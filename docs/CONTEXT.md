@@ -116,6 +116,13 @@
   模拟器 hierarchy 的 content-desc 可读（真机不可读）；按钮 y 比例跨设备不同，
   `checkin.py` 已改为霍夫圆动态定位按钮；四态 fixture 回归 PASS；模拟器 dry-run（窗口外 gray）通过。
 
+## 2026-09-21 项目结构整理
+
+- Python 脚本从 `docs/` 移到 `scripts/`（checkin.py / probe.py / analyze_images.py / test_image_states.py）。
+- 根目录调试采集归档到 `captures/phone|emulator|misc/`；脚本调试截图统一输出 `debug/`（已入 .gitignore）。
+- 新增 `.gitignore`（排除 .conda/.vscode/debug/captures/data 等）并完成首次 git 提交。
+- 文档内路径引用已同步；迁移后编译、四态 fixture 回归、模拟器 dry-run 均验证通过。
+
 ## 2026-09-21 暂停时最新进度
 
 - 电脑 Android SDK 根目录已确认是 `D:\Documents\Android\Sdk`。
