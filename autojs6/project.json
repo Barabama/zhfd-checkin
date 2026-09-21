@@ -1,0 +1,10 @@
+{
+  "name": "zhfd-checkin-autojs6",
+  "versionName": "0.1.0",
+  "versionCode": 1,
+  "main": "main.js",
+  "launchConfig": {
+    "displaySplash": false,
+    "useFeatures": ["ui", "accessibility", "images", "ocr"]
+  }
+}

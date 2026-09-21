@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.conda/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+
+# 调试输出（脚本运行时生成的截图/hierarchy dump）
+debug/
+
+# 调试采集归档（UI hierarchy XML、临时截图等，体积大且为一次性产物）
+captures/
+data/
+
+# 日志
+logs/
+*.log
+
+# 大文件归档
+*.zip
+*.vdi
+
+# 系统文件
+Thumbs.db
+desktop.ini

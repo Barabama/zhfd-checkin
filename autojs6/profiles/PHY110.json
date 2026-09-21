@@ -1,0 +1,12 @@
+{
+  "model": "PHY110",
+  "screen": [1440, 3168],
+  "button_center": [720, 1756],
+  "button_center_ratio": [0.5, 0.5543],
+  "button_box": [420, 420],
+  "service_icon_bounds": [129, 1800, 150, 151],
+  "service_icon_center": [204, 1875],
+  "service_icon_center_ratio": [0.1417, 0.5919],
+  "requires_unlock_swipe": true,
+  "notes": "OPPO/ColorOS; Flutter 自绘页面；无锁屏密码时可自动唤醒并上滑"
+}
