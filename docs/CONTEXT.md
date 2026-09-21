@@ -123,6 +123,17 @@
 - 新增 `.gitignore`（排除 .conda/.vscode/debug/captures/data 等）并完成首次 git 提交。
 - 文档内路径引用已同步；迁移后编译、四态 fixture 回归、模拟器 dry-run 均验证通过。
 
+## 2026-09-22 签到窗口验证结果
+
+- 23:43-23:59 窗口内在模拟器完成首次窗口内 dry-run：定位注入链路（ldconsole locate →
+  gps_hal → App，71 次 fix 交付）与 H5 每 10 秒定位轮询均已验证；
+  一度识别到蓝色 locating，但按钮最终停在灰色"无法签到"。
+- 原因定位：注入坐标偏校区 1.84km（GCJ-02/WGS-84 换算漏乘 π）。
+  正确 WGS-84 值 `119.188555,26.064324` 已注入并验证 gps_hal 收到；
+  新增 `scripts/gcj2wgs.py` 做坐标系互转。
+- 关键行为：H5 **只在签到窗口内**请求定位，窗口外 0 次轮询 → 完整复验需等下一个窗口。
+- 详细记录见 `docs/LDPLAYER_ENVIRONMENT.md` 末节。
+
 ## 2026-09-21 暂停时最新进度
 
 - 电脑 Android SDK 根目录已确认是 `D:\Documents\Android\Sdk`。
