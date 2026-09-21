@@ -1,0 +1,4 @@
+uiautomator2>=3.7,<4
+opencv-python>=4.8
+numpy>=1.26
+requests>=2.31

@@ -1,0 +1,17 @@
+{
+  "generated": "2026-09-19",
+  "screen_reference": [
+    1440,
+    3168
+  ],
+  "fixture_source_scale": [
+    1080,
+    2376
+  ],
+  "expected_states": {
+    "gray": "data/images/IMG_20260918_14040981.jpeg",
+    "locating": "data/images/IMG_20260919_15503298.jpeg",
+    "ready": "data/images/IMG_20260919_15503662.jpeg",
+    "success": "data/images/IMG_20260919_15504871.jpeg"
+  }
+}
