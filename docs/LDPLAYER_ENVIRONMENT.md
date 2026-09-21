@@ -179,6 +179,49 @@ logcat 显示晚点名签到页由 App 内 WebView 加载：
 
 ### 待办
 
-1. 21:30-23:59 窗口内在模拟器 dry-run 一次，观察 ready/locating 识别与 GPS 启动。
-2. 若窗口内 H5 请求定位：确认 `locate` 注入坐标被接受、页面显示旗山校区。
-3. 确认后评估生产载体；如选真机/模拟器长期跑，再配定时启动脚本。
+1. ~~21:30-23:59 窗口内在模拟器 dry-run 一次~~（2026-09-21/22 已完成，见下节）
+2. 确认定位注入后页面显示旗山校区、按钮转蓝（待下一窗口验证）
+3. 确认后评估生产载体；如选真机/模拟器长期跑，再配定时启动脚本
+
+## 2026-09-21/22 签到窗口验证（23:43-23:59 + 复盘至 01:00）
+
+### 已验证通过
+
+1. **定位注入链路端到端可用**（ldconsole locate → gps_hal → 系统 → App）：
+   - `ldconsole locate --index 0 --LLI <lng>,<lat>` 注入后（部分场景需重启实例落盘），
+     logcat `gps_hal` 立即出现 `NewLocation <lat>, <lng>`；
+   - dumpsys 显示 App（uid 10071）以 HIGH_ACCURACY 请求、系统 `delivered location` 50 次、
+     App 统计 `locations = 71`；
+   - **注意坐标系**：注入坐标必须是 **WGS-84**。高德/腾讯地图查到的校区坐标是 GCJ-02
+     （旗山校区 26.061246, 119.193379），直接注入会偏 ~600m；
+     第一次注入还因换算代码漏乘 π 偏了 1.84km。已写 `scripts/gcj2wgs.py` 做互转
+     （round-trip 误差 <1m）。**正确注入值：`--LLI 119.188555,26.064324`**。
+2. **窗口内 H5 定位轮询行为**：页面每 10 秒经 JS bridge 请求定位
+   （`kysk-fdxy-app://native?type=location&function=nativeCallJsLocationFunKysk`），
+   每次 App 发起 HIGH_ACCURACY GPS 请求并收到 fix；
+   **窗口外（00:00 后）完全不轮询**（45 分钟 0 次）——定位只在签到窗口内发起。
+3. **四态分类器在窗口内复验**：23:47 dry-run 曾识别到蓝色 `locating`（"定位中..."），
+   HSV 阈值在模拟器上工作正常；识别链条无假阳性。
+
+### 未解决：窗口内按钮最终停在灰色"无法签到"
+
+23:47 显示过 `locating`，23:48 后转灰并保持到窗口结束（H5 每 10s 拿到 fix 但页面
+不给"点击签到"）。当时注入坐标偏校区 1.84km（换算 bug），高德 SDK 逆地理得到
+"不在旗山校区范围"是最可能原因。正确坐标已注入（01:00 后 H5 不再轮询，无法即时复验）。
+
+### 其他发现
+
+- App 冷启动后不保留"晚点名签到"路由（重新安装/重启后停在首页）；
+  之前"已在签到页"是温启动保活。`checkin.py` 的首页导航路径因此很重要。
+- 实例重启后定位权限会重置，需要重新 `pm grant`。
+- `ldconsole locate` 在实例运行时注入即时生效（gps_hal 立刻打印新坐标）；
+  但对 `leidian0.config` 的落盘有时延迟/需要 quit 才刷出，验证以 logcat 为准。
+
+### 下一窗口（09-22 21:30-23:59）验证清单
+
+1. 提前确认 `locate` 配置仍是 `119.188555,26.064324`（logcat gps_hal 确认坐标值）。
+2. 21:30 后进签到页，确认按钮依次 gray → locating → ready。
+3. 若 ready：dry-run 记录即成功，不改 config 直接结束。
+4. 若仍 gray 且定位正常：抓 H5 页面数值（页面提示行 y=445 暗像素）+
+   logcat 保存到 `captures/emulator/window_test_0922/`，考虑高德逆地理是否
+   需要 GPS 卫星数（Bundle satellites=0）等信息，再评估。
