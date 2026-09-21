@@ -79,7 +79,7 @@ d.window_size()   # (900, 1600)
 d.dump_hierarchy()  # Flutter 页面几乎没有文本节点（与真机一致），只有状态栏时间
 ```
 
-Python 端复用现有脚本的方式：
+Python 端复用现有脚本的方式（脚本在 `scripts/`，调试输出统一写 `debug/`）：
 
 ```bash
 ZHFD_SERIAL=127.0.0.1:5555 python scripts/probe.py
