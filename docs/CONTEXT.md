@@ -116,6 +116,15 @@
   模拟器 hierarchy 的 content-desc 可读（真机不可读）；按钮 y 比例跨设备不同，
   `checkin.py` 已改为霍夫圆动态定位按钮；四态 fixture 回归 PASS；模拟器 dry-run（窗口外 gray）通过。
 
+## 2026-09-22 窗口内验证（21:30-23:59）
+
+- 窗口内 dry-run 完成：状态识别、定位注入到系统/App 原生层全部验证通过；
+  但 H5 页面始终停在"定位中..."，未进入"点击签到"（未点击，符合边界）。
+- 00:00 窗口一关页面立刻从 locating 转 gray，说明 H5 与服务器时序正常。
+- 疑点集中在坐标系偏移（LD 交付值与写入值差约 1km）与高德 SDK 模拟器兼容。
+- 21:32 的定时唤醒任务被消费但未实际执行——定时任务需要会话在触发时可用。
+- 详见 `docs/WINDOW_TEST_2026-09-22.md`。
+
 ## 2026-09-21 项目结构整理
 
 - Python 脚本从 `docs/` 移到 `scripts/`（checkin.py / probe.py / analyze_images.py / test_image_states.py）。
