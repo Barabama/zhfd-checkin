@@ -225,3 +225,45 @@ logcat 显示晚点名签到页由 App 内 WebView 加载：
 4. 若仍 gray 且定位正常：抓 H5 页面数值（页面提示行 y=445 暗像素）+
    logcat 保存到 `captures/emulator/window_test_0922/`，考虑高德逆地理是否
    需要 GPS 卫星数（Bundle satellites=0）等信息，再评估。
+
+## 2026-09-22 窗口验证结果：定位链路全通，按钮卡在 locating
+
+### 执行时间线（定时任务 21:32 自动触发）
+
+- 21:37 重注坐标（config 竟然又回到旧值 119.178），gps_hal 确认收到正确坐标。
+- 21:40 进签到页，dry-run 状态机：gray → **locating**（识别正确，
+  HSV 108/208/206、白字 4272 ≈ 真机 3725 标定值）。
+- 21:40-23:59 按钮持续「定位中...」约 2 小时，从未转 ready。
+
+### 系统层一切正常（排除项）
+
+- GPS 会话每 10s 一轮：`set_position_mode → session begin → location_cb(正确坐标) → stop`；
+  App（uid 10071）收到 8+ 次 fix，`locations = 8`。
+- 模拟器网络可达高德（`ping c.amap.com` 7ms）；App 外连正常
+  （59.77.x 福大 IP 段 yzsxg 可达、DNS 通）。
+- 定位权限、mock 设置、坐标值均正确。
+
+### 卡点定位：App/H5 侧
+
+系统把 fix 交给了 App，但页面不结束定位态。可能原因（未完全排除）：
+
+1. AMap SDK 收到 GPS 原始坐标但**逆地理编码失败**（需要访问高德服务器把
+   坐标转成"旗山校区"地址；logcat 无 AMap 明确错误，但 AMap 网络请求日志缺失）。
+2. H5 对定位结果有校验（速度/精度/卫星数：Bundle 显示 `satellites=0`，
+   真机有真实卫星；模拟器注入 fix 卫星数为 0，可能被判定"不可信"）。
+3. App 原生层到 H5 的 `nativeCallJsLocationFunKysk` 回传的数据格式/错误码问题。
+
+### 结论与下一步
+
+- 自动化脚本本身已完全可用（导航、四态识别、窗口判断、dry-run 保护全部正确）。
+- 剩余问题是**模拟器环境与 App 定位 SDK 的兼容性**，不是脚本问题。
+- 候选方案：a) 用真机 USB 跑同一条链路（最接近真实环境）；
+  b) 深入调查模拟器 GPS 卫星数/精度模拟（雷电设置里可能有 GPS 强化选项）；
+  c) 接受模拟器只能验证到 locating 为止，生产用真机。
+
+### 证据文件（captures/emulator/window_test_0922/，不入库）
+
+- logcat_2222/2337/2347_final.log、dumpsys_location_final.txt
+- page_locating_stuck_2222.png、page_final_2347.png、button_2306.png
+- button_2306.png 数值分析：按钮径向全部蓝色（H≈107），无红/灰；
+  之前"白字 25k"是裁剪框四角的页面白背景（圆形 mask 内仍是 4272）。
