@@ -49,18 +49,17 @@
 
 ## 下次会话恢复步骤
 
-1. 读 `docs/WINDOW_TEST_2026-09-22.md`（含"下次验证建议"清单）。
-2. 赶在 21:30 前完成准备：
-   - 从真机地图 App（高德）取"岐安福大学生街"精确 GCJ-02 坐标，
-     `python scripts/gcj2wgs.py <lat> <lng>` 转成 WGS-84；
-   - `ldconsole locate --index 0 --LLI <wgs_lng>,<wgs_lat>` 注入；
-   - logcat `gps_hal` 确认交付值。
-3. 21:30 窗口开：force-stop App → 重进签到页 → 跑状态监控循环
-   （WINDOW_TEST 文档末尾有现成命令）。
-4. 若仍不转 ready → 用"候选原因③"反推：注入 GCJ-02 值本身（故意不转）试一次，
-   若转 ready 即证明 App 混用坐标系；再不行考虑真机验证
-   （同一脚本 `ZHFD_SERIAL=<真机serial>`）。
-5. **生产载体仍未定**（模拟器/真机 USB/手机 AutoJs6），本卡点解决后再评估。
+> **09-23 23:27 更新**：恢复步骤 1-3 已在当夜半窗口（23:27-00:00）执行完毕：
+> 学生街精确 WGS-84 坐标注入后仍卡 locating。结论与后续步骤见
+> `docs/WINDOW_TEST_2026-09-23.md` —— 模拟器路线到顶，下一步转真机 USB 验证。
+
+1. ~~读 `docs/WINDOW_TEST_2026-09-22.md`~~ → 已执行，另见 `WINDOW_TEST_2026-09-23.md`。
+2. ~~坐标准备与注入~~ → 已执行（GCJ-02 26.0628,119.1952 → WGS-84 26.065882,119.190379）。
+3. ~~窗口内监控~~ → 已执行（23:54:14 locating → 00:00:04 gray，未转 ready）。
+4. ~~候选原因③（GCJ-02/WGS84 混用反推）~~ → 精确转换坐标也失败，该假设降级。
+5. **新下一步：真机 USB 验证** —— 手机连电脑，
+   `ZHFD_SERIAL=<真机serial> ZHFD_DRY_RUN=1 python scripts/checkin.py`。
+6. **生产载体仍未定**（模拟器/真机 USB/手机 AutoJs6），真机验证后再评估。
 
 ## 定时唤醒的经验
 
