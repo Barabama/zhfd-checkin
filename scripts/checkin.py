@@ -239,11 +239,30 @@ def classify_button_image(roi, verbose=True):
     if color_coverage > 0.55 and BLUE["h"][0] <= dominant_h <= BLUE["h"][1]:
         # 仅统计圆心内的白字，避免把外圈和页面背景算进去。
         white_text = (hsv[:, :, 1] < 80) & (hsv[:, :, 2] > 235) & circle
-        white_count = int(white_text.sum())
+        # 行结构判据（跨分辨率稳定）：
+        # ready = "点击签到"上行(~y97-153) + 时间下行(~y180-213) 两段式；
+        # locating = "定位中..."单行(~y130-180)。
+        # 绝对像素数不可靠：模拟器 900x1600 渲染像素少（ready 实测 4345），
+        # 真机 1080x2376 标定值是 locating≈3.7k / ready≈6.7k。
+        proj = white_text.sum(axis=1)
+        rows = []
+        for y, v in enumerate(proj):
+            if v > 3:
+                if rows and y - rows[-1][1] <= 4:
+                    rows[-1][1] = y
+                    rows[-1][2] += int(v)
+                else:
+                    rows.append([y, y, int(v)])
+        rows = [r for r in rows if r[2] >= 150]  # 过滤噪点行
         if verbose:
-            print(f"[按钮文字像素] {white_count}")
-        # 定位中...约 3.8k；点击签到+时间约 6.8k（315x315归一化截图）。
-        return STATE_READY if white_count >= 5000 else STATE_LOCATING
+            print(f"[按钮文字行] {rows}")
+        if len(rows) >= 2:
+            # 两段式：上行(点击签到) + 下行(时间)。下行位置在圆下半部。
+            lower_rows = [r for r in rows if r[0] >= NORMALIZED_BUTTON_SIZE * 0.5]
+            if lower_rows:
+                return STATE_READY
+        # 单行宽文字 = 定位中...
+        return STATE_LOCATING
 
     # 灰色按钮核心基本无彩色，且中位亮度明显低于纯白加载页。
     if 80 <= median_v < 230 and median_s <= GRAY["s"][1]:
