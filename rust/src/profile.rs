@@ -96,8 +96,9 @@ pub const PROFILES: &[Profile] = &[
         width: 1920,
         height: 1080,
         density_dpi: 280,
-        button_center_ratio: (0.50, 0.67),
-        button_box_ratio: (0.29, 0.56),
+        // 2026-09-25 gray-state measurement: center≈(960,908), 308 px.
+        button_center_ratio: (0.5000, 0.8407),
+        button_box_ratio: (0.1604, 0.2852),
         service_icon_center_ratio: (0.14, 0.59),
         calibrated: false,
     },
@@ -107,8 +108,9 @@ pub const PROFILES: &[Profile] = &[
         width: 1080,
         height: 1920,
         density_dpi: 280,
-        button_center_ratio: (0.50, 0.67),
-        button_box_ratio: (0.36, 0.20),
+        // 2026-09-25 gray-state measurement: center≈(540,907), 308 px.
+        button_center_ratio: (0.5000, 0.4724),
+        button_box_ratio: (0.2852, 0.1604),
         service_icon_center_ratio: (0.1417, 0.5919),
         calibrated: false,
     },
@@ -118,8 +120,9 @@ pub const PROFILES: &[Profile] = &[
         width: 960,
         height: 540,
         density_dpi: 160,
-        button_center_ratio: (0.50, 0.67),
-        button_box_ratio: (0.29, 0.56),
+        // 2026-09-25 gray-state measurement: center≈(480,352), 178 px.
+        button_center_ratio: (0.5000, 0.6519),
+        button_box_ratio: (0.1854, 0.3296),
         service_icon_center_ratio: (0.14, 0.59),
         calibrated: false,
     },
@@ -140,8 +143,9 @@ pub const PROFILES: &[Profile] = &[
         width: 540,
         height: 960,
         density_dpi: 160,
-        button_center_ratio: (0.50, 0.67),
-        button_box_ratio: (0.36, 0.20),
+        // 2026-09-25 gray-state measurement: center≈(270,525), 178 px.
+        button_center_ratio: (0.5000, 0.5469),
+        button_box_ratio: (0.3296, 0.1854),
         service_icon_center_ratio: (0.1417, 0.5919),
         calibrated: false,
     },
@@ -251,6 +255,10 @@ mod tests {
             ("portrait_900x1600_d240", (0.4994, 0.4863), (0.2578, 0.1450)),
             ("landscape_1280x720_d240", (0.50, 0.5694), (0.20, 0.3556)),
             ("portrait_720x1280_d240", (0.50, 0.6664), (0.3556, 0.20)),
+            ("landscape_1920x1080_d280", (0.50, 0.8407), (0.1604, 0.2852)),
+            ("portrait_1080x1920_d280", (0.50, 0.4724), (0.2852, 0.1604)),
+            ("landscape_960x540_d160", (0.50, 0.6519), (0.1854, 0.3296)),
+            ("portrait_540x960_d160", (0.50, 0.5469), (0.3296, 0.1854)),
         ];
         for (id, center, region) in expected {
             let profile = find_profile_by_id(id).expect("measured profile missing");

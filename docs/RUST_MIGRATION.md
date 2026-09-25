@@ -72,8 +72,7 @@ rust/target/release/zhfd-checkin.exe
 
 ## 尚未完成
 
-- 八个 profile 的真实截图标定；
-- 四个 240 DPI profile 的 `locating -> ready` 和正式点击仍需在应用真实签到窗口内完成；几何、页面导航和灰态 dry-run 已完成。
+- 八个 profile 的 `locating -> ready` 实态和最终 live 能力验证仍未完成；当前八个均已完成灰态截图、坐标测量和窗口外 dry-run。
 - GUI 的更完整异步任务状态、诊断报告导出和同步确认对话框；
 - UiAutomator Rust crate 的独立封装验证。目前使用 ADB 的 `uiautomator dump` 作为兼容方案；
 - 干净 Windows 环境上的便携 EXE 验收。
@@ -132,3 +131,24 @@ error: location_timeout
 - landscape 页面支持“业务”入口和服务目录滚动；
 - 进入签到页后允许安全滚动，不会触发签到点击；
 - live 门禁仍要求 `--live --confirm`、已标定 profile、前台包名、时间窗口和连续 ready 帧。
+
+## 2026-09-25 八个 profile 的几何验证完成
+
+继续不等待签到窗口，已完成剩余四个 profile 的同步、导航、灰态按钮测量和 release dry-run：
+
+| Profile | 实测按钮区域 | dry-run 状态 | 日志目录 |
+|---|---:|---|---|
+| `landscape_1920x1080_d280` | `(960,907) 307x308` | `gray`，未点击 | `logs/2026-09-25_184249/` |
+| `portrait_1080x1920_d280` | `(540,907) 308x307` | `gray`，未点击 | `logs/2026-09-25_184336/` |
+| `landscape_960x540_d160` | `(480,352) 177x177` | `gray`，未点击 | `logs/2026-09-25_184412/` |
+| `portrait_540x960_d160` | `(270,525) 177x177` | `gray`，未点击 | `logs/2026-09-25_184500/` |
+
+至此八个要求 profile 都已经完成：
+
+- 分辨率/DPI 同步和 ADB 重连；
+- 页面入口导航（含 landscape 的“业务”标签和服务目录滚动）；
+- 灰态签到圆的 profile-specific fallback 坐标；
+- Rust release dry-run 的灰态分类；
+- `clicked=false` 安全确认。
+
+八个 profile 仍全部保持 `calibrated=false`。这表示现在已经完成几何和页面能力验证，但没有把窗口外的灰态结果误当成 ready，也没有绕过应用的时间/定位校验。
