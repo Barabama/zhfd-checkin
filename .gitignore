@@ -25,3 +25,8 @@ logs/
 # 系统文件
 Thumbs.db
 desktop.ini
+# Rust
+rust/target/
+rust/**/config.toml
+rust/**/logs/
+rust/**/captures/
