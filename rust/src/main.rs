@@ -657,40 +657,117 @@ fn locate_or_navigate(
         return Ok(fallback);
     }
     let xml = device.dump_hierarchy().unwrap_or_default();
-    if let Some((x, y)) = find_entry_bounds(&xml, "晚点名签到") {
+    let min_entry_y = image.height() / 8;
+    let mut navigated = false;
+    if let Some((x, y)) = find_labeled_bounds(&xml, "晚点名签到", min_entry_y) {
         device.tap(x, y)?;
         thread::sleep(Duration::from_secs(3));
-    } else {
+        navigated = true;
+    } else if let Some((x, y)) = find_labeled_bounds(&xml, "业务", 0) {
+        // Landscape layouts put the service catalogue behind the bottom
+        // "业务" tab and may require one or more vertical swipes before the
+        // check-in tile becomes part of the accessibility hierarchy.
+        device.tap(x, y)?;
+        thread::sleep(Duration::from_secs(2));
+        for attempt in 0..6 {
+            let page_xml = device.dump_hierarchy().unwrap_or_default();
+            if let Some((entry_x, entry_y)) =
+                find_labeled_bounds(&page_xml, "晚点名签到", min_entry_y)
+            {
+                device.tap(entry_x, entry_y)?;
+                thread::sleep(Duration::from_secs(3));
+                navigated = true;
+                break;
+            }
+            if attempt < 5 {
+                device.swipe(
+                    image.width() / 2,
+                    image.height() * 3 / 4,
+                    image.width() / 2,
+                    image.height() / 4,
+                    500,
+                )?;
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+    if !navigated {
         device.tap(
             (profile.service_icon_center_ratio.0 * image.width() as f32) as u32,
             (profile.service_icon_center_ratio.1 * image.height() as f32) as u32,
         )?;
         thread::sleep(Duration::from_secs(3));
     }
-    let bytes = device.screenshot()?;
-    log.save_bytes("navigation_result.png", &bytes)?;
-    let image = vision::decode(&bytes)?;
-    if let Some(button) = vision::find_colored_button(&image) {
-        return Ok(button);
+    let mut bytes = device.screenshot()?;
+    let mut image = vision::decode(&bytes)?;
+    for attempt in 0..4 {
+        if let Some(button) = vision::find_colored_button(&image) {
+            let analysis = vision::classify_button(&image, button);
+            if analysis.state != vision::ButtonState::Unknown {
+                log.save_bytes("navigation_result.png", &bytes)?;
+                return Ok(button);
+            }
+        }
+        let fallback = vision::fallback_button(&image, profile);
+        if vision::classify_button(&image, fallback).state != vision::ButtonState::Unknown {
+            log.save_bytes("navigation_result.png", &bytes)?;
+            return Ok(fallback);
+        }
+        if !navigated || attempt == 3 {
+            break;
+        }
+        // Some landscape WebView layouts render the check-in circle below the
+        // initial viewport. Scroll only after selecting the check-in tile;
+        // this cannot activate the sign-in control.
+        device.swipe(
+            image.width() / 2,
+            image.height() * 3 / 4,
+            image.width() / 2,
+            image.height() / 4,
+            500,
+        )?;
+        thread::sleep(Duration::from_secs(1));
+        bytes = device.screenshot()?;
+        image = vision::decode(&bytes)?;
     }
+    log.save_bytes("navigation_result.png", &bytes)?;
     Ok(vision::fallback_button(&image, profile))
 }
 
-fn find_entry_bounds(xml: &str, label: &str) -> Option<(u32, u32)> {
-    let marker1 = format!("content-desc=\"{}\"", label);
-    let marker2 = format!("text=\"{}\"", label);
-    let pos = xml.find(&marker1).or_else(|| xml.find(&marker2))?;
-    let tail = &xml[pos..];
-    let b = tail.find("bounds=\"")?;
-    let value = &tail[b + 8..];
-    let end = value.find('"')?;
-    let token = &value[..end];
-    let nums: Vec<u32> = token
-        .split(['[', ']', ','])
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    (nums.len() >= 4).then(|| ((nums[0] + nums[2]) / 2, (nums[1] + nums[3]) / 2))
+fn find_labeled_bounds(xml: &str, label: &str, min_center_y: u32) -> Option<(u32, u32)> {
+    for attribute in ["content-desc", "text"] {
+        let prefix = format!("{}=\"", attribute);
+        let mut cursor = 0;
+        while let Some(relative) = xml[cursor..].find(&prefix) {
+            let value_start = cursor + relative + prefix.len();
+            let value_end = value_start + xml[value_start..].find('"')?;
+            let value = &xml[value_start..value_end];
+            if value.contains(label) {
+                let node_start = xml[..value_start].rfind("<node").unwrap_or(value_start);
+                let node_end = node_start + xml[node_start..].find('>')?;
+                let node = &xml[node_start..node_end];
+                if let Some(bounds_start) = node.find("bounds=\"") {
+                    let bounds_value = &node[bounds_start + 8..];
+                    if let Some(end) = bounds_value.find('"') {
+                        let nums: Vec<u32> = bounds_value[..end]
+                            .split(['[', ']', ','])
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        if nums.len() >= 4 {
+                            let center_y = (nums[1] + nums[3]) / 2;
+                            if center_y >= min_center_y {
+                                return Some(((nums[0] + nums[2]) / 2, center_y));
+                            }
+                        }
+                    }
+                }
+            }
+            cursor = value_end + 1;
+        }
+    }
+    None
 }
+
 fn print_device(serial: &str, info: &adb::DeviceInfo) {
     println!(
         "serial={} model={} sdk={} size={}x{} dpi={} orientation={} package={:?}",
@@ -703,4 +780,16 @@ fn print_device(serial: &str, info: &adb::DeviceInfo) {
         info.orientation.as_str(),
         info.package
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_labeled_bounds;
+
+    #[test]
+    fn labeled_bounds_match_accessibility_suffix_and_skip_header() {
+        let xml = r#"<node content-desc="晚点名签到" bounds="[10,20][30,40]"/><node content-desc="业务&#10;第 4 个标签，共 4 个" bounds="[100,600][300,700]"/>"#;
+        assert_eq!(find_labeled_bounds(xml, "晚点名签到", 100), None);
+        assert_eq!(find_labeled_bounds(xml, "业务", 100), Some((200, 650)));
+    }
 }
