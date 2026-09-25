@@ -77,3 +77,34 @@ rust/target/release/zhfd-checkin.exe
 - GUI 的更完整异步任务状态、诊断报告导出和同步确认对话框；
 - UiAutomator Rust crate 的独立封装验证。目前使用 ADB 的 `uiautomator dump` 作为兼容方案；
 - 干净 Windows 环境上的便携 EXE 验收。
+
+## 2026-09-25 `portrait_900x1600_d240` 首轮实机验证
+
+已完成以下操作：
+
+- `profile sync --id portrait_900x1600_d240 --confirm` 首次写入配置后，旧实现因 LDPlayer 停止/启动竞态报告启动超时；随后修复为等待实例明确停止后再启动。
+- 修复后的同步命令于 2026-09-25 17:43 再次执行成功，并生成 LDPlayer 配置备份。
+- `diagnose` 和 `profile detect` 均识别为 `900x1600@240`、`portrait_900x1600_d240`。
+- 实机截图测得 240 DPI 下灰色签到圆约为 `(449,778)`、`232x232`；已更新该 profile 的 dry-run 回退区域，但仍保持 `calibrated=false`。
+- 修复页面探测：灰色“无法签到”按钮没有饱和色，动态彩色按钮检测会失败；现在会先用 profile 回退区域分类灰色状态，避免误把已在签到页的页面当成首页。
+
+17:46 的 release dry-run（临时将轮询/超时缩短，运行后已恢复正式配置）证据：
+
+```text
+profile_id: portrait_900x1600_d240
+state_history: [gray, gray, gray, gray]
+button: (449, 778, 232, 232)
+clicked: false
+dry_run_ready: false
+error: location_timeout
+```
+
+对应日志目录：`rust/target/release/logs/2026-09-25_174604/`。这次结果符合安全预期：没有点击；由于当前本机时间为 17:46，早于配置窗口 21:30-23:59，页面保持灰色，尚不能据此完成 `locating -> ready` 的时间窗口验证。
+
+下一次应在 **2026-09-25 21:30 至 23:59（Asia/Shanghai）** 的真实签到窗口内，仅执行：
+
+```powershell
+rust/target/release/zhfd-checkin.exe run --dry-run
+```
+
+仍不得把 `portrait_900x1600_d240` 标记为 calibrated，直到日志确认 `gray -> locating -> ready` 且 `dry_run_ready=true`。

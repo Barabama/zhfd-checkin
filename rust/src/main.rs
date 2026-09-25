@@ -278,6 +278,7 @@ fn sync_profile(store: &ConfigStore, id: &str, confirm: bool) -> Result<ExitCode
     println!("已写入 profile {}: {}", target.id, resolution);
     if instance.running {
         ld.command(&["quit", "--index", &index.to_string()])?;
+        ld.wait_for_stopped(index, Duration::from_secs(30))?;
         ld.launch_wait(
             index,
             Duration::from_secs(store.config.runtime.startup_timeout_seconds),
@@ -646,6 +647,14 @@ fn locate_or_navigate(
         if analysis.state != vision::ButtonState::Unknown {
             return Ok(button);
         }
+    }
+    // Gray is a valid check-in-page state but has no saturated color for the
+    // dynamic detector. Check the calibrated fallback before navigating, so a
+    // page showing "无法签到" is not mistaken for the home page.
+    let fallback = vision::fallback_button(&image, profile);
+    let fallback_analysis = vision::classify_button(&image, fallback);
+    if fallback_analysis.state != vision::ButtonState::Unknown {
+        return Ok(fallback);
     }
     let xml = device.dump_hierarchy().unwrap_or_default();
     if let Some((x, y)) = find_entry_bounds(&xml, "晚点名签到") {
