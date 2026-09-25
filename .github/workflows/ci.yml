@@ -37,6 +37,10 @@ jobs:
       - name: Rust release build
         run: cargo build --release --manifest-path rust/Cargo.toml
 
+      - name: Portable EXE smoke test
+        shell: pwsh
+        run: .\scripts\portable_smoke.ps1 -ExePath "$pwd\rust\target\release\zhfd-checkin.exe" -FixturePath "$pwd\autojs6\fixtures\ready.png"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

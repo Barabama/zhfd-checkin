@@ -152,3 +152,34 @@ error: location_timeout
 - `clicked=false` 安全确认。
 
 八个 profile 仍全部保持 `calibrated=false`。这表示现在已经完成几何和页面能力验证，但没有把窗口外的灰态结果误当成 ready，也没有绕过应用的时间/定位校验。
+
+## 2026-09-25 便携 EXE staging 验收
+
+新增 `scripts/portable_smoke.ps1`，用于在 Windows 临时目录模拟便携部署。脚本只复制：
+
+- `rust/target/release/zhfd-checkin.exe`；
+- `autojs6/fixtures/ready.png`。
+
+随后从 staging 目录执行：
+
+```powershell
+.\scripts\portable_smoke.ps1
+```
+
+验收内容：
+
+- `about` 能启动并打印版本信息；
+- `profile list` 包含八个要求 profile；
+- `config show` 在 EXE 同目录创建 `config.toml`；
+- `vision --image fixtures\ready.png` 返回 `state=ready`；
+- 相对 fixture 路径从 staging 工作目录解析，不依赖仓库当前目录。
+
+2026-09-25 本机结果：
+
+```text
+PORTABLE_SMOKE_PASS
+profile_count=8+
+vision_state=ready
+```
+
+CI 已加入同一 smoke test。该结果证明“单 EXE + 外部 fixture”便携路径通过；尚未声称完成真正干净 Windows 镜像验收，因为当前验证仍运行在开发机 Windows 环境。最终便携验收仍需在没有 Rust、Python、Node、Android SDK 和 LDPlayer 的干净 Windows 环境中执行 `about`、`profile list`、`config show` 与 fixture 视觉命令。
