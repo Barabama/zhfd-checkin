@@ -80,6 +80,15 @@ try {
         throw "Portable config output did not resolve beside the EXE: $stageConfig"
     }
 
+    $reportText = Invoke-PortableApp @("report")
+    $stageReports = Join-Path $stage "reports"
+    if (-not (Test-Path -LiteralPath $stageReports -PathType Container)) {
+        throw "Portable report command did not create reports directory."
+    }
+    if ($reportText -notmatch "诊断报告") {
+        throw "Portable report command did not print a report path."
+    }
+
     $visionText = Invoke-PortableApp @("vision", "--image", (Join-Path "fixtures" "ready.png"))
     $vision = $visionText | ConvertFrom-Json
     if ($vision.state -ne "ready") {

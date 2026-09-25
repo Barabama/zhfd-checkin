@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use chrono::{FixedOffset, NaiveTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -34,7 +34,7 @@ pub enum ExitCode {
     Timeout = 5,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
     pub mode: String,
     pub serial: String,

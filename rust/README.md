@@ -15,9 +15,10 @@ Run commands from the release output directory or copy the executable anywhere:
 ```text
 zhfd-checkin.exe                 # GUI
 zhfd-checkin.exe diagnose
+zhfd-checkin.exe report
 zhfd-checkin.exe profile detect
 zhfd-checkin.exe run --dry-run
 zhfd-checkin.exe vision --image .\debug\button_now.png
 ```
 
-`config.toml`, `logs/`, and `captures/` are created beside the executable. LDPlayer and the APK remain external dependencies. See `docs/RUST_MIGRATION.md` for the current migration boundary and profile status.
+`config.toml`, `logs/`, `reports/`, and `captures/` are created beside the executable. LDPlayer and the APK remain external dependencies. See `docs/RUST_MIGRATION.md` for the current migration boundary and profile status.
