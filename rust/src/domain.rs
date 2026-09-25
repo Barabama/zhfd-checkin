@@ -72,6 +72,10 @@ pub fn in_configured_window(start: &str, end: &str, timezone: &str) -> Result<bo
     in_window(start, end, now.time())
 }
 
+#[expect(
+    dead_code,
+    reason = "reserved for scheduled waiting UX; verified by unit test"
+)]
 pub fn seconds_until_window_start(start: &str, now: NaiveTime) -> Result<Option<u64>> {
     let start = parse_time(start)?;
     if now >= start {
@@ -111,8 +115,12 @@ pub fn authorize_click(
 }
 
 fn parse_time(value: &str) -> Result<NaiveTime> {
-    NaiveTime::parse_from_str(value.trim(), "%H:%M")
-        .map_err(|e| anyhow::anyhow!("非法时间 {}: {}", value, e))
+    let value = value.trim();
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 2 || parts[0].len() != 2 || parts[1].len() != 2 {
+        bail!("非法时间 {value}: 必须是 HH:MM");
+    }
+    NaiveTime::parse_from_str(value, "%H:%M").map_err(|e| anyhow::anyhow!("非法时间 {value}: {e}"))
 }
 
 #[cfg(test)]
