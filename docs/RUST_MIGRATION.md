@@ -18,6 +18,7 @@ Rust 第一阶段 CLI 已建立，Python 仍是行为参考基线。当前 CLI �
 zhfd-checkin.exe                 # GUI
 zhfd-checkin.exe about
 zhfd-checkin.exe diagnose
+zhfd-checkin.exe report
 zhfd-checkin.exe profile list
 zhfd-checkin.exe profile detect
 zhfd-checkin.exe profile sync --id portrait_900x1600_d240 --confirm
@@ -183,3 +184,21 @@ vision_state=ready
 ```
 
 CI 已加入同一 smoke test。该结果证明“单 EXE + 外部 fixture”便携路径通过；尚未声称完成真正干净 Windows 镜像验收，因为当前验证仍运行在开发机 Windows 环境。最终便携验收仍需在没有 Rust、Python、Node、Android SDK 和 LDPlayer 的干净 Windows 环境中执行 `about`、`profile list`、`config show` 与 fixture 视觉命令。
+
+## 2026-09-25 GUI 诊断结果完善
+
+GUI 诊断页现已支持：
+
+- 导出 JSON 诊断报告（`reports/diagnostic-*.json`）；
+- 刷新并展示最近一次 `result.json`；
+- 展示 mode、profile、state history、serial、clicked、success；
+- 将 `unknown_state`、`location_timeout`、`outside_window`、ADB 不可用等错误映射为用户可读提示；
+- dry-run 异步任务完成后自动刷新最近运行结果。
+
+新增 CLI 命令：
+
+```powershell
+zhfd-checkin.exe report
+```
+
+报告包含配置和最近运行结果，但会清空通知 URL 等不适合分享的字段；不包含 Token、Cookie 或定位地址。

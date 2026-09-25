@@ -30,3 +30,4 @@ rust/target/
 rust/**/config.toml
 rust/**/logs/
 rust/**/captures/
+rust/**/reports/

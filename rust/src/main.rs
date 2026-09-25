@@ -33,6 +33,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum CommandKind {
     Diagnose,
+    Report,
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
@@ -146,9 +147,16 @@ fn run_cli() -> Result<ExitCode> {
         CommandKind::Config { command } => config_command(&store, command),
         CommandKind::Profile { command } => profile_command(&store, command),
         CommandKind::Diagnose => diagnose(&store),
+        CommandKind::Report => write_report(&store),
         CommandKind::App { command } => app_command(&store, command),
         CommandKind::Run(args) => run(&store, args),
     }
+}
+
+fn write_report(store: &ConfigStore) -> Result<ExitCode> {
+    let path = logger::write_diagnostic_report(store)?;
+    println!("诊断报告: {}", path.display());
+    Ok(ExitCode::Ok)
 }
 
 fn analyze_image(path: &PathBuf) -> Result<ExitCode> {

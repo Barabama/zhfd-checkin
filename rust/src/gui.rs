@@ -1,6 +1,7 @@
 use crate::config::ConfigStore;
+use crate::domain::RunResult;
 use crate::{ConfigCommand, RunArgs, app_command, diagnose, run, runtime, sync_profile};
-use crate::{config, profile};
+use crate::{config, logger, profile};
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,6 +23,9 @@ struct GuiApp {
     apk_path: String,
     job: Option<Arc<Mutex<Option<String>>>>,
     pending_sync: Option<String>,
+    latest_result: Option<RunResult>,
+    latest_log_dir: Option<String>,
+    report_path: Option<String>,
 }
 
 impl GuiApp {
@@ -34,6 +38,9 @@ impl GuiApp {
             apk_path,
             job: None,
             pending_sync: None,
+            latest_result: None,
+            latest_log_dir: None,
+            report_path: None,
         }
     }
 
@@ -63,6 +70,20 @@ impl GuiApp {
         self.status = "dry-run 已启动，正在等待结果……".into();
     }
 
+    fn refresh_latest_result(&mut self) {
+        match logger::latest_result(&self.store.root) {
+            Ok(Some((dir, result))) => {
+                self.latest_log_dir = Some(dir.display().to_string());
+                self.latest_result = Some(result);
+            }
+            Ok(None) => {
+                self.latest_log_dir = None;
+                self.latest_result = None;
+            }
+            Err(error) => self.status = format!("读取运行结果失败: {:#}", error),
+        }
+    }
+
     fn poll_job(&mut self) {
         let result = self
             .job
@@ -71,6 +92,17 @@ impl GuiApp {
         if let Some(result) = result {
             self.status = result;
             self.job = None;
+            self.refresh_latest_result();
+        }
+    }
+
+    fn export_report(&mut self) {
+        match logger::write_diagnostic_report(&self.store) {
+            Ok(path) => {
+                self.report_path = Some(path.display().to_string());
+                self.status = format!("诊断报告已导出: {}", path.display());
+            }
+            Err(error) => self.status = format!("诊断报告导出失败: {:#}", error),
         }
     }
 
@@ -81,6 +113,20 @@ impl GuiApp {
             Ok(()) => self.status = format!("已保存 APK 路径: {}", self.apk_path),
             Err(e) => self.status = format!("保存配置失败: {:#}", e),
         }
+    }
+}
+
+fn explain_error(error: &str) -> &'static str {
+    match error {
+        "unknown_state" => "视觉状态未能确认；请查看最新日志截图。",
+        "location_timeout" => "定位等待超时；未执行点击。",
+        "success_timeout" => "点击后未在超时内确认成功；请人工核对页面。",
+        "outside_window" => "当前不在配置的签到时间窗口；未执行点击。",
+        "foreground_package_changed" => "前台应用已变化；安全策略阻止点击。",
+        "ready_confirmation_failed" => "点击前二次 ready 确认失败；未执行点击。",
+        "unknown_profile" => "设备分辨率/DPI 没有精确 profile；未执行点击。",
+        other if other.contains("ADB") => "ADB 设备不可用；请检查模拟器和 serial。",
+        _ => "请查看诊断报告和运行日志。",
     }
 }
 
@@ -141,17 +187,83 @@ impl GuiApp {
             }
         ));
         ui.label("正式模式请使用 CLI：zhfd-checkin.exe run --live --confirm");
+        if let Some(result) = &self.latest_result {
+            ui.separator();
+            ui.label(format!(
+                "最近结果：{} / {}",
+                result.state_history.join(" → "),
+                if result.success {
+                    "success"
+                } else {
+                    result.error.as_deref().unwrap_or("未完成")
+                }
+            ));
+        }
     }
 
     fn diagnostics(&mut self, ui: &mut egui::Ui) {
         ui.heading("环境诊断");
-        if ui.button("重新检测 LDPlayer / ADB").clicked() {
-            match diagnose(&self.store) {
-                Ok(code) => self.status = format!("诊断完成，退出码 {:?}", code),
-                Err(e) => self.status = format!("诊断失败: {:#}", e),
+        ui.horizontal(|ui| {
+            if ui.button("重新检测 LDPlayer / ADB").clicked() {
+                match diagnose(&self.store) {
+                    Ok(code) => self.status = format!("诊断完成，退出码 {:?}", code),
+                    Err(e) => self.status = format!("诊断失败: {:#}", e),
+                }
             }
+            if ui.button("导出诊断报告").clicked() {
+                self.export_report();
+            }
+            if ui.button("刷新最近运行结果").clicked() {
+                self.refresh_latest_result();
+                self.status = "最近运行结果已刷新".into();
+            }
+        });
+        ui.label("诊断和报告导出不会执行签到点击。报告不包含 Token、Cookie 或定位地址。");
+        ui.separator();
+        if let Some(path) = &self.report_path {
+            ui.label(format!("最近导出的报告：{}", path));
         }
-        ui.label("诊断不会执行签到点击。");
+        if let Some(dir) = &self.latest_log_dir {
+            ui.label(format!("最近运行日志：{}", dir));
+        } else {
+            ui.label("尚未找到 result.json");
+        }
+        if let Some(result) = &self.latest_result {
+            ui.horizontal(|ui| {
+                ui.label(format!("模式：{}", result.mode));
+                ui.label(format!(
+                    "Profile：{}",
+                    result.profile_id.as_deref().unwrap_or("unknown")
+                ));
+                ui.label(format!(
+                    "点击：{}",
+                    if result.clicked { "是" } else { "否" }
+                ));
+                ui.label(format!(
+                    "成功：{}",
+                    if result.success { "是" } else { "否" }
+                ));
+            });
+            if let Some(error) = &result.error {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("错误：{}（{}）", error, explain_error(error)),
+                );
+            } else {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, "未记录运行错误");
+            }
+            ui.label(format!("状态历史：{}", result.state_history.join(" → ")));
+            ui.label(format!(
+                "ADB serial：{}",
+                if result.serial.is_empty() {
+                    "unknown"
+                } else {
+                    &result.serial
+                }
+            ));
+        }
+        ui.separator();
+        ui.label("当前阶段：默认 dry-run；正式点击必须使用 CLI 的 --live --confirm，并通过 profile 标定和时间窗口门禁。");
     }
 
     fn profiles(&mut self, ui: &mut egui::Ui) {
