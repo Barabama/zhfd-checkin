@@ -38,6 +38,8 @@ pub struct Profile {
 // The successful historical LDPlayer run was 900x1600 at the device
 // reported 320 dpi. The required 240 dpi presets are present but remain
 // uncalibrated until each preset gets an image/coordinate validation run.
+// The portrait 900x1600@240 fallback was measured on 2026-09-25 at (449,778)
+// with a 232 px circle; it remains non-live until in-window dry-run validation.
 pub const PROFILES: &[Profile] = &[
     Profile {
         id: "landscape_1600x900_d240",
@@ -56,8 +58,8 @@ pub const PROFILES: &[Profile] = &[
         width: 900,
         height: 1600,
         density_dpi: 240,
-        button_center_ratio: (0.50, 0.67),
-        button_box_ratio: (0.36, 0.20),
+        button_center_ratio: (0.4994, 0.4863),
+        button_box_ratio: (0.2578, 0.1450),
         service_icon_center_ratio: (0.1417, 0.5919),
         calibrated: false,
     },

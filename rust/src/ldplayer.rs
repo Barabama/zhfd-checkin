@@ -98,18 +98,26 @@ impl LdPlayer {
             .with_context(|| format!("LDPlayer 实例不存在: {}", index))
     }
 
+    pub fn wait_for_stopped(&self, index: u32, timeout: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if !self.instance(index)?.running {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        bail!("LDPlayer 实例停止超时: {}", index)
+    }
+
     pub fn launch_wait(&self, index: u32, timeout: Duration) -> Result<()> {
-        let status = self
-            .command(&["isrunning", "--index", &index.to_string()])
-            .unwrap_or_default();
-        if !status.to_ascii_lowercase().contains("running") && !status.trim().ends_with('1') {
+        // After `quit`, `isrunning` can briefly return stale output. Check the
+        // parsed instance state and issue launch only while it is stopped.
+        if !self.instance(index)?.running {
             self.command(&["launch", "--index", &index.to_string()])?;
         }
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
-            if let Ok(inst) = self.instance(index)
-                && inst.running
-            {
+            if self.instance(index)?.running {
                 return Ok(());
             }
             thread::sleep(Duration::from_secs(2));
