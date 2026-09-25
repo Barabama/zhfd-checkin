@@ -73,7 +73,7 @@ rust/target/release/zhfd-checkin.exe
 ## 尚未完成
 
 - 八个 profile 的真实截图标定；
-- Rust 版本在四个 240 DPI profile 上的真实模拟器 dry-run；
+- 四个 240 DPI profile 的 `locating -> ready` 和正式点击仍需在应用真实签到窗口内完成；几何、页面导航和灰态 dry-run 已完成。
 - GUI 的更完整异步任务状态、诊断报告导出和同步确认对话框；
 - UiAutomator Rust crate 的独立封装验证。目前使用 ADB 的 `uiautomator dump` 作为兼容方案；
 - 干净 Windows 环境上的便携 EXE 验收。
@@ -101,10 +101,34 @@ error: location_timeout
 
 对应日志目录：`rust/target/release/logs/2026-09-25_174604/`。这次结果符合安全预期：没有点击；由于当前本机时间为 17:46，早于配置窗口 21:30-23:59，页面保持灰色，尚不能据此完成 `locating -> ready` 的时间窗口验证。
 
-下一次应在 **2026-09-25 21:30 至 23:59（Asia/Shanghai）** 的真实签到窗口内，仅执行：
+本轮不等待签到窗口：窗口外的 profile 几何、导航、WebView 滚动和灰态分类能力已经先行验证。剩余的 `locating -> ready` 及正式点击门禁，仍保留到真实窗口内做最终确认；在此之前不得把 profile 标记为 `calibrated=true`。
 
-```powershell
-rust/target/release/zhfd-checkin.exe run --dry-run
+## 2026-09-25 四个 240 DPI profile 的窗口外能力验证
+
+按计划不等待签到窗口，先完成不触发签到的能力验证：profile 同步、ADB 重连、服务页导航、WebView 滚动、灰态按钮定位和状态分类。四个 profile 均保持 `calibrated=false`，因此不会允许 live 点击。
+
+| Profile | 实测按钮区域 | dry-run 状态 | 日志目录 |
+|---|---:|---|---|
+| `portrait_900x1600_d240` | `(449,778) 232x232` | `gray`，未点击 | `logs/2026-09-25_182849/` |
+| `landscape_1600x900_d240` | `(800,779) 232x232` | `gray`，未点击 | `logs/2026-09-25_182945/` |
+| `landscape_1280x720_d240` | `(640,409) 256x256` | `gray`，未点击 | `logs/2026-09-25_182556/` |
+| `portrait_720x1280_d240` | `(360,852) 256x256` | `gray`，未点击 | `logs/2026-09-25_182754/` |
+
+其中 landscape 页面新增了兼容导航：点击“业务”标签、向上滚动服务目录直到发现“晚点名签到”，进入页面后再滚动 WebView 使签到圆进入视口。Rust CLI 的 release dry-run 已验证该路径，输出示例：
+
+```text
+state_history: [gray, gray, gray, gray]
+clicked: false
+dry_run_ready: false
+error: location_timeout
 ```
 
-仍不得把 `portrait_900x1600_d240` 标记为 calibrated，直到日志确认 `gray -> locating -> ready` 且 `dry_run_ready=true`。
+这里的 `location_timeout` 是测试时临时将轮询/超时缩短后的收尾结果，不是设备或视觉失败；每次测试后正式配置均已恢复。由于当前时间早于应用的 `21:30-23:59` 窗口，四个页面都显示“无法签到”。本轮不修改模拟器系统时间，也不绕过应用的时间/定位校验。
+
+已新增的保护/兼容逻辑：
+
+- `profile sync` 等待 LDPlayer 真正停止后再启动，避免 ADB offline 和启动竞态；
+- 灰态页面先用 profile-specific fallback 分类，不再误导航；
+- landscape 页面支持“业务”入口和服务目录滚动；
+- 进入签到页后允许安全滚动，不会触发签到点击；
+- live 门禁仍要求 `--live --confirm`、已标定 profile、前台包名、时间窗口和连续 ready 帧。
