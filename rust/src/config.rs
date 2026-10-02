@@ -65,6 +65,38 @@ pub struct EmulatorConfig {
     pub serial: String,
     #[serde(default = "default_true")]
     pub auto_launch: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<EmulatorInstanceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmulatorInstanceConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub instance_index: u32,
+    #[serde(default)]
+    pub serial: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl EmulatorConfig {
+    pub fn effective_instances(&self) -> Vec<EmulatorInstanceConfig> {
+        if self.instances.is_empty() {
+            return vec![EmulatorInstanceConfig {
+                name: "default".into(),
+                instance_index: self.instance_index,
+                serial: self.serial.clone(),
+                enabled: true,
+            }];
+        }
+        self.instances
+            .iter()
+            .filter(|instance| instance.enabled)
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +175,7 @@ pub struct ConfigStore {
 impl ConfigStore {
     pub fn load() -> Result<Self> {
         let root = exe_root()?;
+        ensure_runtime_dirs(&root)?;
         let path = root.join("config.toml");
         if !path.exists() {
             let config = Config::default();
@@ -159,6 +192,14 @@ impl ConfigStore {
     pub fn save(&self) -> Result<()> {
         write_config(&self.path, &self.config)
     }
+}
+
+pub fn ensure_runtime_dirs(root: &Path) -> Result<()> {
+    for name in ["logs", "captures", "reports"] {
+        fs::create_dir_all(root.join(name))
+            .with_context(|| format!("无法创建运行目录: {}", root.join(name).display()))?;
+    }
+    Ok(())
 }
 
 pub fn exe_root() -> Result<PathBuf> {
@@ -209,6 +250,61 @@ mod tests {
         assert_eq!(config.runtime.stable_frames, 2);
         assert_eq!(config.window.timezone, "Asia/Shanghai");
         assert_eq!(config.app.package_name, "cn.edu.fzu.fdxypa");
+    }
+
+    #[test]
+    fn legacy_single_instance_config_becomes_default_effective_instance() {
+        let config = Config::default();
+        let instances = config.emulator.effective_instances();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].instance_index, 0);
+        assert!(instances[0].enabled);
+    }
+
+    #[test]
+    fn multi_instance_config_round_trips_as_array_of_tables() {
+        let mut config = Config::default();
+        config.emulator.instances = vec![
+            EmulatorInstanceConfig {
+                name: "one".into(),
+                instance_index: 0,
+                serial: "".into(),
+                enabled: true,
+            },
+            EmulatorInstanceConfig {
+                name: "two".into(),
+                instance_index: 1,
+                serial: "127.0.0.1:5557".into(),
+                enabled: true,
+            },
+        ];
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("[[emulator.instances]]"));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.emulator.effective_instances().len(), 2);
+        assert_eq!(parsed.emulator.instances[1].serial, "127.0.0.1:5557");
+    }
+
+    #[test]
+    fn configured_instances_filter_disabled_entries() {
+        let mut config = Config::default();
+        config.emulator.instances = vec![
+            EmulatorInstanceConfig {
+                name: "one".into(),
+                instance_index: 0,
+                serial: "".into(),
+                enabled: true,
+            },
+            EmulatorInstanceConfig {
+                name: "two".into(),
+                instance_index: 1,
+                serial: "".into(),
+                enabled: false,
+            },
+        ];
+        let instances = config.emulator.effective_instances();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].name, "one");
     }
 
     #[test]

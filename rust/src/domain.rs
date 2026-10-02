@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use chrono::{FixedOffset, NaiveTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,10 @@ pub enum ExitCode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
     pub mode: String,
+    #[serde(default)]
+    pub instance_index: Option<u32>,
+    #[serde(default)]
+    pub instance_name: Option<String>,
     pub serial: String,
     pub profile_id: Option<String>,
     pub state_history: Vec<String>,
@@ -59,7 +63,51 @@ pub fn in_window(start: &str, end: &str, now: NaiveTime) -> Result<bool> {
 pub fn in_configured_window(start: &str, end: &str, timezone: &str) -> Result<bool> {
     // The supported deployment zone is intentionally explicit. Do not silently
     // fall back to the Windows host timezone because it could cause a bad-time click.
-    let offset = match timezone {
+    let offset = timezone_offset(timezone)?;
+    let now = Utc::now().with_timezone(&offset);
+    in_window(start, end, now.time())
+}
+
+/// Return the number of whole seconds left before the currently active
+/// configured window ends. `None` means the current time is outside the
+/// window. Keeping this calculation here makes the run loop testable without
+/// depending on the host timezone or wall clock.
+pub fn seconds_until_configured_window_end(
+    start: &str,
+    end: &str,
+    timezone: &str,
+) -> Result<Option<u64>> {
+    let offset = timezone_offset(timezone)?;
+    let now = Utc::now().with_timezone(&offset);
+    seconds_until_configured_window_end_at(start, end, now)
+}
+
+pub fn seconds_until_configured_window_end_at(
+    start: &str,
+    end: &str,
+    now: DateTime<FixedOffset>,
+) -> Result<Option<u64>> {
+    let start = parse_time(start)?;
+    let end = parse_time(end)?;
+    if !in_window_values(start, end, now.time()) {
+        return Ok(None);
+    }
+
+    let end_date = if start <= end || now.time() <= end {
+        now.date_naive()
+    } else {
+        now.date_naive() + ChronoDuration::days(1)
+    };
+    let end_local = end_date
+        .and_time(end)
+        .and_local_timezone(*now.offset())
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("无法计算签到窗口结束时间"))?;
+    Ok(Some((end_local - now).num_seconds().max(0) as u64))
+}
+
+fn timezone_offset(timezone: &str) -> Result<FixedOffset> {
+    match timezone {
         "Asia/Shanghai" => FixedOffset::east_opt(8 * 60 * 60),
         "UTC" | "Etc/UTC" => FixedOffset::east_opt(0),
         _ => bail!(
@@ -67,9 +115,15 @@ pub fn in_configured_window(start: &str, end: &str, timezone: &str) -> Result<bo
             timezone
         ),
     }
-    .ok_or_else(|| anyhow::anyhow!("无效 UTC offset"))?;
-    let now = Utc::now().with_timezone(&offset);
-    in_window(start, end, now.time())
+    .ok_or_else(|| anyhow::anyhow!("无效 UTC offset"))
+}
+
+fn in_window_values(start: NaiveTime, end: NaiveTime, now: NaiveTime) -> bool {
+    if start <= end {
+        now >= start && now <= end
+    } else {
+        now >= start || now <= end
+    }
 }
 
 #[expect(
@@ -157,6 +211,44 @@ mod tests {
         assert!(matches!("Asia/Shanghai", "Asia/Shanghai"));
         assert!(in_configured_window("21:30", "23:59", "Asia/Shanghai").is_ok());
         assert!(in_configured_window("21:30", "23:59", "Mars/Olympus").is_err());
+    }
+
+    #[test]
+    fn window_end_remaining_is_bounded_for_active_window() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-27T22:00:00+08:00").unwrap();
+        assert_eq!(
+            seconds_until_configured_window_end_at("21:30", "23:59", now).unwrap(),
+            Some(7_140)
+        );
+
+        let near_end = chrono::DateTime::parse_from_rfc3339("2026-09-27T23:58:59+08:00").unwrap();
+        assert_eq!(
+            seconds_until_configured_window_end_at("21:30", "23:59", near_end).unwrap(),
+            Some(1)
+        );
+
+        let outside = chrono::DateTime::parse_from_rfc3339("2026-09-27T20:00:00+08:00").unwrap();
+        assert_eq!(
+            seconds_until_configured_window_end_at("21:30", "23:59", outside).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn window_end_remaining_handles_midnight_crossing() {
+        let before_midnight =
+            chrono::DateTime::parse_from_rfc3339("2026-09-27T23:45:00+08:00").unwrap();
+        assert_eq!(
+            seconds_until_configured_window_end_at("23:30", "00:30", before_midnight).unwrap(),
+            Some(2_700)
+        );
+
+        let after_midnight =
+            chrono::DateTime::parse_from_rfc3339("2026-09-28T00:10:00+08:00").unwrap();
+        assert_eq!(
+            seconds_until_configured_window_end_at("23:30", "00:30", after_midnight).unwrap(),
+            Some(1_200)
+        );
     }
 
     #[test]

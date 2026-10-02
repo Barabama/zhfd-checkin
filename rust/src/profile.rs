@@ -36,11 +36,11 @@ pub struct Profile {
 }
 
 // The successful historical LDPlayer run was 900x1600 at the device
-// reported 320 dpi. The required 240 dpi presets are present but remain
-// uncalibrated for live clicks until each preset also passes an in-window
-// state/interaction validation run.
-// The portrait 900x1600@240 fallback was measured on 2026-09-25 at (449,778)
-// with a 232 px circle; it remains non-live until in-window dry-run validation.
+// reported 320 dpi. The required 240 dpi presets remain non-live until each
+// preset passes an in-window state/interaction validation run. The portrait
+// 900x1600@240 profile passed the first in-window dry-run on 2026-09-26 and
+// is the only 240 dpi profile currently enabled for guarded live verification.
+// Its fallback was measured on 2026-09-25 at (449,778) with a 232 px circle.
 pub const PROFILES: &[Profile] = &[
     Profile {
         id: "landscape_1600x900_d240",
@@ -63,7 +63,10 @@ pub const PROFILES: &[Profile] = &[
         button_center_ratio: (0.4994, 0.4863),
         button_box_ratio: (0.2578, 0.1450),
         service_icon_center_ratio: (0.1417, 0.5919),
-        calibrated: false,
+        // 2026-09-26 in-window dry-run: locating -> ready -> ready,
+        // dry_run_ready=true, clicked=false. Enable only this profile for
+        // the first guarded live verification.
+        calibrated: true,
     },
     Profile {
         id: "landscape_1280x720_d240",
@@ -234,10 +237,14 @@ mod tests {
             let profile = find_profile(*width, *height, *dpi).expect("required profile missing");
             assert_eq!(profile.id, *id);
             assert_eq!(profile.orientation, *orientation);
-            assert!(
-                !profile.calibrated,
-                "new profile must not be click-enabled without measurement"
-            );
+            if *id == "portrait_900x1600_d240" {
+                assert!(profile.calibrated);
+            } else {
+                assert!(
+                    !profile.calibrated,
+                    "unverified profile must not be click-enabled"
+                );
+            }
         }
     }
 
@@ -264,7 +271,7 @@ mod tests {
             let profile = find_profile_by_id(id).expect("measured profile missing");
             assert_eq!(profile.button_center_ratio, center);
             assert_eq!(profile.button_box_ratio, region);
-            assert!(!profile.calibrated);
+            assert_eq!(profile.calibrated, id == "portrait_900x1600_d240");
         }
     }
 

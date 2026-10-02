@@ -125,6 +125,12 @@ impl AdbDevice {
         if !output.status.success() {
             bail!("截图失败: {}", text(&output.stderr));
         }
+        if output.stdout.is_empty() {
+            bail!(
+                "截图返回空内容，设备可能 offline 或正在重启: {}",
+                self.serial
+            );
+        }
         Ok(output.stdout)
     }
 
