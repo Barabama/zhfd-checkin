@@ -54,6 +54,11 @@ try {
     if ($about -notmatch "zhfd-checkin") {
         throw "Portable about output did not contain the application name."
     }
+    foreach ($aboutMarker in @("Git commit:", "支持 Profile:", "视觉依赖:", "设备依赖:")) {
+        if ($about -notmatch [regex]::Escape($aboutMarker)) {
+            throw "Portable about output is missing metadata: $aboutMarker"
+        }
+    }
 
     $profiles = Invoke-PortableApp @("profile", "list")
     foreach ($id in @(
@@ -80,6 +85,13 @@ try {
         throw "Portable config output did not resolve beside the EXE: $stageConfig"
     }
 
+    foreach ($directoryName in @("logs", "captures", "reports")) {
+        $stageDirectory = Join-Path $stage $directoryName
+        if (-not (Test-Path -LiteralPath $stageDirectory -PathType Container)) {
+            throw "Portable EXE did not create expected directory: $directoryName"
+        }
+    }
+
     $reportText = Invoke-PortableApp @("report")
     $stageReports = Join-Path $stage "reports"
     if (-not (Test-Path -LiteralPath $stageReports -PathType Container)) {
@@ -103,6 +115,7 @@ try {
     Write-Host "exe=$stageExe"
     Write-Host "profile_count=8+"
     Write-Host "vision_state=$($vision.state)"
+    Write-Host "runtime_dirs=logs,captures,reports"
     Write-Host "config=$stageConfig"
 }
 finally {

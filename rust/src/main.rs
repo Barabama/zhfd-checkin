@@ -1,4 +1,5 @@
 mod adb;
+mod apk;
 mod config;
 mod domain;
 mod gui;
@@ -11,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use config::ConfigStore;
 use domain::{ExitCode, Mode, RunResult};
-use logger::RunLog;
+use logger::{RunLog, SyncGeometry, SyncLog, SyncResult};
 use std::{
     path::PathBuf,
     process::Command,
@@ -22,6 +23,10 @@ use std::{
 const LDPLAYER_URL: &str = "https://www.ldmnq.com/";
 const ZHFD_URL: &str = "https://app.fzu.edu.cn/fd-app/m/index.html";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_COMMIT: &str = match option_env!("ZHFD_GIT_COMMIT") {
+    Some(value) => value,
+    None => "unknown",
+};
 
 #[derive(Parser, Debug)]
 #[command(name="zhfd-checkin", version=VERSION, about="智汇福大 LDPlayer 自动签到控制器")]
@@ -32,7 +37,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CommandKind {
-    Diagnose,
+    Diagnose {
+        #[command(flatten)]
+        target: InstanceTargetArgs,
+    },
     Report,
     Profile {
         #[command(subcommand)]
@@ -49,6 +57,10 @@ enum CommandKind {
     },
     About,
     Gui,
+    Instance {
+        #[command(subcommand)]
+        command: InstanceCommand,
+    },
     Task {
         #[command(subcommand)]
         command: TaskCommand,
@@ -65,12 +77,17 @@ enum CommandKind {
 #[derive(Subcommand, Debug)]
 enum ProfileCommand {
     List,
-    Detect,
+    Detect {
+        #[command(flatten)]
+        target: InstanceTargetArgs,
+    },
     Sync {
         #[arg(long)]
         id: String,
         #[arg(long)]
         confirm: bool,
+        #[command(flatten)]
+        target: InstanceTargetArgs,
     },
 }
 #[derive(Subcommand, Debug)]
@@ -78,6 +95,8 @@ enum AppCommand {
     Install {
         #[arg(long)]
         apk: PathBuf,
+        #[command(flatten)]
+        target: InstanceTargetArgs,
     },
 }
 #[derive(Subcommand, Debug)]
@@ -85,6 +104,19 @@ enum ConfigCommand {
     Show,
     Open,
 }
+#[derive(Subcommand, Debug)]
+enum InstanceCommand {
+    List,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+struct InstanceTargetArgs {
+    #[arg(long, help = "选择 LDPlayer 实例 index；默认使用 config.toml")]
+    instance_index: Option<u32>,
+    #[arg(long, help = "显式指定 ADB serial；覆盖实例 index 推导值")]
+    serial: Option<String>,
+}
+
 #[derive(Subcommand, Debug)]
 enum TaskCommand {
     Create {
@@ -94,6 +126,10 @@ enum TaskCommand {
         live: bool,
         #[arg(long, requires = "live")]
         confirm: bool,
+        #[arg(long, help = "让计划任务依次运行所有已发现实例")]
+        all_instances: bool,
+        #[command(flatten)]
+        target: InstanceTargetArgs,
     },
     Delete {
         #[arg(long, default_value = "ZHFD-AutoCheckin")]
@@ -106,9 +142,12 @@ enum TaskCommand {
 }
 #[derive(Subcommand, Debug)]
 enum UiCommand {
-    Dump,
+    Dump {
+        #[command(flatten)]
+        target: InstanceTargetArgs,
+    },
 }
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct RunArgs {
     #[arg(long, conflicts_with = "live")]
     dry_run: bool,
@@ -116,6 +155,10 @@ struct RunArgs {
     live: bool,
     #[arg(long, requires = "live")]
     confirm: bool,
+    #[arg(long, help = "依次运行所有已发现的 LDPlayer 实例")]
+    all_instances: bool,
+    #[command(flatten)]
+    target: InstanceTargetArgs,
 }
 
 fn main() {
@@ -141,16 +184,137 @@ fn run_cli() -> Result<ExitCode> {
             gui::launch(store)?;
             Ok(ExitCode::Ok)
         }
+        CommandKind::Instance { command } => instance_command(&store, command),
         CommandKind::Task { command } => task_command(command),
         CommandKind::Ui { command } => ui_command(&store, command),
         CommandKind::Vision { image } => analyze_image(&image),
         CommandKind::Config { command } => config_command(&store, command),
         CommandKind::Profile { command } => profile_command(&store, command),
-        CommandKind::Diagnose => diagnose(&store),
+        CommandKind::Diagnose { target } => diagnose(&store, &target),
         CommandKind::Report => write_report(&store),
         CommandKind::App { command } => app_command(&store, command),
         CommandKind::Run(args) => run(&store, args),
     }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedInstance {
+    index: u32,
+    name: String,
+    serial: String,
+}
+
+fn resolve_instance_target(
+    ld: &ldplayer::LdPlayer,
+    store: &ConfigStore,
+    target: Option<&InstanceTargetArgs>,
+) -> Result<ResolvedInstance> {
+    let target = target.cloned().unwrap_or_default();
+    let instances = ld.instances()?;
+    if instances.is_empty() {
+        bail!("LDPlayer 没有可用实例");
+    }
+    let configured_instances = store.config.emulator.effective_instances();
+    let requested_serial = target.serial.filter(|value| !value.trim().is_empty());
+
+    let index_from_serial = requested_serial.as_deref().and_then(|serial| {
+        instances.iter().find_map(|instance| {
+            let default_serial = ldplayer::LdPlayer::serial_for_index(instance.index);
+            let configured_match = configured_instances.iter().any(|configured| {
+                configured.instance_index == instance.index && configured.serial.trim() == serial
+            });
+            (default_serial == serial || configured_match).then_some(instance.index)
+        })
+    });
+
+    if requested_serial.is_some() && index_from_serial.is_none() {
+        bail!(
+            "ADB serial 未匹配到已发现的 LDPlayer 实例: {}",
+            requested_serial.as_deref().unwrap()
+        );
+    }
+    if let (Some(requested_index), Some(mapped_index)) = (target.instance_index, index_from_serial)
+        && requested_index != mapped_index
+    {
+        bail!(
+            "实例 index 与 ADB serial 不一致: index={} serial={} 实际对应 index={}",
+            requested_index,
+            requested_serial.as_deref().unwrap_or(""),
+            mapped_index
+        );
+    }
+
+    let index = target
+        .instance_index
+        .or(index_from_serial)
+        .unwrap_or(store.config.emulator.instance_index);
+    let instance = instances
+        .iter()
+        .find(|instance| instance.index == index)
+        .with_context(|| format!("LDPlayer 实例不存在: {}", index))?;
+    let configured_instance = configured_instances
+        .into_iter()
+        .find(|configured| configured.instance_index == index);
+    let serial = requested_serial
+        .or_else(|| {
+            configured_instance
+                .as_ref()
+                .filter(|configured| !configured.serial.trim().is_empty())
+                .map(|configured| configured.serial.clone())
+        })
+        .or_else(|| {
+            let configured = store.config.emulator.serial.trim();
+            (index == store.config.emulator.instance_index && !configured.is_empty())
+                .then(|| configured.to_string())
+        })
+        .unwrap_or_else(|| ldplayer::LdPlayer::serial_for_index(index));
+    let name = configured_instance
+        .as_ref()
+        .filter(|configured| !configured.name.trim().is_empty())
+        .map(|configured| configured.name.clone())
+        .unwrap_or_else(|| instance.name.clone());
+    Ok(ResolvedInstance {
+        index,
+        name,
+        serial,
+    })
+}
+
+fn instance_command(store: &ConfigStore, command: InstanceCommand) -> Result<ExitCode> {
+    match command {
+        InstanceCommand::List => {
+            let ld =
+                ldplayer::LdPlayer::discover(&store.config.emulator.ldconsole_path, &store.root)?;
+            println!("LDPlayer: {}", ld.executable.display());
+            let configured_instances = store.config.emulator.effective_instances();
+            for instance in ld.instances()? {
+                let serial = ldplayer::LdPlayer::serial_for_index(instance.index);
+                let configured = configured_instances
+                    .iter()
+                    .find(|configured| configured.instance_index == instance.index);
+                let display_name = configured
+                    .and_then(|item| (!item.name.trim().is_empty()).then_some(item.name.as_str()))
+                    .unwrap_or(&instance.name);
+                println!(
+                    "index={} name={} running={} serial={} adb_port={:?} size={:?}x{:?} dpi={:?} configured={}",
+                    instance.index,
+                    display_name,
+                    instance.running,
+                    configured
+                        .and_then(
+                            |item| (!item.serial.trim().is_empty()).then_some(item.serial.as_str())
+                        )
+                        .unwrap_or(&serial),
+                    instance.adb_port,
+                    instance.width,
+                    instance.height,
+                    instance.dpi,
+                    configured.is_some(),
+                );
+            }
+        }
+    }
+    Ok(ExitCode::Ok)
 }
 
 fn write_report(store: &ConfigStore) -> Result<ExitCode> {
@@ -179,10 +343,26 @@ fn analyze_image(path: &PathBuf) -> Result<ExitCode> {
 
 fn print_about() {
     println!("zhfd-checkin {}", VERSION);
+    println!("Git commit: {}", GIT_COMMIT);
     println!("Rust Windows 便携式 CLI");
     println!("雷电模拟器官网: {}", LDPLAYER_URL);
     println!("智汇福大官网: {}", ZHFD_URL);
     println!("配置/日志根目录: EXE 所在目录");
+    println!("支持 Profile: {}", profile::PROFILES.len());
+    for supported in profile::PROFILES {
+        println!(
+            "  {} {}x{}@{} {} calibrated={}",
+            supported.id,
+            supported.width,
+            supported.height,
+            supported.density_dpi,
+            supported.orientation.as_str(),
+            supported.calibrated
+        );
+    }
+    println!("视觉依赖: image + 手写 HSV/像素统计/行结构");
+    println!("设备依赖: ADB + LDPlayer ldconsole.exe");
+    println!("GUI: eframe/egui + rfd");
 }
 
 fn config_command(store: &ConfigStore, command: ConfigCommand) -> Result<ExitCode> {
@@ -226,29 +406,95 @@ fn profile_command(store: &ConfigStore, command: ProfileCommand) -> Result<ExitC
                 );
             }
         }
-        ProfileCommand::Detect => {
-            let (_, device, info) = runtime(store, false)?;
+        ProfileCommand::Detect { target } => {
+            let (_, device, info) = runtime_with_target(store, false, Some(&target))?;
             print_device(&device.serial, &info);
             match profile::find_profile(info.width, info.height, info.density_dpi) {
                 Some(p) => println!("profile={}", p.id),
                 None => println!("profile=unknown"),
             };
         }
-        ProfileCommand::Sync { id, confirm } => {
-            sync_profile(store, &id, confirm)?;
+        ProfileCommand::Sync {
+            id,
+            confirm,
+            target,
+        } => {
+            sync_profile(store, &id, confirm, &target)?;
         }
     }
     Ok(ExitCode::Ok)
 }
 
-fn sync_profile(store: &ConfigStore, id: &str, confirm: bool) -> Result<ExitCode> {
+fn sync_profile(
+    store: &ConfigStore,
+    id: &str,
+    confirm: bool,
+    instance_target: &InstanceTargetArgs,
+) -> Result<ExitCode> {
     if !confirm {
         bail!("同步模拟器配置会修改分辨率/DPI并重启实例，请指定 --confirm");
     }
     let target =
         profile::find_profile_by_id(id).with_context(|| format!("未知 profile: {}", id))?;
+    let target_geometry = SyncGeometry {
+        source: "requested_profile".into(),
+        width: Some(target.width),
+        height: Some(target.height),
+        density_dpi: Some(target.density_dpi),
+        profile_id: Some(target.id.to_string()),
+    };
+    let sync_log = SyncLog::new(&store.root)?;
+    let mut record = SyncResult {
+        action: "profile_sync".into(),
+        profile_id: target.id.to_string(),
+        instance_index: instance_target
+            .instance_index
+            .unwrap_or(store.config.emulator.instance_index),
+        target: target_geometry,
+        before: None,
+        after: None,
+        backup_path: None,
+        mutation_attempted: false,
+        modified: false,
+        restarted: false,
+        rollback_attempted: false,
+        rollback_succeeded: false,
+        status: "started".into(),
+        error: None,
+    };
+    sync_log.event("start", &record)?;
+
+    let operation = sync_profile_inner(store, target, instance_target, &sync_log, &mut record);
+    match operation {
+        Ok(()) => {
+            record.status = "success".into();
+            sync_log.event("verified", &record)?;
+            sync_log.save_json("sync.json", &record)?;
+            println!("同步完成；结构化日志: {}", sync_log.dir.display());
+            println!("model/IMEI/账号/定位数据未修改");
+            Ok(ExitCode::Ok)
+        }
+        Err(error) => {
+            record.status = "failed".into();
+            record.error = Some(format!("{:#}", error));
+            let _ = sync_log.event("failure", &record);
+            let _ = sync_log.save_json("sync.json", &record);
+            Err(error)
+        }
+    }
+}
+
+fn sync_profile_inner(
+    store: &ConfigStore,
+    target: &profile::Profile,
+    instance_target: &InstanceTargetArgs,
+    sync_log: &SyncLog,
+    record: &mut SyncResult,
+) -> Result<()> {
     let ld = ldplayer::LdPlayer::discover(&store.config.emulator.ldconsole_path, &store.root)?;
-    let index = store.config.emulator.instance_index;
+    let selected = resolve_instance_target(&ld, store, Some(instance_target))?;
+    record.instance_index = selected.index;
+    let index = selected.index;
     let instance = ld.instance(index)?;
     let source = ld.executable.parent().map(|parent| {
         parent
@@ -256,47 +502,214 @@ fn sync_profile(store: &ConfigStore, id: &str, confirm: bool) -> Result<ExitCode
             .join("config")
             .join(format!("leidian{}.config", index))
     });
-    let backup = source.as_ref().filter(|p| p.is_file()).map(|p| {
-        p.with_extension(format!(
+    let backup = source.as_ref().filter(|path| path.is_file()).map(|path| {
+        path.with_extension(format!(
             "config.bak.{}",
             chrono::Local::now().format("%Y%m%d%H%M%S")
         ))
     });
-    if let (Some(source), Some(backup)) = (source.as_ref().filter(|p| p.is_file()), backup.as_ref())
-    {
-        std::fs::copy(source, backup)
-            .with_context(|| format!("无法备份 LDPlayer 配置: {}", source.display()))?;
-        println!("已备份: {}", backup.display());
-    }
-    let resolution = format!("{},{},{}", target.width, target.height, target.density_dpi);
-    if let Err(error) = ld.command(&[
-        "modify",
-        "--index",
-        &index.to_string(),
-        "--resolution",
-        &resolution,
-    ]) {
-        if let (Some(source), Some(backup)) =
-            (source.as_ref().filter(|p| p.is_file()), backup.as_ref())
-        {
-            let _ = std::fs::copy(backup, source);
-        }
-        return Err(error).context("同步 LDPlayer 分辨率/DPI失败");
-    }
-    println!("已写入 profile {}: {}", target.id, resolution);
+
+    let mut before = geometry_from_instance(&instance);
     if instance.running {
-        ld.command(&["quit", "--index", &index.to_string()])?;
-        ld.wait_for_stopped(index, Duration::from_secs(30))?;
-        ld.launch_wait(
-            index,
-            Duration::from_secs(store.config.runtime.startup_timeout_seconds),
-        )?;
+        match runtime_with_target(store, false, Some(instance_target)) {
+            Ok((_, _, info)) => before = geometry_from_device(&info),
+            Err(error) => {
+                sync_log.event(
+                    "before_read_warning",
+                    serde_json::json!({"error": format!("{:#}", error)}),
+                )?;
+            }
+        }
     }
-    println!("同步完成；model/IMEI/账号/定位数据未修改");
-    Ok(ExitCode::Ok)
+    record.before = Some(before.clone());
+    sync_log.event("before", &before)?;
+
+    let operation: Result<()> = (|| {
+        if let (Some(source), Some(backup)) = (
+            source.as_ref().filter(|path| path.is_file()),
+            backup.as_ref(),
+        ) {
+            std::fs::copy(source, backup)
+                .with_context(|| format!("无法备份 LDPlayer 配置: {}", source.display()))?;
+            record.backup_path = Some(backup.display().to_string());
+            sync_log.event(
+                "backup_created",
+                serde_json::json!({"source": source, "backup": backup}),
+            )?;
+        } else {
+            sync_log.event("backup_unavailable", serde_json::json!({"source": source}))?;
+        }
+
+        let resolution = format!("{},{},{}", target.width, target.height, target.density_dpi);
+        record.mutation_attempted = true;
+        ld.command(&[
+            "modify",
+            "--index",
+            &index.to_string(),
+            "--resolution",
+            &resolution,
+        ])?;
+        record.modified = true;
+        sync_log.event(
+            "modified",
+            serde_json::json!({
+                "index": index,
+                "resolution": resolution,
+                "width": target.width,
+                "height": target.height,
+                "density_dpi": target.density_dpi,
+            }),
+        )?;
+
+        if instance.running {
+            ld.command(&["quit", "--index", &index.to_string()])?;
+            ld.wait_for_stopped(index, Duration::from_secs(30))?;
+            ld.launch_wait(
+                index,
+                Duration::from_secs(store.config.runtime.startup_timeout_seconds),
+            )?;
+            record.restarted = true;
+            sync_log.event("restarted", serde_json::json!({"index": index}))?;
+        }
+
+        let after = if instance.running {
+            let (_, _, info) = runtime_with_target(store, false, Some(instance_target))?;
+            geometry_from_device(&info)
+        } else {
+            geometry_from_instance(&ld.instance(index)?)
+        };
+        record.after = Some(after.clone());
+        sync_log.event("after", &after)?;
+        if !geometry_matches_target(&after, target) {
+            bail!(
+                "同步后实际分辨率/DPI复核失败：实际 {:?}x{:?}@{:?}，目标 {}x{}@{}",
+                after.width,
+                after.height,
+                after.density_dpi,
+                target.width,
+                target.height,
+                target.density_dpi
+            );
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = operation {
+        if record.mutation_attempted {
+            record.rollback_attempted = true;
+            sync_log.event("rollback_started", serde_json::json!({"index": index}))?;
+            match restore_sync_backup(
+                &ld,
+                index,
+                source.as_deref(),
+                backup.as_deref(),
+                instance.running,
+                Duration::from_secs(store.config.runtime.startup_timeout_seconds),
+            ) {
+                Ok(()) => {
+                    record.rollback_succeeded = true;
+                    sync_log.event("rollback_succeeded", serde_json::json!({"index": index}))?;
+                }
+                Err(recovery_error) => {
+                    sync_log.event(
+                        "rollback_failed",
+                        serde_json::json!({"error": format!("{:#}", recovery_error)}),
+                    )?;
+                    return Err(anyhow::anyhow!(
+                        "{}；自动恢复备份失败: {:#}",
+                        error,
+                        recovery_error
+                    ));
+                }
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
-fn diagnose(store: &ConfigStore) -> Result<ExitCode> {
+fn geometry_from_instance(instance: &ldplayer::Instance) -> SyncGeometry {
+    let profile_id = match (instance.width, instance.height, instance.dpi) {
+        (Some(width), Some(height), Some(dpi)) => {
+            profile::find_profile(width, height, dpi).map(|profile| profile.id.to_string())
+        }
+        _ => None,
+    };
+    SyncGeometry {
+        source: "ldplayer_list2".into(),
+        width: instance.width,
+        height: instance.height,
+        density_dpi: instance.dpi,
+        profile_id,
+    }
+}
+
+fn geometry_from_device(info: &adb::DeviceInfo) -> SyncGeometry {
+    SyncGeometry {
+        source: "adb_wm".into(),
+        width: Some(info.width),
+        height: Some(info.height),
+        density_dpi: Some(info.density_dpi),
+        profile_id: profile::find_profile(info.width, info.height, info.density_dpi)
+            .map(|profile| profile.id.to_string()),
+    }
+}
+
+fn geometry_matches_target(geometry: &SyncGeometry, target: &profile::Profile) -> bool {
+    geometry.width == Some(target.width)
+        && geometry.height == Some(target.height)
+        && geometry.density_dpi == Some(target.density_dpi)
+}
+
+trait SyncLifecycle {
+    fn is_running(&self, index: u32) -> Result<bool>;
+    fn stop_and_wait(&self, index: u32) -> Result<()>;
+    fn launch_wait(&self, index: u32, timeout: Duration) -> Result<()>;
+}
+
+impl SyncLifecycle for ldplayer::LdPlayer {
+    fn is_running(&self, index: u32) -> Result<bool> {
+        Ok(self.instance(index)?.running)
+    }
+
+    fn stop_and_wait(&self, index: u32) -> Result<()> {
+        self.command(&["quit", "--index", &index.to_string()])?;
+        self.wait_for_stopped(index, Duration::from_secs(30))
+    }
+
+    fn launch_wait(&self, index: u32, timeout: Duration) -> Result<()> {
+        ldplayer::LdPlayer::launch_wait(self, index, timeout)
+    }
+}
+
+fn restore_sync_backup<R: SyncLifecycle>(
+    controller: &R,
+    index: u32,
+    source: Option<&std::path::Path>,
+    backup: Option<&std::path::Path>,
+    was_running: bool,
+    startup_timeout: Duration,
+) -> Result<()> {
+    let source = source.context("没有找到 LDPlayer 配置源文件，无法恢复")?;
+    let backup = backup.context("没有生成 LDPlayer 配置备份，无法恢复")?;
+    let currently_running = controller.is_running(index).unwrap_or(was_running);
+    if currently_running {
+        controller.stop_and_wait(index)?;
+    }
+    std::fs::copy(backup, source).with_context(|| {
+        format!(
+            "恢复 LDPlayer 配置失败: {} -> {}",
+            backup.display(),
+            source.display()
+        )
+    })?;
+    if was_running {
+        controller.launch_wait(index, startup_timeout)?;
+    }
+    Ok(())
+}
+
+fn diagnose(store: &ConfigStore, instance_target: &InstanceTargetArgs) -> Result<ExitCode> {
     let ld = ldplayer::LdPlayer::discover(&store.config.emulator.ldconsole_path, &store.root)?;
     println!("LDPlayer: {}", ld.executable.display());
     let instances = ld.instances()?;
@@ -310,7 +723,7 @@ fn diagnose(store: &ConfigStore) -> Result<ExitCode> {
             i.index, i.name, i.running, i.adb_port, i.width, i.height, i.dpi
         );
     }
-    let (_, device, info) = runtime(store, false)?;
+    let (_, device, info) = runtime_with_target(store, false, Some(instance_target))?;
     print_device(&device.serial, &info);
     if let Some(p) = profile::find_profile(info.width, info.height, info.density_dpi) {
         println!("profile={} calibrated={}", p.id, p.calibrated);
@@ -320,23 +733,91 @@ fn diagnose(store: &ConfigStore) -> Result<ExitCode> {
     Ok(ExitCode::Ok)
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ApkInstallResult {
+    pub install_output: String,
+    pub package_name: String,
+    pub version: String,
+}
+
+pub(crate) fn install_apk(
+    store: &ConfigStore,
+    apk: &std::path::Path,
+    instance_target: &InstanceTargetArgs,
+) -> Result<ApkInstallResult> {
+    let metadata = apk::inspect_apk(apk)?;
+    if metadata.package_name != store.config.app.package_name {
+        bail!(
+            "APK 包名不匹配：实际={}，目标={}",
+            metadata.package_name,
+            store.config.app.package_name
+        );
+    }
+    let (_, device, _) = runtime_with_target(store, true, Some(instance_target))?;
+    install_apk_on_device(store, apk, &device)
+}
+
+fn install_apk_on_device(
+    store: &ConfigStore,
+    apk: &std::path::Path,
+    device: &adb::AdbDevice,
+) -> Result<ApkInstallResult> {
+    let install_output = device.install_apk(apk)?;
+    let version = device.package_version(&store.config.app.package_name)?;
+    let mut saved = store.clone();
+    saved.config.app.apk_path = config::path_for_config(&store.root, apk);
+    saved.save()?;
+    Ok(ApkInstallResult {
+        install_output,
+        package_name: store.config.app.package_name.clone(),
+        version,
+    })
+}
+
+pub(crate) fn inspect_apk_metadata(apk: &std::path::Path) -> Result<apk::ApkMetadata> {
+    apk::inspect_apk(apk)
+}
+
+pub(crate) fn installed_app_version(
+    store: &ConfigStore,
+    instance_target: &InstanceTargetArgs,
+) -> Result<String> {
+    let (_, device, _) = runtime_with_target(store, false, Some(instance_target))?;
+    device.package_version(&store.config.app.package_name)
+}
+
 fn app_command(store: &ConfigStore, command: AppCommand) -> Result<ExitCode> {
     match command {
-        AppCommand::Install { apk } => {
-            let (_, device, _) = runtime(store, true)?;
+        AppCommand::Install { apk, target } => {
             println!("安装 APK: {}", apk.display());
-            println!("{}", device.install_apk(&apk)?);
-            let version = device.package_version(&store.config.app.package_name)?;
-            println!(
-                "安装后包校验: {} {}",
-                store.config.app.package_name, version
-            );
-            let mut saved = store.clone();
-            saved.config.app.apk_path = config::path_for_config(&store.root, &apk);
-            saved.save()?;
+            let result = install_apk(store, &apk, &target)?;
+            println!("{}", result.install_output);
+            println!("安装后包校验: {} {}", result.package_name, result.version);
             Ok(ExitCode::Ok)
         }
     }
+}
+
+fn build_task_command_line(
+    exe: &std::path::Path,
+    mode: &str,
+    all_instances: bool,
+    target: &InstanceTargetArgs,
+) -> String {
+    let mut task_run = format!("\"{}\" {}", exe.display(), mode);
+    if all_instances {
+        task_run.push_str(" --all-instances");
+    } else if let Some(index) = target.instance_index {
+        task_run.push_str(&format!(" --instance-index {}", index));
+    }
+    if let Some(serial) = target
+        .serial
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        task_run.push_str(&format!(" --serial {}", serial));
+    }
+    task_run
 }
 
 fn task_command(command: TaskCommand) -> Result<ExitCode> {
@@ -345,6 +826,8 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
             name,
             live,
             confirm,
+            all_instances,
+            target,
         } => {
             if live && !confirm {
                 bail!("正式计划任务必须同时指定 --live --confirm");
@@ -355,7 +838,7 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
             } else {
                 "run --dry-run"
             };
-            let task_run = format!("\"{}\" {}", exe.display(), mode);
+            let task_run = build_task_command_line(&exe, mode, all_instances, &target);
             let store = ConfigStore::load()?;
             let start = store.config.window.start.clone();
             let output = Command::new("schtasks.exe")
@@ -401,8 +884,8 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
 
 fn ui_command(store: &ConfigStore, command: UiCommand) -> Result<ExitCode> {
     match command {
-        UiCommand::Dump => {
-            let (_, device, _) = runtime(store, false)?;
+        UiCommand::Dump { target } => {
+            let (_, device, _) = runtime_with_target(store, false, Some(&target))?;
             println!("{}", device.dump_hierarchy()?);
         }
     }
@@ -417,12 +900,14 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
     } else {
         Mode::from_config(&store.config.runtime.mode)?
     };
-    if mode == Mode::Live && !args.confirm {
-        bail!("正式模式必须同时指定 --live --confirm")
+    if args.all_instances {
+        return run_all_instances(store, args);
     }
     let log = RunLog::new(&store.root)?;
     let mut result = RunResult {
         mode: mode.as_str().into(),
+        instance_index: args.target.instance_index,
+        instance_name: None,
         serial: String::new(),
         profile_id: None,
         state_history: vec![],
@@ -432,16 +917,107 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
         error: None,
     };
     log.event("start", serde_json::json!({"mode":mode.as_str()}))?;
-    let (_, device, info) = match runtime(store, true) {
-        Ok(v) => v,
-        Err(e) => {
-            result.error = Some(e.to_string());
-            let _ = log.save_json("result.json", &result);
-            println!("运行环境失败: {:#}", e);
-            return Ok(ExitCode::DeviceFailure);
+    if mode == Mode::Live && !args.confirm {
+        result.error = Some("live_confirmation_required".into());
+        finalize_run(&log, &result)?;
+        println!("结果: {}", serde_json::to_string_pretty(&result)?);
+        return Ok(ExitCode::BusinessFailure);
+    }
+
+    let execution = run_inner(store, &args, mode, &log, &mut result);
+    let code = match execution {
+        Ok(code) => code,
+        Err(error) => {
+            if result.error.is_none() {
+                result.error = Some(format!("{:#}", error));
+            }
+            eprintln!("运行失败: {:#}", error);
+            ExitCode::DeviceFailure
         }
     };
+
+    finalize_run(&log, &result)?;
+    println!("结果: {}", serde_json::to_string_pretty(&result)?);
+    Ok(code)
+}
+
+fn finalize_run(log: &RunLog, result: &RunResult) -> Result<()> {
+    log.save_json("result.json", result)?;
+    log.event("finish", result)?;
+    Ok(())
+}
+
+fn run_all_instances(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
+    if args.target.instance_index.is_some() || args.target.serial.is_some() {
+        bail!("--all-instances 不能与 --instance-index 或 --serial 同时使用");
+    }
+    let configured = store.config.emulator.effective_instances();
+    if configured.is_empty() {
+        bail!("没有启用的 LDPlayer 实例");
+    }
+    let mut overall = ExitCode::Ok;
+    for configured_instance in configured {
+        let mut per_instance = args.clone();
+        per_instance.all_instances = false;
+        per_instance.target = InstanceTargetArgs {
+            instance_index: Some(configured_instance.instance_index),
+            serial: (!configured_instance.serial.trim().is_empty())
+                .then_some(configured_instance.serial.clone()),
+        };
+        println!(
+            "=== 运行实例 {} ({}) serial={} ===",
+            configured_instance.instance_index,
+            if configured_instance.name.trim().is_empty() {
+                "未命名"
+            } else {
+                configured_instance.name.as_str()
+            },
+            per_instance
+                .target
+                .serial
+                .as_deref()
+                .unwrap_or("按 index 推导")
+        );
+        let code = run(store, per_instance)?;
+        if code as i32 > overall as i32 {
+            overall = code;
+        }
+    }
+    Ok(overall)
+}
+
+fn run_inner(
+    store: &ConfigStore,
+    args: &RunArgs,
+    mode: Mode,
+    log: &RunLog,
+    result: &mut RunResult,
+) -> Result<ExitCode> {
+    run_inner_with_device(store, args, mode, log, result, |store, launch, target| {
+        runtime_with_target(store, launch, Some(target))
+    })
+}
+
+fn run_inner_with_device<F>(
+    store: &ConfigStore,
+    args: &RunArgs,
+    mode: Mode,
+    log: &RunLog,
+    result: &mut RunResult,
+    runtime_provider: F,
+) -> Result<ExitCode>
+where
+    F: FnOnce(
+        &ConfigStore,
+        bool,
+        &InstanceTargetArgs,
+    ) -> Result<(ldplayer::LdPlayer, adb::AdbDevice, adb::DeviceInfo)>,
+{
+    let (ld, device, info) = runtime_provider(store, true, &args.target)?;
     result.serial = device.serial.clone();
+    let selected = resolve_instance_target(&ld, store, Some(&args.target))?;
+    result.instance_index = Some(selected.index);
+    result.instance_name = Some(selected.name);
     let profile = match profile::find_profile(info.width, info.height, info.density_dpi) {
         Some(p) => p,
         None => {
@@ -450,16 +1026,13 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
                 "profile_unknown",
                 serde_json::json!({"width":info.width,"height":info.height,"dpi":info.density_dpi}),
             )?;
-            log.save_json("result.json", &result)?;
             return Ok(ExitCode::VisionFailure);
         }
     };
     result.profile_id = Some(profile.id.to_string());
     if mode == Mode::Live && !profile.calibrated {
-        bail!(
-            "当前 profile 尚未完成生产标定，正式模式禁止点击: {}",
-            profile.id
-        )
+        result.error = Some("uncalibrated_profile".into());
+        return Ok(ExitCode::BusinessFailure);
     }
     device.launch_package(
         &store.config.app.package_name,
@@ -471,12 +1044,30 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
         Duration::from_secs(store.config.runtime.startup_timeout_seconds),
     )?;
     thread::sleep(Duration::from_millis(800));
-    let _initial_button = locate_or_navigate(&device, profile, &log)?;
+    let _initial_button = locate_or_navigate(&device, profile, log)?;
     let started = Instant::now();
     let mut unknowns = 0u32;
     let mut ready_frames = 0u32;
     let mut click_deadline: Option<Instant> = None;
     loop {
+        if click_deadline.is_none() {
+            let within_window = domain::in_configured_window(
+                &store.config.window.start,
+                &store.config.window.end,
+                &store.config.window.timezone,
+            )?;
+            if !within_window {
+                result.error = Some("outside_window".into());
+                break;
+            }
+            if started.elapsed()
+                >= Duration::from_secs(store.config.runtime.location_timeout_seconds)
+            {
+                result.error = Some("location_timeout".into());
+                break;
+            }
+        }
+
         let bytes = device.screenshot()?;
         log.save_bytes(
             &format!("state_{}.png", result.state_history.len() + 1),
@@ -493,25 +1084,26 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
             result.success = true;
             break;
         }
-        if click_deadline.is_none()
-            && started.elapsed()
-                > Duration::from_secs(store.config.runtime.location_timeout_seconds)
-        {
-            result.error = Some("location_timeout".into());
-            break;
+        if let Some(deadline) = click_deadline {
+            if deadline.elapsed()
+                > Duration::from_secs(store.config.runtime.success_timeout_seconds)
+            {
+                result.error = Some("success_timeout".into());
+                break;
+            }
+            // A delayed UI frame may still look ready after the tap. Once a
+            // tap has happened, only wait for success; never tap again.
+            thread::sleep(Duration::from_secs(3));
+            continue;
         }
         match analysis.state {
             vision::ButtonState::Gray => {
                 ready_frames = 0;
-                thread::sleep(Duration::from_secs(
-                    store.config.runtime.locating_poll_seconds,
-                ));
+                sleep_for_next_poll(store, started)?;
             }
             vision::ButtonState::Locating => {
                 ready_frames = 0;
-                thread::sleep(Duration::from_secs(
-                    store.config.runtime.locating_poll_seconds,
-                ));
+                sleep_for_next_poll(store, started)?;
             }
             vision::ButtonState::Ready => {
                 let within_window = domain::in_configured_window(
@@ -551,19 +1143,31 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
                     &store.config.window.end,
                     &store.config.window.timezone,
                 )?;
-                if let Err(policy_error) = domain::authorize_click(
-                    mode,
-                    args.confirm,
-                    profile.calibrated,
-                    foreground_matches,
-                    policy_window,
-                    ready_frames,
-                    store.config.runtime.stable_frames,
+                match guarded_tap(
+                    &device,
+                    TapRequest {
+                        state: confirm.state,
+                        mode,
+                        explicit_confirmation: args.confirm,
+                        profile_calibrated: profile.calibrated,
+                        foreground_matches,
+                        within_window: policy_window,
+                        ready_frames,
+                        required_frames: store.config.runtime.stable_frames,
+                        x: confirm_button.cx,
+                        y: confirm_button.cy,
+                    },
                 ) {
-                    result.error = Some(policy_error.to_string());
-                    break;
+                    Ok(true) => {}
+                    Ok(false) => {
+                        result.error = Some("ready_confirmation_failed".into());
+                        break;
+                    }
+                    Err(policy_error) => {
+                        result.error = Some(policy_error.to_string());
+                        break;
+                    }
                 }
-                device.tap(confirm_button.cx, confirm_button.cy)?;
                 result.clicked = true;
                 log.event(
                     "clicked_ready",
@@ -571,7 +1175,10 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
                 )?;
                 click_deadline = Some(Instant::now());
             }
-            vision::ButtonState::Success => unreachable!("success handled before match"),
+            vision::ButtonState::Success => {
+                result.success = true;
+                break;
+            }
             vision::ButtonState::Unknown => {
                 unknowns += 1;
                 ready_frames = 0;
@@ -580,16 +1187,6 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
                     break;
                 }
                 thread::sleep(Duration::from_secs(1));
-            }
-        }
-        if let Some(deadline) = click_deadline {
-            if deadline.elapsed()
-                > Duration::from_secs(store.config.runtime.success_timeout_seconds)
-            {
-                result.error = Some("success_timeout".into());
-                break;
-            } else {
-                thread::sleep(Duration::from_secs(3));
             }
         }
     }
@@ -602,18 +1199,80 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
     } else {
         ExitCode::BusinessFailure
     };
-    log.save_json("result.json", &result)?;
-    log.event("finish", &result)?;
-    println!("结果: {}", serde_json::to_string_pretty(&result)?);
     Ok(code)
 }
 
-fn runtime(
+trait TapDevice {
+    fn tap_at(&self, x: u32, y: u32) -> Result<()>;
+}
+
+impl TapDevice for adb::AdbDevice {
+    fn tap_at(&self, x: u32, y: u32) -> Result<()> {
+        self.tap(x, y)
+    }
+}
+
+struct TapRequest {
+    state: vision::ButtonState,
+    mode: Mode,
+    explicit_confirmation: bool,
+    profile_calibrated: bool,
+    foreground_matches: bool,
+    within_window: bool,
+    ready_frames: u32,
+    required_frames: u32,
+    x: u32,
+    y: u32,
+}
+
+fn guarded_tap<D: TapDevice>(device: &D, request: TapRequest) -> Result<bool> {
+    if request.state != vision::ButtonState::Ready {
+        return Ok(false);
+    }
+    domain::authorize_click(
+        request.mode,
+        request.explicit_confirmation,
+        request.profile_calibrated,
+        request.foreground_matches,
+        request.within_window,
+        request.ready_frames,
+        request.required_frames,
+    )?;
+    device.tap_at(request.x, request.y)?;
+    Ok(true)
+}
+
+fn sleep_for_next_poll(store: &ConfigStore, started: Instant) -> Result<()> {
+    let location_remaining = Duration::from_secs(
+        store
+            .config
+            .runtime
+            .location_timeout_seconds
+            .saturating_sub(started.elapsed().as_secs()),
+    );
+    let mut sleep_for = Duration::from_secs(store.config.runtime.locating_poll_seconds);
+    sleep_for = sleep_for.min(location_remaining);
+    if let Some(window_remaining) = domain::seconds_until_configured_window_end(
+        &store.config.window.start,
+        &store.config.window.end,
+        &store.config.window.timezone,
+    )? {
+        sleep_for = sleep_for.min(Duration::from_secs(window_remaining));
+    }
+    if !sleep_for.is_zero() {
+        thread::sleep(sleep_for);
+    }
+    Ok(())
+}
+
+pub(crate) fn runtime_with_target(
     store: &ConfigStore,
     launch: bool,
+    instance_target: Option<&InstanceTargetArgs>,
 ) -> Result<(ldplayer::LdPlayer, adb::AdbDevice, adb::DeviceInfo)> {
     let ld = ldplayer::LdPlayer::discover(&store.config.emulator.ldconsole_path, &store.root)?;
-    let instance = ld.instance(store.config.emulator.instance_index)?;
+    let selected = resolve_instance_target(&ld, store, instance_target)?;
+    let instance = ld.instance(selected.index)?;
     if launch && store.config.emulator.auto_launch && !instance.running {
         ld.launch_wait(
             instance.index,
@@ -621,13 +1280,10 @@ fn runtime(
         )?;
     }
     let adb_path = adb::find_adb(&store.config.emulator.adb_path)?;
-    let serial = if !store.config.emulator.serial.trim().is_empty() {
-        store.config.emulator.serial.clone()
-    } else {
-        ldplayer::LdPlayer::serial_for_index(instance.index)
-    };
-    let _ = Command::new(&adb_path).args(["connect", &serial]).output();
-    let device = adb::AdbDevice::discover(&adb_path.to_string_lossy(), &serial)?;
+    let _ = Command::new(&adb_path)
+        .args(["connect", &selected.serial])
+        .output();
+    let device = adb::AdbDevice::discover(&adb_path.to_string_lossy(), &selected.serial)?;
     let info = device.info();
     Ok((ld, device, info?))
 }
@@ -650,28 +1306,25 @@ fn locate_or_navigate(
 ) -> Result<vision::ButtonBox> {
     let bytes = device.screenshot()?;
     let image = vision::decode(&bytes)?;
-    if let Some(button) = vision::find_colored_button(&image) {
-        let analysis = vision::classify_button(&image, button);
-        if analysis.state != vision::ButtonState::Unknown {
-            return Ok(button);
-        }
-    }
-    // Gray is a valid check-in-page state but has no saturated color for the
-    // dynamic detector. Check the calibrated fallback before navigating, so a
-    // page showing "无法签到" is not mistaken for the home page.
+
+    // A home-page service tile can contain saturated colors and white text that
+    // look like a locating button to the visual detector. Trust the
+    // profile-specific fallback first, then use clickable accessibility labels
+    // to navigate, and only use the dynamic detector after the page route is
+    // known.
     let fallback = vision::fallback_button(&image, profile);
-    let fallback_analysis = vision::classify_button(&image, fallback);
-    if fallback_analysis.state != vision::ButtonState::Unknown {
+    if vision::classify_button(&image, fallback).state != vision::ButtonState::Unknown {
         return Ok(fallback);
     }
+
     let xml = device.dump_hierarchy().unwrap_or_default();
     let min_entry_y = image.height() / 8;
     let mut navigated = false;
-    if let Some((x, y)) = find_labeled_bounds(&xml, "晚点名签到", min_entry_y) {
+    if let Some((x, y)) = find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y) {
         device.tap(x, y)?;
         thread::sleep(Duration::from_secs(3));
         navigated = true;
-    } else if let Some((x, y)) = find_labeled_bounds(&xml, "业务", 0) {
+    } else if let Some((x, y)) = find_clickable_labeled_bounds(&xml, "业务", 0) {
         // Landscape layouts put the service catalogue behind the bottom
         // "业务" tab and may require one or more vertical swipes before the
         // check-in tile becomes part of the accessibility hierarchy.
@@ -680,7 +1333,7 @@ fn locate_or_navigate(
         for attempt in 0..6 {
             let page_xml = device.dump_hierarchy().unwrap_or_default();
             if let Some((entry_x, entry_y)) =
-                find_labeled_bounds(&page_xml, "晚点名签到", min_entry_y)
+                find_clickable_labeled_bounds(&page_xml, "晚点名签到", min_entry_y)
             {
                 device.tap(entry_x, entry_y)?;
                 thread::sleep(Duration::from_secs(3));
@@ -706,6 +1359,7 @@ fn locate_or_navigate(
         )?;
         thread::sleep(Duration::from_secs(3));
     }
+
     let mut bytes = device.screenshot()?;
     let mut image = vision::decode(&bytes)?;
     for attempt in 0..4 {
@@ -742,18 +1396,51 @@ fn locate_or_navigate(
     Ok(vision::fallback_button(&image, profile))
 }
 
+#[allow(dead_code)]
 fn find_labeled_bounds(xml: &str, label: &str, min_center_y: u32) -> Option<(u32, u32)> {
+    find_labeled_bounds_internal(xml, label, min_center_y, false)
+}
+
+fn find_clickable_labeled_bounds(xml: &str, label: &str, min_center_y: u32) -> Option<(u32, u32)> {
+    find_labeled_bounds_internal(xml, label, min_center_y, true)
+}
+
+fn find_labeled_bounds_internal(
+    xml: &str,
+    label: &str,
+    min_center_y: u32,
+    clickable_only: bool,
+) -> Option<(u32, u32)> {
     for attribute in ["content-desc", "text"] {
         let prefix = format!("{}=\"", attribute);
         let mut cursor = 0;
         while let Some(relative) = xml[cursor..].find(&prefix) {
             let value_start = cursor + relative + prefix.len();
-            let value_end = value_start + xml[value_start..].find('"')?;
+            let Some(value_length) = xml[value_start..].find('"') else {
+                cursor = value_start.saturating_add(1);
+                continue;
+            };
+            let value_end = value_start + value_length;
             let value = &xml[value_start..value_end];
+            // A malformed attribute can swallow the start of the next node.
+            // Resume scanning at that nested node instead of losing the rest
+            // of the hierarchy dump.
+            if let Some(next_node) = value.find("<node") {
+                cursor = value_start + next_node + "<node".len();
+                continue;
+            }
             if value.contains(label) {
                 let node_start = xml[..value_start].rfind("<node").unwrap_or(value_start);
-                let node_end = node_start + xml[node_start..].find('>')?;
+                let Some(node_length) = xml[node_start..].find('>') else {
+                    cursor = value_end + 1;
+                    continue;
+                };
+                let node_end = node_start + node_length;
                 let node = &xml[node_start..node_end];
+                if clickable_only && !node.contains("clickable=\"true\"") {
+                    cursor = value_end + 1;
+                    continue;
+                }
                 if let Some(bounds_start) = node.find("bounds=\"") {
                     let bounds_value = &node[bounds_start + 8..];
                     if let Some(end) = bounds_value.find('"') {
@@ -792,12 +1479,222 @@ fn print_device(serial: &str, info: &adb::DeviceInfo) {
 
 #[cfg(test)]
 mod tests {
-    use super::find_labeled_bounds;
+    use super::{
+        SyncLifecycle, TapDevice, TapRequest, build_task_command_line,
+        find_clickable_labeled_bounds, find_labeled_bounds, guarded_tap, restore_sync_backup,
+    };
+    use crate::{domain::Mode, vision::ButtonState};
+    use anyhow::Result;
+    use std::{
+        cell::{Cell, RefCell},
+        fs,
+        path::Path,
+        time::Duration,
+    };
 
     #[test]
     fn labeled_bounds_match_accessibility_suffix_and_skip_header() {
         let xml = r#"<node content-desc="晚点名签到" bounds="[10,20][30,40]"/><node content-desc="业务&#10;第 4 个标签，共 4 个" bounds="[100,600][300,700]"/>"#;
         assert_eq!(find_labeled_bounds(xml, "晚点名签到", 100), None);
         assert_eq!(find_labeled_bounds(xml, "业务", 100), Some((200, 650)));
+        let clickable =
+            r#"<node content-desc="晚点名签到" clickable="true" bounds="[10,200][30,240]"/>"#;
+        assert_eq!(
+            find_clickable_labeled_bounds(clickable, "晚点名签到", 100),
+            Some((20, 220))
+        );
+        let malformed_then_valid = r#"<node content-desc="broken><node content-desc="晚点名签到" clickable="true" bounds="[10,200][30,240]"/>"#;
+        assert_eq!(
+            find_clickable_labeled_bounds(malformed_then_valid, "晚点名签到", 100),
+            Some((20, 220))
+        );
+    }
+
+    #[test]
+    fn task_command_line_quotes_exe_path_and_targets_instance() {
+        let target = super::InstanceTargetArgs {
+            instance_index: Some(1),
+            serial: None,
+        };
+        let command = build_task_command_line(
+            Path::new(r"C:\Program Files\ZHFD\zhfd-checkin.exe"),
+            "run --dry-run",
+            false,
+            &target,
+        );
+        assert_eq!(
+            command,
+            r#""C:\Program Files\ZHFD\zhfd-checkin.exe" run --dry-run --instance-index 1"#
+        );
+    }
+
+    #[derive(Default)]
+    struct MockTapDevice {
+        taps: RefCell<Vec<(u32, u32)>>,
+    }
+
+    impl TapDevice for MockTapDevice {
+        fn tap_at(&self, x: u32, y: u32) -> Result<()> {
+            self.taps.borrow_mut().push((x, y));
+            Ok(())
+        }
+    }
+
+    fn request(state: ButtonState) -> TapRequest {
+        TapRequest {
+            state,
+            mode: Mode::Live,
+            explicit_confirmation: true,
+            profile_calibrated: true,
+            foreground_matches: true,
+            within_window: true,
+            ready_frames: 2,
+            required_frames: 2,
+            x: 448,
+            y: 779,
+        }
+    }
+
+    #[test]
+    fn guarded_tap_is_fail_closed_for_non_ready_states_and_bad_policy() {
+        let device = MockTapDevice::default();
+        for state in [
+            ButtonState::Gray,
+            ButtonState::Locating,
+            ButtonState::Unknown,
+        ] {
+            assert!(!guarded_tap(&device, request(state)).unwrap());
+        }
+
+        let mut not_stable = request(ButtonState::Ready);
+        not_stable.ready_frames = 1;
+        assert!(guarded_tap(&device, not_stable).is_err());
+
+        let mut uncalibrated = request(ButtonState::Ready);
+        uncalibrated.profile_calibrated = false;
+        assert!(guarded_tap(&device, uncalibrated).is_err());
+
+        let mut wrong_foreground = request(ButtonState::Ready);
+        wrong_foreground.foreground_matches = false;
+        assert!(guarded_tap(&device, wrong_foreground).is_err());
+
+        let mut outside_window = request(ButtonState::Ready);
+        outside_window.within_window = false;
+        assert!(guarded_tap(&device, outside_window).is_err());
+
+        assert!(device.taps.borrow().is_empty());
+    }
+
+    #[test]
+    fn guarded_tap_calls_mock_once_at_confirmed_ready_coordinate() {
+        let device = MockTapDevice::default();
+        assert!(guarded_tap(&device, request(ButtonState::Ready)).unwrap());
+        assert_eq!(*device.taps.borrow(), vec![(448, 779)]);
+    }
+
+    struct MockSyncLifecycle {
+        running: Cell<bool>,
+        stops: Cell<u32>,
+        launches: Cell<u32>,
+        fail_launch: bool,
+    }
+
+    impl MockSyncLifecycle {
+        fn new(running: bool, fail_launch: bool) -> Self {
+            Self {
+                running: Cell::new(running),
+                stops: Cell::new(0),
+                launches: Cell::new(0),
+                fail_launch,
+            }
+        }
+    }
+
+    impl SyncLifecycle for MockSyncLifecycle {
+        fn is_running(&self, _index: u32) -> Result<bool> {
+            Ok(self.running.get())
+        }
+
+        fn stop_and_wait(&self, _index: u32) -> Result<()> {
+            self.stops.set(self.stops.get() + 1);
+            self.running.set(false);
+            Ok(())
+        }
+
+        fn launch_wait(&self, _index: u32, _timeout: Duration) -> Result<()> {
+            self.launches.set(self.launches.get() + 1);
+            if self.fail_launch {
+                anyhow::bail!("mock launch failure");
+            }
+            self.running.set(true);
+            Ok(())
+        }
+    }
+
+    fn temp_recovery_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-sync-recovery-{}-{}",
+            std::process::id(),
+            nonce
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        (
+            root.clone(),
+            root.join("source.config"),
+            root.join("backup.config"),
+        )
+    }
+
+    #[test]
+    fn sync_recovery_restores_backup_and_original_running_state() {
+        let (root, source, backup) = temp_recovery_paths();
+        fs::write(&source, b"modified").unwrap();
+        fs::write(&backup, b"original").unwrap();
+        let controller = MockSyncLifecycle::new(true, false);
+
+        restore_sync_backup(
+            &controller,
+            0,
+            Some(Path::new(&source)),
+            Some(Path::new(&backup)),
+            true,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), b"original");
+        assert_eq!(controller.stops.get(), 1);
+        assert_eq!(controller.launches.get(), 1);
+        assert!(controller.running.get());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_recovery_reports_restart_failure_after_restoring_file() {
+        let (root, source, backup) = temp_recovery_paths();
+        fs::write(&source, b"modified").unwrap();
+        fs::write(&backup, b"original").unwrap();
+        let controller = MockSyncLifecycle::new(true, true);
+
+        let error = restore_sync_backup(
+            &controller,
+            0,
+            Some(Path::new(&source)),
+            Some(Path::new(&backup)),
+            true,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("mock launch failure"));
+        assert_eq!(fs::read(&source).unwrap(), b"original");
+        assert_eq!(controller.stops.get(), 1);
+        assert_eq!(controller.launches.get(), 1);
+        let _ = fs::remove_dir_all(root);
     }
 }

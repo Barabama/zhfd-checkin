@@ -4495,6 +4495,7 @@ dependencies = [
  "chrono",
  "clap",
  "eframe",
+ "flate2",
  "image",
  "rfd",
  "serde",

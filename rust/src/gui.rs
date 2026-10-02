@@ -1,6 +1,9 @@
 use crate::config::ConfigStore;
 use crate::domain::RunResult;
-use crate::{ConfigCommand, RunArgs, app_command, diagnose, run, runtime, sync_profile};
+use crate::{
+    ConfigCommand, InstanceTargetArgs, RunArgs, TaskCommand, diagnose, inspect_apk_metadata,
+    install_apk, installed_app_version, run, runtime_with_target, sync_profile, task_command,
+};
 use crate::{config, logger, profile};
 use eframe::egui;
 use std::sync::{Arc, Mutex};
@@ -11,9 +14,31 @@ pub fn launch(store: ConfigStore) -> anyhow::Result<()> {
     eframe::run_native(
         "智汇福大自动签到",
         options,
-        Box::new(move |_cc| Ok(Box::new(GuiApp::new(store)))),
+        Box::new(move |cc| {
+            configure_fonts(&cc.egui_ctx);
+            Ok(Box::new(GuiApp::new(store)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("GUI 启动失败: {}", e))
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "noto_sans_sc".into(),
+        egui::FontData::from_static(include_bytes!("../assets/NotoSansSC-VF.ttf")).into(),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "noto_sans_sc".into());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "noto_sans_sc".into());
+    ctx.set_fonts(fonts);
 }
 
 struct GuiApp {
@@ -21,16 +46,52 @@ struct GuiApp {
     tab: usize,
     status: String,
     apk_path: String,
-    job: Option<Arc<Mutex<Option<String>>>>,
+    job: Option<GuiJob>,
     pending_sync: Option<String>,
     latest_result: Option<RunResult>,
     latest_log_dir: Option<String>,
     report_path: Option<String>,
+    pending_apk_install: Option<std::path::PathBuf>,
+    pending_apk_metadata: Option<crate::apk::ApkMetadata>,
+    installed_version: Option<String>,
+    app_version_checked: bool,
+    apk_install_result: Option<String>,
+    recent_logs: Vec<logger::LogSummary>,
+    task_name: String,
+    task_live: bool,
+    task_all_instances: bool,
+    run_all_instances: bool,
+    selected_instance_index: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    General,
+    AppInstall,
+    AppVersion,
+}
+
+struct JobOutput {
+    message: String,
+    installed_version: Option<String>,
+}
+
+struct GuiJob {
+    label: String,
+    kind: JobKind,
+    result: Arc<Mutex<Option<JobOutput>>>,
 }
 
 impl GuiApp {
     fn new(store: ConfigStore) -> Self {
         let apk_path = store.config.app.apk_path.clone();
+        let selected_instance_index = store
+            .config
+            .emulator
+            .effective_instances()
+            .first()
+            .map(|instance| instance.instance_index)
+            .unwrap_or(store.config.emulator.instance_index);
         Self {
             store,
             tab: 0,
@@ -41,33 +102,111 @@ impl GuiApp {
             latest_result: None,
             latest_log_dir: None,
             report_path: None,
+            pending_apk_install: None,
+            pending_apk_metadata: None,
+            installed_version: None,
+            app_version_checked: false,
+            apk_install_result: None,
+            recent_logs: Vec::new(),
+            task_name: "ZHFD-AutoCheckin".into(),
+            task_live: false,
+            task_all_instances: false,
+            run_all_instances: false,
+            selected_instance_index,
         }
     }
 
-    fn start_dry_run(&mut self) {
+    fn start_background_job<F>(&mut self, label: impl Into<String>, task: F) -> bool
+    where
+        F: FnOnce() -> String + Send + 'static,
+    {
+        self.start_background_job_with_kind(label, JobKind::General, move || (task(), None))
+    }
+
+    fn start_background_job_with_kind<F>(
+        &mut self,
+        label: impl Into<String>,
+        kind: JobKind,
+        task: F,
+    ) -> bool
+    where
+        F: FnOnce() -> (String, Option<String>) + Send + 'static,
+    {
         if self.job.is_some() {
             self.status = "已有任务运行中".into();
-            return;
+            return false;
         }
+        let label = label.into();
         let slot = Arc::new(Mutex::new(None));
         let result_slot = slot.clone();
-        let store = self.store.clone();
         thread::spawn(move || {
-            let result = match run(
+            let (message, installed_version) = task();
+            *result_slot.lock().unwrap() = Some(JobOutput {
+                message,
+                installed_version,
+            });
+        });
+        self.status = format!("{} 已启动，正在后台运行……", label);
+        self.job = Some(GuiJob {
+            label,
+            kind,
+            result: slot,
+        });
+        true
+    }
+
+    fn instance_target(&self) -> InstanceTargetArgs {
+        InstanceTargetArgs {
+            instance_index: Some(self.selected_instance_index),
+            serial: None,
+        }
+    }
+
+    fn instance_options(&self) -> Vec<(u32, String)> {
+        self.store
+            .config
+            .emulator
+            .effective_instances()
+            .into_iter()
+            .map(|instance| {
+                (
+                    instance.instance_index,
+                    if instance.name.trim().is_empty() {
+                        format!("实例 {}", instance.instance_index)
+                    } else {
+                        format!("{} ({})", instance.name, instance.instance_index)
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn start_dry_run(&mut self) {
+        let store = self.store.clone();
+        let target = self.instance_target();
+        let all_instances = self.run_all_instances;
+        self.start_background_job("dry-run", move || {
+            match run(
                 &store,
                 RunArgs {
                     dry_run: true,
                     live: false,
                     confirm: false,
+                    all_instances,
+                    target,
                 },
             ) {
-                Ok(code) => format!("dry-run 完成，退出码 {:?}", code),
-                Err(e) => format!("dry-run 失败: {:#}", e),
-            };
-            *result_slot.lock().unwrap() = Some(result);
+                Ok(code) => format!("完成，退出码 {:?}", code),
+                Err(e) => format!("失败: {:#}", e),
+            }
         });
-        self.job = Some(slot);
-        self.status = "dry-run 已启动，正在等待结果……".into();
+    }
+
+    fn refresh_logs(&mut self) {
+        match logger::recent_logs(&self.store.root, 12) {
+            Ok(logs) => self.recent_logs = logs,
+            Err(error) => self.status = format!("读取运行日志失败: {:#}", error),
+        }
     }
 
     fn refresh_latest_result(&mut self) {
@@ -75,10 +214,12 @@ impl GuiApp {
             Ok(Some((dir, result))) => {
                 self.latest_log_dir = Some(dir.display().to_string());
                 self.latest_result = Some(result);
+                self.refresh_logs();
             }
             Ok(None) => {
                 self.latest_log_dir = None;
                 self.latest_result = None;
+                self.refresh_logs();
             }
             Err(error) => self.status = format!("读取运行结果失败: {:#}", error),
         }
@@ -88,11 +229,39 @@ impl GuiApp {
         let result = self
             .job
             .as_ref()
-            .and_then(|slot| slot.lock().ok().and_then(|mut guard| guard.take()));
+            .and_then(|job| job.result.lock().ok().and_then(|mut guard| guard.take()));
         if let Some(result) = result {
-            self.status = result;
+            let (label, kind) = self
+                .job
+                .as_ref()
+                .map(|job| (job.label.clone(), job.kind))
+                .unwrap_or_else(|| ("后台任务".into(), JobKind::General));
+            if let Some(version) = result.installed_version {
+                self.installed_version = Some(version);
+            }
+            if kind == JobKind::AppInstall {
+                self.apk_install_result = Some(result.message.clone());
+            }
+            self.status = format!("{}：{}", label, result.message);
             self.job = None;
             self.refresh_latest_result();
+            self.refresh_logs();
+        }
+    }
+
+    fn start_app_version_query(&mut self) {
+        self.app_version_checked = true;
+        let store = self.store.clone();
+        let started =
+            self.start_background_job_with_kind("读取已安装版本", JobKind::AppVersion, {
+                let target = self.instance_target();
+                move || match installed_app_version(&store, &target) {
+                    Ok(version) => (format!("当前已安装版本：{}", version), Some(version)),
+                    Err(error) => (format!("失败: {:#}", error), None),
+                }
+            });
+        if !started {
+            self.app_version_checked = false;
         }
     }
 
@@ -125,6 +294,8 @@ fn explain_error(error: &str) -> &'static str {
         "foreground_package_changed" => "前台应用已变化；安全策略阻止点击。",
         "ready_confirmation_failed" => "点击前二次 ready 确认失败；未执行点击。",
         "unknown_profile" => "设备分辨率/DPI 没有精确 profile；未执行点击。",
+        "uncalibrated_profile" => "当前 profile 尚未完成生产标定；未执行点击。",
+        "live_confirmation_required" => "正式模式需要同时指定 --live --confirm；未执行点击。",
         other if other.contains("ADB") => "ADB 设备不可用；请检查模拟器和 serial。",
         _ => "请查看诊断报告和运行日志。",
     }
@@ -137,9 +308,18 @@ impl eframe::App for GuiApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.heading("智汇福大自动签到");
             ui.horizontal(|ui| {
-                for (i, label) in ["首页", "诊断", "Profile", "应用", "配置", "帮助/About"]
-                    .iter()
-                    .enumerate()
+                for (i, label) in [
+                    "首页",
+                    "诊断",
+                    "Profile",
+                    "应用",
+                    "配置",
+                    "计划任务",
+                    "运行日志",
+                    "帮助/About",
+                ]
+                .iter()
+                .enumerate()
                 {
                     if ui.selectable_label(self.tab == i, *label).clicked() {
                         self.tab = i;
@@ -149,6 +329,9 @@ impl eframe::App for GuiApp {
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.label(&self.status);
+            if let Some(job) = &self.job {
+                ui.label(format!("后台任务：{}（运行中）", job.label));
+            }
         });
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             0 => self.home(ui),
@@ -156,8 +339,12 @@ impl eframe::App for GuiApp {
             2 => self.profiles(ui),
             3 => self.app_page(ui),
             4 => self.config_page(ui),
+            5 => self.tasks_page(ui),
+            6 => self.logs_page(ui),
             _ => self.about(ui),
         });
+        self.sync_confirmation_window(ctx);
+        self.apk_install_confirmation_window(ctx);
     }
 }
 
@@ -165,6 +352,26 @@ impl GuiApp {
     fn home(&mut self, ui: &mut egui::Ui) {
         ui.heading("运行控制");
         ui.label("Rust CLI/GUI 迁移第一阶段：默认只进行 dry-run，不执行真实点击。");
+        let options = self.instance_options();
+        ui.checkbox(
+            &mut self.run_all_instances,
+            "dry-run 依次运行全部已发现实例",
+        );
+        if !options.is_empty() {
+            egui::ComboBox::from_label("当前实例")
+                .selected_text(
+                    options
+                        .iter()
+                        .find(|(index, _)| *index == self.selected_instance_index)
+                        .map(|(_, label)| label.as_str())
+                        .unwrap_or("未选择"),
+                )
+                .show_ui(ui, |ui| {
+                    for (index, label) in &options {
+                        ui.selectable_value(&mut self.selected_instance_index, *index, label);
+                    }
+                });
+        }
         ui.horizontal(|ui| {
             if ui.button("环境诊断").clicked() {
                 self.tab = 1;
@@ -205,10 +412,14 @@ impl GuiApp {
         ui.heading("环境诊断");
         ui.horizontal(|ui| {
             if ui.button("重新检测 LDPlayer / ADB").clicked() {
-                match diagnose(&self.store) {
-                    Ok(code) => self.status = format!("诊断完成，退出码 {:?}", code),
-                    Err(e) => self.status = format!("诊断失败: {:#}", e),
-                }
+                let store = self.store.clone();
+                let target = self.instance_target();
+                self.start_background_job("环境诊断", move || {
+                    match diagnose(&store, &target) {
+                        Ok(code) => format!("完成，退出码 {:?}", code),
+                        Err(e) => format!("失败: {:#}", e),
+                    }
+                });
             }
             if ui.button("导出诊断报告").clicked() {
                 self.export_report();
@@ -268,23 +479,29 @@ impl GuiApp {
 
     fn profiles(&mut self, ui: &mut egui::Ui) {
         ui.heading("内置 Profile");
+        ui.label(format!("当前实例 index：{}", self.selected_instance_index));
         if ui.button("检测当前模拟器 Profile").clicked() {
-            match runtime(&self.store, false) {
-                Ok((_, device, info)) => {
-                    let exact = profile::find_profile(info.width, info.height, info.density_dpi);
-                    self.status = match exact {
-                        Some(p) => format!(
-                            "当前 {} {}x{}@{}，匹配 {}",
-                            device.serial, info.width, info.height, info.density_dpi, p.id
-                        ),
-                        None => format!(
-                            "当前 {} {}x{}@{}，没有精确匹配 profile",
-                            device.serial, info.width, info.height, info.density_dpi
-                        ),
-                    };
+            let store = self.store.clone();
+            let target = self.instance_target();
+            self.start_background_job("Profile 检测", move || {
+                match runtime_with_target(&store, false, Some(&target)) {
+                    Ok((_, device, info)) => {
+                        let exact =
+                            profile::find_profile(info.width, info.height, info.density_dpi);
+                        match exact {
+                            Some(p) => format!(
+                                "当前 {} {}x{}@{}，匹配 {}",
+                                device.serial, info.width, info.height, info.density_dpi, p.id
+                            ),
+                            None => format!(
+                                "当前 {} {}x{}@{}，没有精确匹配 profile",
+                                device.serial, info.width, info.height, info.density_dpi
+                            ),
+                        }
+                    }
+                    Err(e) => format!("失败: {:#}", e),
                 }
-                Err(e) => self.status = format!("Profile 检测失败: {:#}", e),
-            }
+            });
         }
         egui::Grid::new("profiles").striped(true).show(ui, |ui| {
             ui.label("ID");
@@ -306,28 +523,235 @@ impl GuiApp {
                 ui.end_row();
             }
         });
-        if let Some(id) = self.pending_sync.clone() {
+    }
+
+    fn sync_confirmation_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.pending_sync.clone() else {
+            return;
+        };
+
+        let mut action = None;
+        egui::Window::new("确认 Profile 同步")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!("将修改 LDPlayer 分辨率/DPI 并重启实例：{}", id),
+                );
+                ui.label("同步会先备份已有配置；执行期间请不要手动操作模拟器。\n确认继续吗？");
+                ui.horizontal(|ui| {
+                    if ui.button("确认同步").clicked() {
+                        action = Some(true);
+                    }
+                    if ui.button("取消").clicked() {
+                        action = Some(false);
+                    }
+                });
+            });
+
+        if let Some(confirm) = action {
+            self.pending_sync = None;
+            if confirm {
+                let store = self.store.clone();
+                let sync_id = id.clone();
+                let target = self.instance_target();
+                self.start_background_job(format!("同步 {}", id), move || {
+                    match sync_profile(&store, &sync_id, true, &target) {
+                        Ok(code) => format!("完成，退出码 {:?}", code),
+                        Err(e) => format!("失败: {:#}", e),
+                    }
+                });
+            } else {
+                self.status = "已取消 Profile 同步".into();
+            }
+        }
+    }
+
+    fn tasks_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("计划任务");
+        ui.label("计划任务默认创建为 dry-run；正式模式必须显式勾选并确认。\n");
+        ui.horizontal(|ui| {
+            ui.label("任务名称");
+            ui.text_edit_singleline(&mut self.task_name);
+        });
+        ui.checkbox(&mut self.task_live, "创建 live 任务（需要显式确认）");
+        ui.checkbox(&mut self.task_all_instances, "计划任务依次运行全部配置实例");
+        ui.horizontal(|ui| {
+            if ui.button("查询任务").clicked() {
+                let name = self.task_name.clone();
+                self.start_background_job("计划任务查询", move || {
+                    match task_command(TaskCommand::Query { name }) {
+                        Ok(code) => format!("完成，退出码 {:?}", code),
+                        Err(error) => format!("失败: {:#}", error),
+                    }
+                });
+            }
+            if ui.button("创建任务").clicked() {
+                let name = self.task_name.clone();
+                let live = self.task_live;
+                let all_instances = self.task_all_instances;
+                let target = self.instance_target();
+                if live {
+                    self.status = "live 计划任务需要再次确认；请点击下方确认按钮".into();
+                } else {
+                    self.start_background_job("创建 dry-run 计划任务", move || {
+                        match task_command(TaskCommand::Create {
+                            name,
+                            live: false,
+                            confirm: false,
+                            all_instances,
+                            target,
+                        }) {
+                            Ok(code) => format!("完成，退出码 {:?}", code),
+                            Err(error) => format!("失败: {:#}", error),
+                        }
+                    });
+                }
+            }
+            if ui.button("删除任务").clicked() {
+                let name = self.task_name.clone();
+                self.start_background_job("删除计划任务", move || {
+                    match task_command(TaskCommand::Delete { name }) {
+                        Ok(code) => format!("完成，退出码 {:?}", code),
+                        Err(error) => format!("失败: {:#}", error),
+                    }
+                });
+            }
+        });
+        if self.task_live {
             ui.separator();
             ui.colored_label(
                 egui::Color32::YELLOW,
-                format!("将修改 LDPlayer 分辨率/DPI并重启实例：{}", id),
+                "正式计划任务会每天在签到窗口开始时间执行 live；必须再次确认。",
             );
-            if ui.button("再次点击确认同步").clicked() {
-                match sync_profile(&self.store, &id, true) {
-                    Ok(code) => self.status = format!("同步完成，退出码 {:?}", code),
-                    Err(e) => self.status = format!("同步失败: {:#}", e),
-                }
-                self.pending_sync = None;
+            if ui.button("确认创建 live 计划任务").clicked() {
+                let name = self.task_name.clone();
+                let all_instances = self.task_all_instances;
+                let target = self.instance_target();
+                self.start_background_job("创建 live 计划任务", move || {
+                    match task_command(TaskCommand::Create {
+                        name,
+                        live: true,
+                        confirm: true,
+                        all_instances,
+                        target,
+                    }) {
+                        Ok(code) => format!("完成，退出码 {:?}", code),
+                        Err(error) => format!("失败: {:#}", error),
+                    }
+                });
+                self.task_live = false;
             }
-            if ui.button("取消同步").clicked() {
-                self.pending_sync = None;
+        }
+        ui.separator();
+        ui.label(format!(
+            "配置窗口：{}–{}",
+            self.store.config.window.start, self.store.config.window.end
+        ));
+        ui.label("GUI 不提供直接 live 签到按钮；计划任务 live 仍受 CLI 的全部门禁保护。");
+    }
+
+    fn logs_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("运行日志");
+        if ui.button("刷新日志列表").clicked() {
+            self.refresh_logs();
+        }
+        if self.recent_logs.is_empty() {
+            ui.label("尚未找到运行或同步日志。");
+            return;
+        }
+        egui::Grid::new("recent_logs").striped(true).show(ui, |ui| {
+            ui.label("类型");
+            ui.label("状态");
+            ui.label("摘要");
+            ui.label("目录");
+            ui.end_row();
+            for log in &self.recent_logs {
+                ui.label(&log.kind);
+                ui.label(&log.status);
+                ui.label(&log.summary);
+                ui.label(log.directory.display().to_string());
+                ui.end_row();
+            }
+        });
+    }
+
+    fn apk_install_confirmation_window(&mut self, ctx: &egui::Context) {
+        let Some(apk) = self.pending_apk_install.clone() else {
+            return;
+        };
+        let mut action = None;
+        egui::Window::new("确认安装 APK")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("APK：{}", apk.display()));
+                if let Some(metadata) = &self.pending_apk_metadata {
+                    ui.label(format!("APK 包名：{}", metadata.package_name));
+                    ui.label(format!(
+                        "APK versionName：{}",
+                        metadata.version_name.as_deref().unwrap_or("未知")
+                    ));
+                    ui.label(format!(
+                        "APK versionCode：{}",
+                        metadata.version_code.as_deref().unwrap_or("未知")
+                    ));
+                }
+                ui.label(format!("目标包名：{}", self.store.config.app.package_name));
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "将连接当前模拟器并使用 adb install -r 安装/更新 APK。",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("确认安装").clicked() {
+                        action = Some(true);
+                    }
+                    if ui.button("取消").clicked() {
+                        action = Some(false);
+                    }
+                });
+            });
+
+        if let Some(confirm) = action {
+            self.pending_apk_install = None;
+            self.pending_apk_metadata = None;
+            if confirm {
+                let store = self.store.clone();
+                let target = self.instance_target();
+                self.start_background_job_with_kind("APK 安装", JobKind::AppInstall, move || {
+                    match install_apk(&store, &apk, &target) {
+                        Ok(result) => (
+                            format!(
+                                "完成：{} {}；adb 输出：{}",
+                                result.package_name,
+                                result.version,
+                                result.install_output.trim()
+                            ),
+                            Some(result.version),
+                        ),
+                        Err(error) => (format!("失败: {:#}", error), None),
+                    }
+                });
+            } else {
+                self.status = "已取消 APK 安装".into();
             }
         }
     }
 
     fn app_page(&mut self, ui: &mut egui::Ui) {
+        if !self.app_version_checked && self.job.is_none() {
+            self.start_app_version_query();
+        }
         ui.heading("应用管理");
         ui.label(format!("目标包名：{}", self.store.config.app.package_name));
+        ui.horizontal(|ui| {
+            ui.label("当前已安装版本");
+            ui.label(self.installed_version.as_deref().unwrap_or("尚未读取"));
+            if ui.button("刷新版本").clicked() {
+                self.start_app_version_query();
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("APK 路径");
             ui.text_edit_singleline(&mut self.apk_path);
@@ -348,16 +772,29 @@ impl GuiApp {
             }
         }
         if ui.button("安装/更新选中的 APK").clicked() {
-            let path = config::resolve_path(&self.store.root, &self.apk_path);
-            match path {
-                Some(apk) => match app_command(&self.store, crate::AppCommand::Install { apk }) {
-                    Ok(code) => self.status = format!("安装完成，退出码 {:?}", code),
-                    Err(e) => self.status = format!("安装失败: {:#}", e),
+            match config::resolve_path(&self.store.root, &self.apk_path) {
+                Some(apk) if apk.is_file() => match inspect_apk_metadata(&apk) {
+                    Ok(metadata) if metadata.package_name == self.store.config.app.package_name => {
+                        self.pending_apk_metadata = Some(metadata);
+                        self.pending_apk_install = Some(apk);
+                    }
+                    Ok(metadata) => {
+                        self.status = format!(
+                            "APK 包名不匹配：实际={}，目标={}",
+                            metadata.package_name, self.store.config.app.package_name
+                        )
+                    }
+                    Err(error) => self.status = format!("APK 检查失败: {:#}", error),
                 },
+                Some(apk) => self.status = format!("APK 不存在：{}", apk.display()),
                 None => self.status = "请先选择 APK".into(),
             }
         }
-        ui.label("当前阶段支持标准 .apk；不自动下载、不修改账号或设备身份。");
+        if let Some(result) = &self.apk_install_result {
+            ui.separator();
+            ui.label(format!("最近一次安装结果：{}", result));
+        }
+        ui.label("当前阶段支持标准 .apk；不自动下载、不修改账号或设备身份。安装前必须确认，安装后会校验目标包名和版本。");
     }
 
     fn config_page(&mut self, ui: &mut egui::Ui) {
@@ -378,8 +815,29 @@ impl GuiApp {
     fn about(&mut self, ui: &mut egui::Ui) {
         ui.heading("帮助 / About");
         ui.label(format!("版本：{}", env!("CARGO_PKG_VERSION")));
+        ui.label(format!("Git commit：{}", crate::GIT_COMMIT));
         ui.hyperlink_to("雷电模拟器官网", "https://www.ldmnq.com/");
         ui.hyperlink_to("智汇福大官网", "https://app.fzu.edu.cn/fd-app/m/index.html");
+        ui.separator();
+        ui.label("支持的 Profile：");
+        for supported in profile::PROFILES {
+            ui.label(format!(
+                "{} {}x{}@{} {} calibrated={}",
+                supported.id,
+                supported.width,
+                supported.height,
+                supported.density_dpi,
+                supported.orientation.as_str(),
+                supported.calibrated
+            ));
+        }
+        ui.separator();
+        ui.label("第三方依赖：");
+        ui.label("image：PNG/JPEG 解码和轻量视觉处理");
+        ui.label("eframe/egui：原生 GUI");
+        ui.label("rfd：APK 文件选择器");
+        ui.label("serde / serde_json / toml：配置和结构化日志");
+        ui.label("ADB + LDPlayer ldconsole.exe：外部设备控制依赖");
         ui.separator();
         ui.label("使用建议：先执行诊断，再运行 dry-run；正式模式需要显式确认。");
     }
