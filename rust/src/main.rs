@@ -20,7 +20,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[allow(dead_code)]
 const LDPLAYER_URL: &str = "https://www.ldmnq.com/";
+#[allow(dead_code)]
 const ZHFD_URL: &str = "https://app.fzu.edu.cn/fd-app/m/index.html";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = match option_env!("ZHFD_GIT_COMMIT") {
@@ -161,6 +163,7 @@ struct RunArgs {
     target: InstanceTargetArgs,
 }
 
+#[allow(dead_code)]
 fn main() {
     let code = match run_cli() {
         Ok(code) => code as i32,
@@ -172,6 +175,7 @@ fn main() {
     std::process::exit(code);
 }
 
+#[allow(dead_code)]
 fn run_cli() -> Result<ExitCode> {
     let cli = Cli::parse();
     let store = ConfigStore::load()?;
@@ -180,10 +184,7 @@ fn run_cli() -> Result<ExitCode> {
             print_about();
             Ok(ExitCode::Ok)
         }
-        CommandKind::Gui => {
-            gui::launch(store)?;
-            Ok(ExitCode::Ok)
-        }
+        CommandKind::Gui => launch_gui_companion(),
         CommandKind::Instance { command } => instance_command(&store, command),
         CommandKind::Task { command } => task_command(command),
         CommandKind::Ui { command } => ui_command(&store, command),
@@ -280,36 +281,69 @@ fn resolve_instance_target(
     })
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct InstanceSummary {
+    pub index: u32,
+    pub name: String,
+    pub running: bool,
+    pub serial: String,
+    pub adb_port: Option<u16>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub dpi: Option<u32>,
+    pub configured: bool,
+    pub enabled: bool,
+}
+
+pub(crate) fn list_instance_summaries(store: &ConfigStore) -> Result<Vec<InstanceSummary>> {
+    let ld = ldplayer::LdPlayer::discover(&store.config.emulator.ldconsole_path, &store.root)?;
+    let configured_instances = store.config.emulator.effective_instances();
+    Ok(ld
+        .instances()?
+        .into_iter()
+        .map(|instance| {
+            let configured = configured_instances
+                .iter()
+                .find(|configured| configured.instance_index == instance.index);
+            InstanceSummary {
+                index: instance.index,
+                name: configured
+                    .filter(|item| !item.name.trim().is_empty())
+                    .map(|item| item.name.clone())
+                    .unwrap_or(instance.name),
+                running: instance.running,
+                serial: configured
+                    .filter(|item| !item.serial.trim().is_empty())
+                    .map(|item| item.serial.clone())
+                    .unwrap_or_else(|| ldplayer::LdPlayer::serial_for_index(instance.index)),
+                adb_port: instance.adb_port,
+                width: instance.width,
+                height: instance.height,
+                dpi: instance.dpi,
+                configured: configured.is_some(),
+                enabled: configured.is_some_and(|item| item.enabled),
+            }
+        })
+        .collect())
+}
+
 fn instance_command(store: &ConfigStore, command: InstanceCommand) -> Result<ExitCode> {
     match command {
         InstanceCommand::List => {
-            let ld =
-                ldplayer::LdPlayer::discover(&store.config.emulator.ldconsole_path, &store.root)?;
-            println!("LDPlayer: {}", ld.executable.display());
-            let configured_instances = store.config.emulator.effective_instances();
-            for instance in ld.instances()? {
-                let serial = ldplayer::LdPlayer::serial_for_index(instance.index);
-                let configured = configured_instances
-                    .iter()
-                    .find(|configured| configured.instance_index == instance.index);
-                let display_name = configured
-                    .and_then(|item| (!item.name.trim().is_empty()).then_some(item.name.as_str()))
-                    .unwrap_or(&instance.name);
+            for instance in list_instance_summaries(store)? {
                 println!(
-                    "index={} name={} running={} serial={} adb_port={:?} size={:?}x{:?} dpi={:?} configured={}",
+                    "index={} name={} running={} serial={} adb_port={:?} size={:?}x{:?} dpi={:?} configured={} enabled={}",
                     instance.index,
-                    display_name,
+                    instance.name,
                     instance.running,
-                    configured
-                        .and_then(
-                            |item| (!item.serial.trim().is_empty()).then_some(item.serial.as_str())
-                        )
-                        .unwrap_or(&serial),
+                    instance.serial,
                     instance.adb_port,
                     instance.width,
                     instance.height,
                     instance.dpi,
-                    configured.is_some(),
+                    instance.configured,
+                    instance.enabled,
                 );
             }
         }
@@ -317,13 +351,54 @@ fn instance_command(store: &ConfigStore, command: InstanceCommand) -> Result<Exi
     Ok(ExitCode::Ok)
 }
 
+pub fn launch_gui() -> anyhow::Result<()> {
+    let store = ConfigStore::load()?;
+    launch_gui_with_store(store)
+}
+
+fn launch_gui_with_store(store: ConfigStore) -> anyhow::Result<()> {
+    gui::launch(store)
+}
+
+fn launch_gui_companion() -> Result<ExitCode> {
+    let cli_exe = std::env::current_exe().context("无法取得 CLI EXE 路径")?;
+    let gui_exe = cli_exe
+        .parent()
+        .context("CLI EXE 没有父目录")?
+        .join("zhfd-checkin-gui.exe");
+    if !gui_exe.is_file() {
+        bail!(
+            "找不到独立 GUI 程序: {}；请运行 zhfd-checkin-gui.exe",
+            gui_exe.display()
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        Command::new(&gui_exe)
+            .creation_flags(DETACHED_PROCESS)
+            .spawn()
+            .with_context(|| format!("无法启动 GUI: {}", gui_exe.display()))?;
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(&gui_exe)
+            .spawn()
+            .with_context(|| format!("无法启动 GUI: {}", gui_exe.display()))?;
+    }
+    Ok(ExitCode::Ok)
+}
+
+#[allow(dead_code)]
 fn write_report(store: &ConfigStore) -> Result<ExitCode> {
     let path = logger::write_diagnostic_report(store)?;
     println!("诊断报告: {}", path.display());
     Ok(ExitCode::Ok)
 }
 
-fn analyze_image(path: &PathBuf) -> Result<ExitCode> {
+#[allow(dead_code)]
+pub(crate) fn analyze_image_file(path: &std::path::Path) -> Result<vision::ButtonAnalysis> {
     let bytes = std::fs::read(path).with_context(|| format!("无法读取图片: {}", path.display()))?;
     let image = vision::decode(&bytes)?;
     let button = if image.width() <= 500 && image.height() <= 500 {
@@ -336,11 +411,18 @@ fn analyze_image(path: &PathBuf) -> Result<ExitCode> {
     } else {
         vision::find_colored_button(&image).context("未找到彩色签到按钮")?
     };
-    let analysis = vision::classify_button(&image, button);
-    println!("{}", serde_json::to_string_pretty(&analysis)?);
+    Ok(vision::classify_button(&image, button))
+}
+
+fn analyze_image(path: &std::path::Path) -> Result<ExitCode> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&analyze_image_file(path)?)?
+    );
     Ok(ExitCode::Ok)
 }
 
+#[allow(dead_code)]
 fn print_about() {
     println!("zhfd-checkin {}", VERSION);
     println!("Git commit: {}", GIT_COMMIT);
@@ -391,6 +473,7 @@ fn config_command(store: &ConfigStore, command: ConfigCommand) -> Result<ExitCod
     Ok(ExitCode::Ok)
 }
 
+#[allow(dead_code)]
 fn profile_command(store: &ConfigStore, command: ProfileCommand) -> Result<ExitCode> {
     match command {
         ProfileCommand::List => {
@@ -786,6 +869,7 @@ pub(crate) fn installed_app_version(
     device.package_version(&store.config.app.package_name)
 }
 
+#[allow(dead_code)]
 fn app_command(store: &ConfigStore, command: AppCommand) -> Result<ExitCode> {
     match command {
         AppCommand::Install { apk, target } => {
@@ -882,12 +966,18 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
     Ok(ExitCode::Ok)
 }
 
+#[allow(dead_code)]
+pub(crate) fn dump_ui_hierarchy(
+    store: &ConfigStore,
+    target: &InstanceTargetArgs,
+) -> Result<String> {
+    let (_, device, _) = runtime_with_target(store, false, Some(target))?;
+    device.dump_hierarchy()
+}
+
 fn ui_command(store: &ConfigStore, command: UiCommand) -> Result<ExitCode> {
     match command {
-        UiCommand::Dump { target } => {
-            let (_, device, _) = runtime_with_target(store, false, Some(&target))?;
-            println!("{}", device.dump_hierarchy()?);
-        }
+        UiCommand::Dump { target } => println!("{}", dump_ui_hierarchy(store, &target)?),
     }
     Ok(ExitCode::Ok)
 }
