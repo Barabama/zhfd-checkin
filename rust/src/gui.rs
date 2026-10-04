@@ -1,8 +1,9 @@
 use crate::config::ConfigStore;
 use crate::domain::RunResult;
 use crate::{
-    ConfigCommand, InstanceTargetArgs, RunArgs, TaskCommand, diagnose, inspect_apk_metadata,
-    install_apk, installed_app_version, run, runtime_with_target, sync_profile, task_command,
+    ConfigCommand, InstanceTargetArgs, RunArgs, TaskCommand, analyze_image_file, diagnose,
+    dump_ui_hierarchy, inspect_apk_metadata, install_apk, installed_app_version,
+    list_instance_summaries, run, runtime_with_target, sync_profile, task_command,
 };
 use crate::{config, logger, profile};
 use eframe::egui;
@@ -48,6 +49,7 @@ struct GuiApp {
     apk_path: String,
     job: Option<GuiJob>,
     pending_sync: Option<String>,
+    pending_live_run: bool,
     latest_result: Option<RunResult>,
     latest_log_dir: Option<String>,
     report_path: Option<String>,
@@ -61,6 +63,7 @@ struct GuiApp {
     task_live: bool,
     task_all_instances: bool,
     run_all_instances: bool,
+    instance_summaries: Vec<crate::InstanceSummary>,
     selected_instance_index: u32,
 }
 
@@ -99,6 +102,7 @@ impl GuiApp {
             apk_path,
             job: None,
             pending_sync: None,
+            pending_live_run: false,
             latest_result: None,
             latest_log_dir: None,
             report_path: None,
@@ -112,6 +116,7 @@ impl GuiApp {
             task_live: false,
             task_all_instances: false,
             run_all_instances: false,
+            instance_summaries: Vec::new(),
             selected_instance_index,
         }
     }
@@ -181,25 +186,30 @@ impl GuiApp {
             .collect()
     }
 
-    fn start_dry_run(&mut self) {
+    fn start_run(&mut self, live: bool) {
         let store = self.store.clone();
         let target = self.instance_target();
         let all_instances = self.run_all_instances;
-        self.start_background_job("dry-run", move || {
+        let label = if live { "live 运行" } else { "dry-run" };
+        self.start_background_job(label, move || {
             match run(
                 &store,
                 RunArgs {
-                    dry_run: true,
-                    live: false,
-                    confirm: false,
+                    dry_run: !live,
+                    live,
+                    confirm: live,
                     all_instances,
                     target,
                 },
             ) {
                 Ok(code) => format!("完成，退出码 {:?}", code),
-                Err(e) => format!("失败: {:#}", e),
+                Err(error) => format!("失败: {:#}", error),
             }
         });
+    }
+
+    fn start_dry_run(&mut self) {
+        self.start_run(false);
     }
 
     fn refresh_logs(&mut self) {
@@ -311,6 +321,7 @@ impl eframe::App for GuiApp {
                 for (i, label) in [
                     "首页",
                     "诊断",
+                    "实例",
                     "Profile",
                     "应用",
                     "配置",
@@ -336,15 +347,17 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             0 => self.home(ui),
             1 => self.diagnostics(ui),
-            2 => self.profiles(ui),
-            3 => self.app_page(ui),
-            4 => self.config_page(ui),
-            5 => self.tasks_page(ui),
-            6 => self.logs_page(ui),
+            2 => self.instances_page(ui),
+            3 => self.profiles(ui),
+            4 => self.app_page(ui),
+            5 => self.config_page(ui),
+            6 => self.tasks_page(ui),
+            7 => self.logs_page(ui),
             _ => self.about(ui),
         });
         self.sync_confirmation_window(ctx);
         self.apk_install_confirmation_window(ctx);
+        self.live_confirmation_window(ctx);
     }
 }
 
@@ -379,8 +392,11 @@ impl GuiApp {
             if ui.button("运行 dry-run").clicked() {
                 self.start_dry_run();
             }
+            if ui.button("准备 live 运行").clicked() {
+                self.pending_live_run = true;
+            }
             if ui.button("打开配置").clicked() {
-                self.tab = 4;
+                self.tab = 5;
             }
         });
         ui.separator();
@@ -423,6 +439,32 @@ impl GuiApp {
             }
             if ui.button("导出诊断报告").clicked() {
                 self.export_report();
+            }
+            if ui.button("导出当前实例 hierarchy").clicked() {
+                let store = self.store.clone();
+                let target = self.instance_target();
+                self.start_background_job("导出 hierarchy", move || {
+                    match dump_ui_hierarchy(&store, &target) {
+                        Ok(text) => format!("完成，节点 XML 长度 {}", text.len()),
+                        Err(error) => format!("失败: {:#}", error),
+                    }
+                });
+            }
+            if ui.button("分析截图...").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("图片", &["png", "jpg", "jpeg"])
+                    .pick_file()
+            {
+                match analyze_image_file(&path) {
+                    Ok(analysis) => {
+                        self.status = format!(
+                            "视觉分析：state={:?} center={:?}",
+                            analysis.state,
+                            analysis.button.map(|button| (button.cx, button.cy))
+                        );
+                    }
+                    Err(error) => self.status = format!("视觉分析失败: {:#}", error),
+                }
             }
             if ui.button("刷新最近运行结果").clicked() {
                 self.refresh_latest_result();
@@ -477,6 +519,47 @@ impl GuiApp {
         ui.label("当前阶段：默认 dry-run；正式点击必须使用 CLI 的 --live --confirm，并通过 profile 标定和时间窗口门禁。");
     }
 
+    fn instances_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("模拟器实例");
+        if ui.button("刷新实例列表").clicked() {
+            match list_instance_summaries(&self.store) {
+                Ok(instances) => {
+                    self.status = format!("检测到 {} 个实例", instances.len());
+                    self.instance_summaries = instances;
+                }
+                Err(error) => self.status = format!("实例列表失败: {:#}", error),
+            }
+        }
+        if self.instance_summaries.is_empty()
+            && let Ok(instances) = list_instance_summaries(&self.store)
+        {
+            self.instance_summaries = instances;
+        }
+        egui::Grid::new("instances").striped(true).show(ui, |ui| {
+            ui.label("index");
+            ui.label("名称");
+            ui.label("运行");
+            ui.label("serial");
+            ui.label("尺寸/DPI");
+            ui.label("启用");
+            ui.end_row();
+            for instance in &self.instance_summaries {
+                ui.label(instance.index.to_string());
+                ui.label(&instance.name);
+                ui.label(if instance.running { "是" } else { "否" });
+                ui.label(&instance.serial);
+                ui.label(format!(
+                    "{}x{}@{}",
+                    instance.width.unwrap_or(0),
+                    instance.height.unwrap_or(0),
+                    instance.dpi.unwrap_or(0)
+                ));
+                ui.label(if instance.enabled { "是" } else { "否" });
+                ui.end_row();
+            }
+        });
+    }
+
     fn profiles(&mut self, ui: &mut egui::Ui) {
         ui.heading("内置 Profile");
         ui.label(format!("当前实例 index：{}", self.selected_instance_index));
@@ -523,6 +606,42 @@ impl GuiApp {
                 ui.end_row();
             }
         });
+    }
+
+    fn live_confirmation_window(&mut self, ctx: &egui::Context) {
+        if !self.pending_live_run {
+            return;
+        }
+        let mut action = None;
+        egui::Window::new("确认正式 live 运行")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let scope = if self.run_all_instances {
+                    "全部已启用实例"
+                } else {
+                    "当前选择的实例"
+                };
+                ui.colored_label(egui::Color32::YELLOW, format!("范围：{}", scope));
+                ui.label("将执行真实签到点击。程序仍会检查 calibrated Profile、时间窗口、前台包名、连续 ready 和点击前二次确认。");
+                ui.label("请确认设备、实例和当前页面均正确；确认后将调用 CLI 同一套 run --live --confirm 业务逻辑。");
+                ui.horizontal(|ui| {
+                    if ui.button("确认 live").clicked() {
+                        action = Some(true);
+                    }
+                    if ui.button("取消").clicked() {
+                        action = Some(false);
+                    }
+                });
+            });
+        if let Some(confirm) = action {
+            self.pending_live_run = false;
+            if confirm {
+                self.start_run(true);
+            } else {
+                self.status = "已取消 live 运行".into();
+            }
+        }
     }
 
     fn sync_confirmation_window(&mut self, ctx: &egui::Context) {

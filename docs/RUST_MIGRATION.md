@@ -690,3 +690,59 @@ portable_smoke           PASS
 ```
 
 当前仍不支持 `.xapk`、`.apks` 和分包 APK；CJK 字体资源为 `rust/assets/NotoSansSC-VF.ttf`，许可证为 `rust/assets/OFL-NotoSansSC.txt`。
+
+## 2026-10-03 GUI 与 CLI 业务入口统一
+
+CLI 与 GUI 现在共享同一套核心业务函数：
+
+- GUI 的 dry-run/live 运行调用 `run`；
+- GUI 的 Profile 检测调用 `runtime_with_target` 和 Profile 匹配逻辑；
+- GUI 的 Profile 同步调用 `sync_profile`；
+- GUI 的 APK 安装调用 `install_apk`，并在确认前调用 `inspect_apk_metadata`；
+- GUI 的实例页调用 `list_instance_summaries`；
+- GUI 的 hierarchy 导出调用 `dump_ui_hierarchy`；
+- GUI 的截图分析调用 `analyze_image_file`；
+- GUI 的计划任务调用 `task_command`。
+
+GUI 不再复制 CLI 的设备、Profile、视觉或安装业务判断；GUI 只负责交互、确认窗口和后台任务调度。
+
+Windows 启动方式已拆分为两个二进制：
+
+```text
+zhfd-checkin.exe       CLI dispatcher
+zhfd-checkin-gui.exe   windows_subsystem="windows" 的独立 GUI
+```
+
+CLI 无参数启动时会以 detached process 启动同目录的 `zhfd-checkin-gui.exe`，不会创建终端窗口。直接双击 `zhfd-checkin-gui.exe` 也不会显示控制台窗口。portable smoke 已要求两个 EXE 同时存在。
+
+本轮离线验证：
+
+```text
+cargo fmt --check        PASS
+cargo clippy -D warnings PASS
+cargo test               PASS（34 tests）
+cargo build --release --bins PASS
+portable_smoke           PASS
+```
+
+## 2026-10-03 GUI/CLI parity follow-up
+
+GUI 现已补齐 CLI 中此前没有对应入口的用户功能：
+
+- 首页提供 live 运行确认窗口，确认后调用与 CLI 相同的 `run` 函数和安全门禁；
+- 实例页展示实例列表、运行状态、serial、尺寸/DPI 和 enabled 状态；
+- 诊断页可以导出当前实例 hierarchy，并支持选择图片调用同一视觉分析函数；
+- Profile、APK、计划任务、报告和日志仍调用 CLI 共用函数，不在 GUI 内复制业务判断；
+- CLI 默认入口不再直接创建 GUI，而是以 detached process 启动同目录 `zhfd-checkin-gui.exe`；
+- `zhfd-checkin-gui.exe` 使用 Windows GUI subsystem，不创建控制台窗口；
+- CI、README 和 portable smoke 均改为构建/检查两个 release binary。
+
+本轮验证：
+
+```text
+cargo fmt --check        PASS
+cargo clippy -D warnings PASS
+cargo test               PASS（34 tests）
+cargo build --release --bins PASS
+portable_smoke           PASS
+```

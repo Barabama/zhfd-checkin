@@ -26,6 +26,7 @@ if (-not (Test-Path -LiteralPath $FixturePath -PathType Leaf)) {
 
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("zhfd-portable-smoke-" + [guid]::NewGuid().ToString("N"))
 $stageExe = Join-Path $stage "zhfd-checkin.exe"
+$stageGuiExe = Join-Path $stage "zhfd-checkin-gui.exe"
 $stageFixtureDir = Join-Path $stage "fixtures"
 $stageFixture = Join-Path $stageFixtureDir "ready.png"
 
@@ -48,6 +49,11 @@ function Invoke-PortableApp {
 try {
     New-Item -ItemType Directory -Path $stageFixtureDir -Force | Out-Null
     Copy-Item -LiteralPath $ExePath -Destination $stageExe
+    $guiExePath = Join-Path (Split-Path -Parent $ExePath) "zhfd-checkin-gui.exe"
+    if (-not (Test-Path -LiteralPath $guiExePath -PathType Leaf)) {
+        throw "Standalone GUI EXE not found beside CLI EXE: $guiExePath"
+    }
+    Copy-Item -LiteralPath $guiExePath -Destination $stageGuiExe
     Copy-Item -LiteralPath $FixturePath -Destination $stageFixture
 
     $about = Invoke-PortableApp @("about")
@@ -113,6 +119,7 @@ try {
     Write-Host "PORTABLE_SMOKE_PASS"
     Write-Host "staging=$stage"
     Write-Host "exe=$stageExe"
+    Write-Host "gui_exe=$stageGuiExe"
     Write-Host "profile_count=8+"
     Write-Host "vision_state=$($vision.state)"
     Write-Host "runtime_dirs=logs,captures,reports"

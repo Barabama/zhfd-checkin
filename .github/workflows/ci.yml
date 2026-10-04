@@ -35,7 +35,7 @@ jobs:
         run: cargo test --manifest-path rust/Cargo.toml
 
       - name: Rust release build
-        run: cargo build --release --manifest-path rust/Cargo.toml
+        run: cargo build --release --manifest-path rust/Cargo.toml --bins
 
       - name: Portable EXE smoke test
         shell: pwsh
