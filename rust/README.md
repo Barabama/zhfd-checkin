@@ -7,13 +7,14 @@ Build with the MSVC toolchain:
 ```powershell
 $env:PATH="$env:USERPROFILE\.cargo\bin;$env:PATH"
 cargo test --manifest-path .\rust\Cargo.toml
-cargo build --release --manifest-path .\rust\Cargo.toml
+cargo build --release --manifest-path .\rust\Cargo.toml --bins
 ```
 
 Run commands from the release output directory or copy the executable anywhere:
 
 ```text
-zhfd-checkin.exe                 # GUI
+zhfd-checkin.exe                 # CLI dispatcher (no args launches detached GUI companion)
+zhfd-checkin-gui.exe             # standalone GUI; no console window on Windows
 zhfd-checkin.exe diagnose
 zhfd-checkin.exe report
 zhfd-checkin.exe profile detect
