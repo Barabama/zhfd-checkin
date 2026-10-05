@@ -14,7 +14,7 @@ use config::ConfigStore;
 use domain::{ExitCode, Mode, RunResult};
 use logger::{RunLog, SyncGeometry, SyncLog, SyncResult};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     thread,
     time::{Duration, Instant},
@@ -1370,12 +1370,44 @@ pub(crate) fn runtime_with_target(
         )?;
     }
     let adb_path = adb::find_adb(&store.config.emulator.adb_path)?;
-    let _ = Command::new(&adb_path)
-        .args(["connect", &selected.serial])
-        .output();
-    let device = adb::AdbDevice::discover(&adb_path.to_string_lossy(), &selected.serial)?;
+    let device = connect_adb_device(
+        &adb_path,
+        &selected.serial,
+        Duration::from_secs(store.config.runtime.startup_timeout_seconds.max(1)),
+    )?;
     let info = device.info();
     Ok((ld, device, info?))
+}
+
+/// LDPlayer can report an instance as running before its ADB endpoint has
+/// registered with the host daemon. Keep connecting until the startup budget
+/// expires instead of turning that normal boot race into an immediate GUI/CLI
+/// device failure.
+fn connect_adb_device(adb_path: &Path, serial: &str, timeout: Duration) -> Result<adb::AdbDevice> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let connect_error = match Command::new(adb_path).args(["connect", serial]).output() {
+            Ok(output) if !output.status.success() => Some(format!(
+                "adb connect 失败: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Ok(_) => None,
+            Err(error) => Some(format!("执行 adb connect 失败: {error}")),
+        };
+
+        let last_error = match adb::AdbDevice::discover(&adb_path.to_string_lossy(), serial) {
+            Ok(device) => return Ok(device),
+            Err(error) => match connect_error {
+                Some(connect_error) => format!("{connect_error}; 设备状态: {error:#}"),
+                None => format!("{error:#}"),
+            },
+        };
+
+        if Instant::now() >= deadline {
+            bail!("连接 ADB 设备超时: {} ({})", serial, last_error);
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn wait_for_package(device: &adb::AdbDevice, package: &str, timeout: Duration) -> Result<()> {
