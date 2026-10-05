@@ -18,7 +18,7 @@ serial = ""
 auto_launch = true
 
 [window]
-start = "21:30"
+start = "21:00"
 end = "23:59"
 timezone = "Asia/Shanghai"
 
@@ -248,6 +248,8 @@ mod tests {
         assert_eq!(config.runtime.location_timeout_seconds, 150);
         assert_eq!(config.runtime.success_timeout_seconds, 60);
         assert_eq!(config.runtime.stable_frames, 2);
+        assert_eq!(config.window.start, "21:00");
+        assert_eq!(config.window.end, "23:59");
         assert_eq!(config.window.timezone, "Asia/Shanghai");
         assert_eq!(config.app.package_name, "cn.edu.fzu.fdxypa");
     }

@@ -21,5 +21,5 @@ for (const file of files) {
 const cfg = require(path.join(root, "config.js"));
 if (cfg.app.packageName !== "cn.edu.fzu.fdxypa") throw new Error("unexpected package");
 if (cfg.runtime.dryRun !== true) throw new Error("dry-run must remain enabled");
-if (cfg.window.start !== "21:30" || cfg.window.end !== "23:59") throw new Error("unexpected window");
+if (cfg.window.start !== "21:00" || cfg.window.end !== "23:59") throw new Error("unexpected window");
 console.log("PASS autojs6 structural smoke test");

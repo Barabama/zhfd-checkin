@@ -1407,17 +1407,46 @@ fn locate_or_navigate(
         return Ok(fallback);
     }
 
-    let xml = device.dump_hierarchy().unwrap_or_default();
+    let mut xml = device.dump_hierarchy().unwrap_or_default();
     let min_entry_y = image.height() / 8;
     let mut navigated = false;
+
+    // 1. The check-in entry may already be a clickable node on the current page.
     if let Some((x, y)) = find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y) {
         device.tap(x, y)?;
         thread::sleep(Duration::from_secs(3));
         navigated = true;
-    } else if let Some((x, y)) = find_clickable_labeled_bounds(&xml, "业务", 0) {
-        // Landscape layouts put the service catalogue behind the bottom
-        // "业务" tab and may require one or more vertical swipes before the
-        // check-in tile becomes part of the accessibility hierarchy.
+    }
+
+    // 2. Some layouts keep the check-in tile below the fold on the home page,
+    //    so scroll the current page and rescan before trying other routes.
+    //    Scrolling a check-in page cannot activate the sign-in control.
+    if !navigated {
+        for attempt in 0..4 {
+            log.event("home_scroll", serde_json::json!({"attempt": attempt + 1}))?;
+            device.swipe(
+                image.width() / 2,
+                image.height() * 3 / 4,
+                image.width() / 2,
+                image.height() * 2 / 5,
+                500,
+            )?;
+            thread::sleep(Duration::from_secs(1));
+            xml = device.dump_hierarchy().unwrap_or_default();
+            if let Some((x, y)) = find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y)
+            {
+                device.tap(x, y)?;
+                thread::sleep(Duration::from_secs(3));
+                navigated = true;
+                break;
+            }
+        }
+    }
+
+    // 3. Landscape layouts hide the service catalogue behind the "业务" tab and
+    //    may require one or more vertical swipes before the check-in tile
+    //    becomes part of the accessibility hierarchy.
+    if !navigated && let Some((x, y)) = find_clickable_labeled_bounds(&xml, "业务", 0) {
         device.tap(x, y)?;
         thread::sleep(Duration::from_secs(2));
         for attempt in 0..6 {
@@ -1442,6 +1471,8 @@ fn locate_or_navigate(
             }
         }
     }
+
+    // 4. Legacy positional fallback when no accessibility entry was found.
     if !navigated {
         device.tap(
             (profile.service_icon_center_ratio.0 * image.width() as f32) as u32,

@@ -42,7 +42,7 @@ CHECKIN_ENTRY = "晚点名签到"
 # 仅作动态检测失败时的回退：按屏幕比例换算。
 BTN_BOX_FALLBACK_RATIO = (0.5, 0.673, 0.29, 0.29)  # 模拟器实测；真机为 0.5,0.5543
 WINDOW = (
-    os.getenv("ZHFD_WINDOW_START", "21:30"),
+    os.getenv("ZHFD_WINDOW_START", "21:00"),
     os.getenv("ZHFD_WINDOW_END", "23:59"),
 )
 BARK_URL = os.getenv("BARK_URL", "")
