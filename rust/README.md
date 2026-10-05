@@ -28,6 +28,8 @@ zhfd-checkin.exe vision --image .\debug\button_now.png
 
 `config.toml`, `logs/`, `reports/`, and `captures/` are created beside the executable. LDPlayer and the APK remain external dependencies. See `docs/RUST_MIGRATION.md` for the current migration boundary and profile status.
 
+The current default sign-in window is **21:00–23:59 (Asia/Shanghai)**. Existing historical validation records may mention the former 21:30 start time; they describe the window that was in effect at the time and are not current defaults.
+
 ## Multiple LDPlayer instances
 
 The legacy single-instance settings remain supported. To configure two instances explicitly, add:

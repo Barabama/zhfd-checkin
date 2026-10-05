@@ -7,7 +7,7 @@ module.exports = {
         serviceText: "我的服务"
     },
     window: {
-        start: "21:30",
+        start: "21:00",
         end: "23:59",
         launchLeadMinutes: 5
     },
