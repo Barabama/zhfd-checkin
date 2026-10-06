@@ -904,6 +904,20 @@ fn build_task_command_line(
     task_run
 }
 
+fn cli_executable_path(current_exe: &std::path::Path) -> std::path::PathBuf {
+    let file_name = current_exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if file_name.eq_ignore_ascii_case("zhfd-checkin-gui.exe") {
+        return current_exe.with_file_name("zhfd-checkin.exe");
+    }
+    if file_name.eq_ignore_ascii_case("zhfd-checkin-gui") {
+        return current_exe.with_file_name("zhfd-checkin");
+    }
+    current_exe.to_path_buf()
+}
+
 fn task_command(command: TaskCommand) -> Result<ExitCode> {
     match command {
         TaskCommand::Create {
@@ -916,7 +930,8 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
             if live && !confirm {
                 bail!("正式计划任务必须同时指定 --live --confirm");
             }
-            let exe = std::env::current_exe().context("无法取得 EXE 路径")?;
+            let current_exe = std::env::current_exe().context("无法取得 EXE 路径")?;
+            let exe = cli_executable_path(&current_exe);
             let mode = if live {
                 "run --live --confirm"
             } else {
@@ -1660,6 +1675,18 @@ mod tests {
         assert_eq!(
             find_clickable_labeled_bounds(malformed_then_valid, "晚点名签到", 100),
             Some((20, 220))
+        );
+    }
+
+    #[test]
+    fn gui_task_creation_targets_cli_companion() {
+        assert_eq!(
+            super::cli_executable_path(Path::new(r"C:\Program Files\ZHFD\zhfd-checkin-gui.exe",)),
+            Path::new(r"C:\Program Files\ZHFD\zhfd-checkin.exe")
+        );
+        assert_eq!(
+            super::cli_executable_path(Path::new(r"C:\ZHFD\zhfd-checkin.exe")),
+            Path::new(r"C:\ZHFD\zhfd-checkin.exe")
         );
     }
 
