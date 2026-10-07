@@ -31,3 +31,6 @@ rust/**/config.toml
 rust/**/logs/
 rust/**/captures/
 rust/**/reports/
+# 本地发布暂存目录（发布包通过 CI artifact / GitHub Release 生成）
+dist/
+release/

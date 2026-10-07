@@ -53,7 +53,7 @@ portrait_540x960_d160
 
 工作区当前已有的 LDPlayer 实例实际报告为 `900x1600@320`，因此额外保留了兼容 profile `portrait_900x1600_d320`。随机 model、IMEI 和 ADB serial 不参与 profile 匹配。
 
-只有已标定 profile 才允许 `--live`；目前仅 `portrait_900x1600_d240` 完成首轮实机标定，其余七个新预设仍只允许检测和 dry-run。
+只有已标定 profile 才允许 `--live`；当前 `portrait_900x1600_d240` 和兼容的 `portrait_900x1600_d320` 已标定，其余 Profile 仍只允许检测和 dry-run。当前三个生产实例均为 `portrait_900x1600_d320`。
 
 ## 已验证
 
@@ -748,3 +748,33 @@ cargo test               PASS（34 tests）
 cargo build --release --bins PASS
 portable_smoke           PASS
 ```
+## 2026-10-07 发布整理与 dry-run 计划任务状态
+
+本轮按 deadline 优先完成发布整理，保留 dry-run 计划任务，不创建 live 自动任务。
+
+当前计划任务：
+
+```text
+ZHFD-AutoCheckin-DryRun
+执行命令：zhfd-checkin.exe run --dry-run --all-instances
+计划时间：每天 21:00（Asia/Shanghai）
+```
+
+2026-10-07 21:00 计划任务已实际执行，三个实例日志均独立生成，且 `clicked=false`：
+
+- 实例 0 识别到旧日期的 success 页面；没有点击，但不能把旧日期 success 当作当天签到证明；
+- 实例 1、实例 2 实际截图已进入“晚点名签到”页并处于“定位中”，但 hierarchy 路由信息不足，记录为 `navigation_not_confirmed`；
+- 任务基础设施、CLI 目标路径、实例选择和 fail-closed 行为正常；
+- 当前不创建 live 计划任务。
+
+该结果作为当前发布版本的已知运行限制记录，不阻塞 deadline 优先的便携版发布；后续继续通过 dry-run 计划任务窗口观察并改进页面路由和当天日期校验。
+
+本轮发布整理包括：
+
+- `scripts/package_release.ps1` Windows 便携包脚本；
+- GitHub Actions release commit 一致性检查；
+- tag 触发的 Windows Release workflow；
+- `.gitignore` 对本地 `dist/`、`release/` 暂存目录的忽略；
+- CLI/GUI 双 EXE 和 dry-run 计划任务使用说明。
+
+发布包不包含 `config.toml`、账号、Cookie、Token、日志、截图或 ADB 状态。
