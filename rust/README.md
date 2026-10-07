@@ -49,3 +49,14 @@ enabled = true
 ```
 
 Use `instance list` to inspect discovered LDPlayer instances. `--instance-index` selects one instance, `--serial` overrides its ADB serial, and `--all-instances` runs the selected command sequentially for all discovered instances. Each run keeps its own serial, instance index/name, Profile decision, and logs; no ADB state is shared between instances.
+## Windows release package
+
+Build and package the two portable Windows binaries:
+
+```powershell
+cargo build --release --manifest-path .\rust\Cargo.toml --bins
+.\scripts\portable_smoke.ps1
+.\scripts\package_release.ps1
+```
+
+The package contains only `zhfd-checkin.exe`, `zhfd-checkin-gui.exe`, and a usage note. It does not contain `config.toml`, accounts, tokens, logs, screenshots, or emulator state. The default scheduled task remains dry-run; do not create a live scheduled task without an explicit operational decision.

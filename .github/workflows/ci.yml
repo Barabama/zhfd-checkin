@@ -29,7 +29,7 @@ jobs:
         run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
 
       - name: Rust lint
-        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Rust tests
         run: cargo test --manifest-path rust/Cargo.toml
@@ -40,6 +40,26 @@ jobs:
       - name: Portable EXE smoke test
         shell: pwsh
         run: .\scripts\portable_smoke.ps1 -ExePath "$pwd\rust\target\release\zhfd-checkin.exe" -FixturePath "$pwd\autojs6\fixtures\ready.png"
+
+      - name: Verify release embeds current commit
+        shell: pwsh
+        run: |
+          $expected = (git rev-parse --short=12 HEAD).Trim()
+          $about = (& .\rust\target\release\zhfd-checkin.exe about | Out-String)
+          if ($about -notmatch [regex]::Escape($expected)) {
+            throw "Release EXE commit mismatch. expected=$expected`n$about"
+          }
+
+      - name: Package Windows release artifact
+        shell: pwsh
+        run: .\scripts\package_release.ps1 -ReleaseDirectory "$pwd\dist"
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhfd-checkin-windows
+          path: dist/*.zip
+          if-no-files-found: error
 
       - name: Set up Python
         uses: actions/setup-python@v5
