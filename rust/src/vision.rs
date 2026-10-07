@@ -215,6 +215,9 @@ pub fn find_colored_button(image: &DynamicImage) -> Option<ButtonBox> {
         }
     }
     let mut seen = vec![false; grid.len()];
+    // Real sign-in circles occupy a substantial fraction of the viewport.
+    // Small home-page service icons must not become button candidates.
+    let min_button_edge = ((w.min(h) as f32) * 0.20).round() as u32;
     let mut best: Option<(usize, usize, usize, usize, usize)> = None;
     for sy in 0..y_count {
         for sx in 0..x_count {
@@ -252,8 +255,8 @@ pub fn find_colored_button(image: &DynamicImage) -> Option<ButtonBox> {
             let bh = (max_y - min_y + 1) as u32 * step;
             let ratio = bw as f32 / bh.max(1) as f32;
             if count >= 40
-                && bw >= w.min(h) as u32 / 10
-                && bh >= w.min(h) as u32 / 10
+                && bw >= min_button_edge
+                && bh >= min_button_edge
                 && (0.55..=1.8).contains(&ratio)
                 && best.as_ref().map(|b| count > b.0).unwrap_or(true)
             {
@@ -292,6 +295,18 @@ mod tests {
             _ => panic!("unknown fixture"),
         };
         decode(bytes).expect("fixture decode")
+    }
+
+    #[test]
+    fn ignores_small_home_service_icon() {
+        let mut image = image::RgbImage::from_pixel(900, 1600, image::Rgb([255, 255, 255]));
+        for y in 1200..1296 {
+            for x in 76..172 {
+                image.put_pixel(x, y, image::Rgb([25, 145, 235]));
+            }
+        }
+        let image = DynamicImage::ImageRgb8(image);
+        assert!(find_colored_button(&image).is_none());
     }
 
     #[test]
