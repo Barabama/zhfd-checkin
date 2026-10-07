@@ -85,6 +85,20 @@ struct GuiJob {
     result: Arc<Mutex<Option<JobOutput>>>,
 }
 
+fn run_target_for_selection(
+    all_instances: bool,
+    selected_instance_index: u32,
+) -> InstanceTargetArgs {
+    if all_instances {
+        InstanceTargetArgs::default()
+    } else {
+        InstanceTargetArgs {
+            instance_index: Some(selected_instance_index),
+            serial: None,
+        }
+    }
+}
+
 impl GuiApp {
     fn new(store: ConfigStore) -> Self {
         let apk_path = store.config.app.apk_path.clone();
@@ -188,8 +202,9 @@ impl GuiApp {
 
     fn start_run(&mut self, live: bool) {
         let store = self.store.clone();
-        let target = self.instance_target();
         let all_instances = self.run_all_instances;
+        // All-instances mode must not carry a single-instance selector.
+        let target = run_target_for_selection(all_instances, self.selected_instance_index);
         let label = if live { "live 运行" } else { "dry-run" };
         self.start_background_job(label, move || {
             match run(
@@ -959,5 +974,24 @@ impl GuiApp {
         ui.label("ADB + LDPlayer ldconsole.exe：外部设备控制依赖");
         ui.separator();
         ui.label("使用建议：先执行诊断，再运行 dry-run；正式模式需要显式确认。");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_instances_run_clears_single_instance_target() {
+        let target = run_target_for_selection(true, 1);
+        assert!(target.instance_index.is_none());
+        assert!(target.serial.is_none());
+    }
+
+    #[test]
+    fn single_instance_run_keeps_selected_index() {
+        let target = run_target_for_selection(false, 2);
+        assert_eq!(target.instance_index, Some(2));
+        assert!(target.serial.is_none());
     }
 }

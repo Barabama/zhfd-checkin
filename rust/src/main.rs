@@ -1149,7 +1149,15 @@ where
         Duration::from_secs(store.config.runtime.startup_timeout_seconds),
     )?;
     thread::sleep(Duration::from_millis(800));
-    let _initial_button = locate_or_navigate(&device, profile, log)?;
+    let navigation = locate_or_navigate(&device, profile, log)?;
+    log.event(
+        "page_route",
+        serde_json::json!({"route": navigation.route.as_str()}),
+    )?;
+    if navigation.route != PageRoute::Checkin {
+        result.error = Some(navigation.route.error_code().into());
+        return Ok(ExitCode::VisionFailure);
+    }
     let started = Instant::now();
     let mut unknowns = 0u32;
     let mut ready_frames = 0u32;
@@ -1179,6 +1187,9 @@ where
             &bytes,
         )?;
         let image = vision::decode(&bytes)?;
+        // Dynamic color detection is only trusted after locate_or_navigate has
+        // explicitly confirmed the check-in route. Otherwise a colorful home
+        // service tile could be classified as ready/success and be clicked.
         let button = vision::find_colored_button(&image)
             .unwrap_or_else(|| vision::fallback_button(&image, profile));
         let analysis = vision::classify_button(&image, button);
@@ -1436,25 +1447,93 @@ fn wait_for_package(device: &adb::AdbDevice, package: &str, timeout: Duration) -
     bail!("等待 App 前台超时: {}", package)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageRoute {
+    Home,
+    Services,
+    Checkin,
+    Login,
+    Unknown,
+}
+
+impl PageRoute {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Home => "home",
+            Self::Services => "services",
+            Self::Checkin => "checkin",
+            Self::Login => "login",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn error_code(self) -> &'static str {
+        match self {
+            Self::Login => "login_required",
+            Self::Home | Self::Services | Self::Unknown => "navigation_not_confirmed",
+            Self::Checkin => "",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NavigationResult {
+    route: PageRoute,
+}
+
+fn detect_page_route(xml: &str) -> PageRoute {
+    if xml.contains("一键登录") || xml.contains("其他账户登录") {
+        return PageRoute::Login;
+    }
+    if [
+        "未签到",
+        "无法签到",
+        "未到签到时间",
+        "定位中",
+        "点击签到",
+        "签到成功",
+    ]
+    .iter()
+    .any(|label| xml.contains(label))
+    {
+        return PageRoute::Checkin;
+    }
+    if xml.contains("我的服务") {
+        return PageRoute::Home;
+    }
+    if xml.contains("业务") {
+        return PageRoute::Services;
+    }
+    PageRoute::Unknown
+}
+
 fn locate_or_navigate(
     device: &adb::AdbDevice,
     profile: &profile::Profile,
     log: &RunLog,
-) -> Result<vision::ButtonBox> {
+) -> Result<NavigationResult> {
     let bytes = device.screenshot()?;
     let image = vision::decode(&bytes)?;
 
     // A home-page service tile can contain saturated colors and white text that
-    // look like a locating button to the visual detector. Trust the
-    // profile-specific fallback first, then use clickable accessibility labels
-    // to navigate, and only use the dynamic detector after the page route is
-    // known.
-    let fallback = vision::fallback_button(&image, profile);
-    if vision::classify_button(&image, fallback).state != vision::ButtonState::Unknown {
-        return Ok(fallback);
+    // look like a locating button to the visual detector. Inspect hierarchy
+    // first and only trust dynamic color detection after the check-in route is
+    // explicitly confirmed.
+    let mut xml = device.dump_hierarchy().unwrap_or_default();
+    let initial_route = detect_page_route(&xml);
+    if initial_route == PageRoute::Login {
+        log.save_bytes("navigation_result.png", &bytes)?;
+        return Ok(NavigationResult {
+            route: initial_route,
+        });
+    }
+    if initial_route == PageRoute::Checkin {
+        log.save_bytes("navigation_result.png", &bytes)?;
+        return Ok(NavigationResult {
+            route: initial_route,
+        });
     }
 
-    let mut xml = device.dump_hierarchy().unwrap_or_default();
     let min_entry_y = image.height() / 8;
     let mut navigated = false;
 
@@ -1530,18 +1609,36 @@ fn locate_or_navigate(
 
     let mut bytes = device.screenshot()?;
     let mut image = vision::decode(&bytes)?;
+    let mut route = if navigated {
+        PageRoute::Checkin
+    } else {
+        detect_page_route(&device.dump_hierarchy().unwrap_or_default())
+    };
+
+    // If the positional fallback did not lead to a page that identifies itself
+    // as the check-in screen, fail closed. In particular, do not let a home
+    // page tile become a dynamic ready/success candidate.
+    if route != PageRoute::Checkin {
+        log.save_bytes("navigation_result.png", &bytes)?;
+        return Ok(NavigationResult { route });
+    }
+
     for attempt in 0..4 {
         if let Some(button) = vision::find_colored_button(&image) {
             let analysis = vision::classify_button(&image, button);
             if analysis.state != vision::ButtonState::Unknown {
                 log.save_bytes("navigation_result.png", &bytes)?;
-                return Ok(button);
+                return Ok(NavigationResult {
+                    route: PageRoute::Checkin,
+                });
             }
         }
         let fallback = vision::fallback_button(&image, profile);
         if vision::classify_button(&image, fallback).state != vision::ButtonState::Unknown {
             log.save_bytes("navigation_result.png", &bytes)?;
-            return Ok(fallback);
+            return Ok(NavigationResult {
+                route: PageRoute::Checkin,
+            });
         }
         if !navigated || attempt == 3 {
             break;
@@ -1559,9 +1656,13 @@ fn locate_or_navigate(
         thread::sleep(Duration::from_secs(1));
         bytes = device.screenshot()?;
         image = vision::decode(&bytes)?;
+        route = detect_page_route(&device.dump_hierarchy().unwrap_or_default());
+        if route != PageRoute::Checkin {
+            break;
+        }
     }
     log.save_bytes("navigation_result.png", &bytes)?;
-    Ok(vision::fallback_button(&image, profile))
+    Ok(NavigationResult { route })
 }
 
 #[allow(dead_code)]
@@ -1648,8 +1749,9 @@ fn print_device(serial: &str, info: &adb::DeviceInfo) {
 #[cfg(test)]
 mod tests {
     use super::{
-        SyncLifecycle, TapDevice, TapRequest, build_task_command_line,
-        find_clickable_labeled_bounds, find_labeled_bounds, guarded_tap, restore_sync_backup,
+        PageRoute, SyncLifecycle, TapDevice, TapRequest, build_task_command_line,
+        detect_page_route, find_clickable_labeled_bounds, find_labeled_bounds, guarded_tap,
+        restore_sync_backup,
     };
     use crate::{domain::Mode, vision::ButtonState};
     use anyhow::Result;
@@ -1676,6 +1778,23 @@ mod tests {
             find_clickable_labeled_bounds(malformed_then_valid, "晚点名签到", 100),
             Some((20, 220))
         );
+    }
+
+    #[test]
+    fn page_route_detection_rejects_login_and_home_as_checkin() {
+        assert_eq!(
+            detect_page_route(r#"<node content-desc="一键登录"/>"#),
+            PageRoute::Login
+        );
+        assert_eq!(
+            detect_page_route(r#"<node content-desc="我的服务"/>"#),
+            PageRoute::Home
+        );
+        assert_eq!(
+            detect_page_route(r#"<node text="晚点名签到"/><node text="无法签到"/>"#),
+            PageRoute::Checkin
+        );
+        assert_eq!(detect_page_route("<hierarchy />"), PageRoute::Unknown);
     }
 
     #[test]
