@@ -26,7 +26,7 @@ zhfd-checkin.exe run --dry-run --all-instances
 zhfd-checkin.exe vision --image .\debug\button_now.png
 ```
 
-`config.toml`, `logs/`, `reports/`, and `captures/` are created beside the executable. LDPlayer and the APK remain external dependencies. See `docs/RUST_MIGRATION.md` for the current migration boundary and profile status.
+`config.toml`, `logs/`, `reports/`, and `captures/` are created beside the executable. LDPlayer and the APK remain external dependencies. See `docs/README.md` for the current documentation index, `docs/OPERATIONS.md` for deployment and commands, `docs/CHECKIN_SAFETY.md` for behavior/safety rules, and `docs/ENGINEERING_AND_RELEASE.md` for build/release state. Historical migration notes are preserved under `docs/archive/2026-10-11/architecture/`.
 
 The current default sign-in window is **21:00–23:59 (Asia/Shanghai)**. Existing historical validation records may mention the former 21:30 start time; they describe the window that was in effect at the time and are not current defaults.
 
