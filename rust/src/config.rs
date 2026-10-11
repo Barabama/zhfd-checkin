@@ -283,15 +283,14 @@ impl ConfigStore {
             if let Err(error) = write_config(&root, &path, &config) {
                 if origin == ConfigOrigin::Portable
                     && local_app_data_root().as_deref() != Some(root.as_path())
+                    && let Some(fallback) = local_app_data_root()
                 {
-                    if let Some(fallback) = local_app_data_root() {
-                        return Self::load_root(
-                            fallback.clone(),
-                            fallback.join("config.toml"),
-                            ConfigOrigin::LocalAppData,
-                            true,
-                        );
-                    }
+                    return Self::load_root(
+                        fallback.clone(),
+                        fallback.join("config.toml"),
+                        ConfigOrigin::LocalAppData,
+                        true,
+                    );
                 }
                 return Err(error);
             }

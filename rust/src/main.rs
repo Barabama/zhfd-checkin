@@ -2235,6 +2235,28 @@ fn locate_or_navigate(
     })
 }
 
+fn log_foreground_snapshot(device: &adb::AdbDevice, log: &RunLog, stage: &str) -> Result<()> {
+    match device.current_package() {
+        Ok(package) => log.event(
+            "foreground_snapshot",
+            serde_json::json!({"stage":stage,"package":package}),
+        ),
+        Err(error) => log.event(
+            "foreground_snapshot",
+            serde_json::json!({"stage":stage,"error":format!("{error:#}")}),
+        ),
+    }
+}
+
+fn hierarchy_xml(device: &adb::AdbDevice, log: &RunLog, stage: &str) -> Result<(String, bool)> {
+    let observation = device.dump_hierarchy_observation(stage)?;
+    let ok = matches!(observation.status, adb::HierarchyStatus::DumpSucceeded);
+    log.event("hierarchy_observation", &observation)?;
+    let xml = observation.xml.unwrap_or_else(String::new);
+    Ok((xml, ok))
+}
+}
+
 #[allow(dead_code)]
 fn find_labeled_bounds(xml: &str, label: &str, min_center_y: u32) -> Option<(u32, u32)> {
     find_labeled_bounds_internal(xml, label, min_center_y, false)
