@@ -149,6 +149,12 @@ pub struct RunResult {
     pub finished_at: Option<String>,
     pub mode: String,
     #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub blocked_by: Option<String>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
     pub instance_index: Option<u32>,
     #[serde(default)]
     pub instance_name: Option<String>,
@@ -180,6 +186,22 @@ pub struct RunResult {
     pub recovery_action: Option<String>,
     #[serde(default)]
     pub artifact_paths: Vec<String>,
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub page_loading: Option<bool>,
+    #[serde(default)]
+    pub button_state: Option<String>,
+    #[serde(default)]
+    pub location_state: Option<String>,
+    #[serde(default)]
+    pub foreground_package: Option<String>,
+    #[serde(default)]
+    pub app_version: Option<String>,
+    #[serde(default)]
+    pub git_commit: Option<String>,
+    #[serde(default)]
+    pub build_id: Option<String>,
     pub error: Option<String>,
 }
 
@@ -318,7 +340,7 @@ pub fn authorize_click(
     Ok(())
 }
 
-fn parse_time(value: &str) -> Result<NaiveTime> {
+pub fn parse_time(value: &str) -> Result<NaiveTime> {
     let value = value.trim();
     let parts = value.split(':').collect::<Vec<_>>();
     if parts.len() != 2 || parts[0].len() != 2 || parts[1].len() != 2 {

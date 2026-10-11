@@ -1,5 +1,6 @@
 use crate::profile::Orientation;
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
     process::Output,
@@ -9,6 +10,29 @@ use std::{
 pub struct AdbDevice {
     pub adb: PathBuf,
     pub serial: String,
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HierarchyStatus {
+    DumpSucceeded,
+    DumpFailed,
+    DumpEmptyOrTruncated,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HierarchyObservation {
+    pub stage: String,
+    pub elapsed_ms: u128,
+    pub status: HierarchyStatus,
+    pub bytes: usize,
+    pub utf8_valid: bool,
+    pub exit_code: Option<i32>,
+    pub stderr_summary: Option<String>,
+    pub marker_summary: Option<String>,
+    #[serde(skip)]
+    pub xml: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,8 +189,62 @@ impl AdbDevice {
     }
 
     pub fn dump_hierarchy(&self) -> Result<String> {
-        self.shell(&["uiautomator", "dump", "/sdcard/window.xml"])?;
-        self.shell(&["cat", "/sdcard/window.xml"])
+        let observation = self.dump_hierarchy_observation("direct")?;
+        observation.xml.context("hierarchy dump 没有 XML 内容")
+    }
+
+    pub fn dump_hierarchy_observation(&self, stage: &str) -> Result<HierarchyObservation> {
+        let started = std::time::Instant::now();
+        let dump = Command::new(&self.adb)
+            .args([
+                "-s",
+                &self.serial,
+                "shell",
+                "uiautomator",
+                "dump",
+                "/sdcard/window.xml",
+            ])
+            .output()
+            .with_context(|| format!("执行 hierarchy dump 失败: {}", self.serial))?;
+        if !dump.status.success() {
+            return Ok(HierarchyObservation {
+                stage: stage.into(),
+                elapsed_ms: started.elapsed().as_millis(),
+                status: HierarchyStatus::DumpFailed,
+                bytes: 0,
+                utf8_valid: false,
+                exit_code: dump.status.code(),
+                stderr_summary: Some(limit_error(&text(&dump.stderr))),
+                marker_summary: None,
+                xml: None,
+            });
+        }
+        let cat = Command::new(&self.adb)
+            .args(["-s", &self.serial, "shell", "cat", "/sdcard/window.xml"])
+            .output()
+            .with_context(|| format!("读取 hierarchy XML 失败: {}", self.serial))?;
+        let utf8 = String::from_utf8(cat.stdout.clone());
+        let utf8_valid = utf8.is_ok();
+        let xml = utf8.unwrap_or_else(|_| String::from_utf8_lossy(&cat.stdout).into_owned());
+        let valid_shape = xml.contains("<hierarchy") && xml.contains("<node");
+        let status = if !cat.status.success() {
+            HierarchyStatus::DumpFailed
+        } else if xml.trim().is_empty() || !valid_shape {
+            HierarchyStatus::DumpEmptyOrTruncated
+        } else {
+            HierarchyStatus::DumpSucceeded
+        };
+        Ok(HierarchyObservation {
+            stage: stage.into(),
+            elapsed_ms: started.elapsed().as_millis(),
+            status: status.clone(),
+            bytes: cat.stdout.len(),
+            utf8_valid,
+            exit_code: cat.status.code(),
+            stderr_summary: (!cat.status.success()).then(|| limit_error(&text(&cat.stderr))),
+            marker_summary: Some(marker_summary(&xml)),
+            xml: matches!(status, HierarchyStatus::DumpSucceeded).then_some(xml),
+        })
     }
 
     pub fn install_apk(&self, apk: &Path) -> Result<String> {
@@ -187,6 +265,32 @@ impl AdbDevice {
         }
         bail!("未找到已安装包: {}", package)
     }
+}
+
+fn limit_error(value: &str) -> String {
+    const LIMIT: usize = 512;
+    let trimmed = value.trim();
+    if trimmed.len() <= LIMIT {
+        trimmed.to_string()
+    } else {
+        format!("{}…", &trimmed[..LIMIT])
+    }
+}
+
+fn marker_summary(xml: &str) -> String {
+    [
+        "晚点名签到",
+        "点击签到",
+        "定位中",
+        "签到成功",
+        "我的服务",
+        "业务",
+    ]
+    .iter()
+    .filter(|marker| xml.contains(**marker))
+    .copied()
+    .collect::<Vec<_>>()
+    .join(",")
 }
 
 pub fn find_adb(configured: &str) -> Result<PathBuf> {
