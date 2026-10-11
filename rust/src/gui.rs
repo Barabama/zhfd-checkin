@@ -420,7 +420,12 @@ fn explain_error(error: &str) -> &'static str {
         "location_timeout" => "定位等待超时；未执行点击。",
         "success_timeout" => "点击后未在超时内确认成功；请人工核对页面。",
         "outside_window" => "当前不在配置的签到时间窗口；未执行点击。",
-        "foreground_package_changed" => "前台应用已变化；安全策略阻止点击。",
+        "foreground_package_changed" | "target_app_not_foreground" => {
+            "目标 App 已离开前台；安全策略阻止继续操作。"
+        }
+        "foreground_query_failed" => "无法读取前台应用；安全策略阻止继续操作。",
+        "route_candidate_unconfirmed" => "页面截图仅能形成候选，层级证据未确认；未执行点击。",
+        "route_evidence_conflict" => "页面截图与层级证据冲突；安全策略阻止继续操作。",
         "ready_confirmation_failed" => "点击前二次 ready 确认失败；未执行点击。",
         "unknown_profile" => "设备分辨率/DPI 没有精确 profile；未执行点击。",
         "uncalibrated_profile" => "当前 profile 尚未完成生产标定；未执行点击。",

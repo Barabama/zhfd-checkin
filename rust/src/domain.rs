@@ -16,6 +16,8 @@ pub enum PageRoute {
     Services,
     Checkin,
     Unknown,
+    RouteCandidateUnconfirmed,
+    RouteEvidenceConflict,
 }
 
 impl PageRoute {
@@ -26,6 +28,8 @@ impl PageRoute {
             Self::Services => "services",
             Self::Checkin => "checkin",
             Self::Unknown => "unknown",
+            Self::RouteCandidateUnconfirmed => "route_candidate_unconfirmed",
+            Self::RouteEvidenceConflict => "route_evidence_conflict",
         }
     }
 }

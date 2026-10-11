@@ -1062,7 +1062,7 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
     }
     let log = RunLog::new(&store.root)?;
     let mut result = RunResult {
-        schema_version: 2,
+        schema_version: 3,
         run_id: log
             .dir
             .file_name()
@@ -1071,6 +1071,9 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
         started_at: chrono::Local::now().to_rfc3339(),
         finished_at: None,
         mode: mode.as_str().into(),
+        status: Some("running".into()),
+        blocked_by: None,
+        error_code: None,
         instance_index: args.target.instance_index,
         instance_name: None,
         serial: String::new(),
@@ -1090,6 +1093,14 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
         error_stage: None,
         recovery_action: None,
         artifact_paths: Vec::new(),
+        route: None,
+        page_loading: None,
+        button_state: None,
+        location_state: None,
+        foreground_package: None,
+        app_version: Some(VERSION.into()),
+        git_commit: Some(GIT_COMMIT.into()),
+        build_id: Some(format!("{}-{}", VERSION, GIT_COMMIT)),
         error: None,
     };
     seed_result_identity(store, &args.target, &mut result);
@@ -1427,16 +1438,23 @@ where
         }),
     )?;
     if navigation.route != PageRoute::Checkin {
-        let (code, recovery) = if navigation.route == PageRoute::Login {
-            (
+        let (code, recovery) = match navigation.route {
+            PageRoute::Login => (
                 "login_required",
                 "请在模拟器中手动完成登录；本程序不会输入账号、密码、验证码或点击一键登录。",
-            )
-        } else {
-            (
+            ),
+            PageRoute::RouteCandidateUnconfirmed => (
+                "route_candidate_unconfirmed",
+                "页面候选缺少可验证的层级证据；请手动确认页面后重试。",
+            ),
+            PageRoute::RouteEvidenceConflict => (
+                "route_evidence_conflict",
+                "页面截图和层级证据不一致；请手动确认页面后重试。",
+            ),
+            _ => (
                 "navigation_not_confirmed",
                 "请手动进入“晚点名签到”页面后重新运行；未执行签到点击。",
-            )
+            ),
         };
         set_run_failure(result, code, "navigation", recovery);
         return Ok(ExitCode::VisionFailure);
@@ -2189,9 +2207,9 @@ fn locate_or_navigate(
         CheckinMode::Unsupported
     };
     if route == PageRoute::Checkin && checkin_mode == CheckinMode::Ordinary {
-        // Ordinary check-in requires hierarchy evidence plus a visible button
-        // candidate. If the button is below the fold, a bounded non-clicking
-        // scroll is allowed only while route and mode remain confirmed.
+        // Confirm that the actual sign-in control is visible before allowing the
+        // run loop to interpret state. When route identity conflicts with a
+        // visible button-like control, preserve that conflict for diagnostics.
         let mut visible_state = vision::ButtonState::Unknown;
         for attempt in 0..4 {
             let button = vision::find_colored_button(&image)
@@ -2224,6 +2242,12 @@ fn locate_or_navigate(
         if visible_state == vision::ButtonState::Unknown {
             route = PageRoute::Unknown;
         }
+    } else if route != PageRoute::Checkin {
+        let button = vision::find_colored_button(&image)
+            .unwrap_or_else(|| vision::fallback_button(&image, profile));
+        if vision::classify_button(&image, button).state != vision::ButtonState::Unknown {
+            route = PageRoute::RouteEvidenceConflict;
+        }
     }
     log.save_bytes("navigation_result.png", &bytes)?;
     Ok(NavigationResult {
@@ -2254,7 +2278,6 @@ fn hierarchy_xml(device: &adb::AdbDevice, log: &RunLog, stage: &str) -> Result<(
     log.event("hierarchy_observation", &observation)?;
     let xml = observation.xml.unwrap_or_else(String::new);
     Ok((xml, ok))
-}
 }
 
 #[allow(dead_code)]
