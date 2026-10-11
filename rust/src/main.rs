@@ -980,11 +980,21 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
                 "run --dry-run"
             };
             let task_run = build_task_command_line(&exe, mode, all_instances, &target);
+            let task_run_arg = format!("\"{}\"", task_run);
             let store = ConfigStore::load()?;
             let start = store.config.window.start.clone();
             let output = process::command("schtasks.exe")
                 .args([
-                    "/Create", "/TN", &name, "/TR", &task_run, "/SC", "DAILY", "/ST", &start, "/F",
+                    "/Create",
+                    "/TN",
+                    &name,
+                    "/TR",
+                    &task_run_arg,
+                    "/SC",
+                    "DAILY",
+                    "/ST",
+                    &start,
+                    "/F",
                 ])
                 .output()
                 .context("无法执行 schtasks.exe")?;
