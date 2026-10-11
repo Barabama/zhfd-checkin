@@ -2,7 +2,7 @@ use crate::profile::Orientation;
 use anyhow::{Context, Result, bail};
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
 };
 
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ impl AdbDevice {
     }
 
     pub fn run(&self, args: &[&str]) -> Result<Output> {
-        let output = Command::new(&self.adb)
+        let output = crate::process::command(&self.adb)
             .args(["-s", &self.serial])
             .args(args)
             .output()
@@ -56,7 +56,7 @@ impl AdbDevice {
     }
 
     pub fn shell(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new(&self.adb)
+        let output = crate::process::command(&self.adb)
             .args(["-s", &self.serial, "shell"])
             .args(args)
             .output()
@@ -68,7 +68,7 @@ impl AdbDevice {
     }
 
     pub fn ensure_online(&self) -> Result<()> {
-        let state = Command::new(&self.adb)
+        let state = crate::process::command(&self.adb)
             .args(["-s", &self.serial, "get-state"])
             .output()
             .with_context(|| format!("检查 ADB 设备失败: {}", self.serial))?;
@@ -119,7 +119,7 @@ impl AdbDevice {
     }
 
     pub fn screenshot(&self) -> Result<Vec<u8>> {
-        let output = Command::new(&self.adb)
+        let output = crate::process::command(&self.adb)
             .args(["-s", &self.serial, "exec-out", "screencap", "-p"])
             .output()?;
         if !output.status.success() {
@@ -190,36 +190,92 @@ impl AdbDevice {
 }
 
 pub fn find_adb(configured: &str) -> Result<PathBuf> {
-    let candidates = [
-        configured.to_string(),
-        std::env::var("ANDROID_ADB_PATH").unwrap_or_default(),
-        std::env::var("ANDROID_ADB_DIR")
-            .map(|v| format!("{}\\adb.exe", v))
-            .unwrap_or_default(),
-        r"D:\Programs\platform-tools\adb.exe".to_string(),
-        r"D:\Documents\Android\Sdk\platform-tools\adb.exe".to_string(),
-        "adb.exe".to_string(),
-    ];
-    for candidate in candidates.iter().filter(|x| !x.trim().is_empty()) {
-        let p = PathBuf::from(candidate);
-        if p.is_file() {
-            return Ok(p);
-        }
-        if !p.components().any(|c| {
-            matches!(
-                c,
-                std::path::Component::RootDir | std::path::Component::Prefix(_)
-            )
-        }) && command_exists(candidate)
-        {
-            return Ok(p);
+    find_adb_for_ldplayer(configured, None, None)
+}
+
+pub fn find_adb_for_ldplayer(
+    configured: &str,
+    ldconsole: Option<&Path>,
+    config_root: Option<&Path>,
+) -> Result<PathBuf> {
+    let report = discover_adb(configured, ldconsole, config_root);
+    report
+        .selected_path()
+        .ok_or_else(|| anyhow::anyhow!(report.summary()))
+}
+
+pub fn discover_adb(
+    configured: &str,
+    ldconsole: Option<&Path>,
+    config_root: Option<&Path>,
+) -> crate::discovery::DiscoveryReport {
+    let mut candidates: Vec<(PathBuf, &'static str)> = Vec::new();
+    if !configured.trim().is_empty() {
+        let path = PathBuf::from(configured);
+        let path = if path.is_absolute() {
+            path
+        } else if let Some(root) = config_root {
+            root.join(path)
+        } else {
+            path
+        };
+        candidates.push((path, "config"));
+    }
+    if let Some(ldconsole) = ldconsole
+        && let Some(parent) = ldconsole.parent()
+    {
+        for relative in [
+            "adb.exe",
+            "platform-tools/adb.exe",
+            "LDPlayer/adb.exe",
+            "LDPlayer/LDPlayer9/adb.exe",
+            "LDPlayer/LDPlayer14/adb.exe",
+            "LDPlayer9/adb.exe",
+            "LDPlayer14/adb.exe",
+        ] {
+            candidates.push((parent.join(relative), "ldplayer_installation"));
         }
     }
-    bail!("找不到 adb.exe，请配置 emulator.adb_path")
+    if let Ok(value) = std::env::var("ANDROID_ADB_PATH")
+        && !value.trim().is_empty()
+    {
+        candidates.push((PathBuf::from(value), "environment"));
+    }
+    for variable in ["ANDROID_ADB_DIR", "ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Ok(value) = std::env::var(variable)
+            && !value.trim().is_empty()
+        {
+            let root = PathBuf::from(value);
+            candidates.push((root.join("platform-tools/adb.exe"), "environment"));
+            candidates.push((root.join("adb.exe"), "environment"));
+        }
+    }
+    if cfg!(windows) {
+        if let Ok(output) = crate::process::command("where.exe").arg("adb.exe").output()
+            && output.status.success()
+        {
+            for line in String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+            {
+                candidates.push((PathBuf::from(line.trim()), "path"));
+            }
+        }
+    } else if let Ok(output) = crate::process::command("which").arg("adb").output()
+        && output.status.success()
+    {
+        for line in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
+            candidates.push((PathBuf::from(line.trim()), "path"));
+        }
+    }
+    crate::discovery::DiscoveryReport::from_candidates("Android Debug Bridge adb.exe", candidates)
 }
 
 pub fn list_devices(adb: &Path) -> Result<Vec<String>> {
-    let output = Command::new(adb).arg("devices").output()?;
+    let output = crate::process::command(adb).arg("devices").output()?;
     if !output.status.success() {
         bail!("adb devices 失败: {}", text(&output.stderr));
     }
@@ -235,13 +291,6 @@ pub fn list_devices(adb: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-fn command_exists(command: &str) -> bool {
-    Command::new(if cfg!(windows) { "where.exe" } else { "which" })
-        .arg(command)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).to_string()
 }
@@ -271,6 +320,92 @@ fn parse_package(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configured_adb_path_wins_over_ldplayer_sibling_candidate() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("zhfd-adb-priority-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let configured = root.join("configured-adb.exe");
+        let ldconsole = root.join("ldconsole.exe");
+        let sibling = root.join("adb.exe");
+        std::fs::write(&configured, b"configured").unwrap();
+        std::fs::write(&ldconsole, b"ld").unwrap();
+        std::fs::write(&sibling, b"sibling").unwrap();
+        let report = discover_adb(
+            configured.to_string_lossy().as_ref(),
+            Some(&ldconsole),
+            Some(&root),
+        );
+        assert_eq!(report.selected_path(), Some(configured));
+        assert_eq!(report.selected().unwrap().source, "config");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sibling_adb_is_selected_when_config_candidate_is_missing() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("zhfd-adb-sibling-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ldconsole = root.join("ldconsole.exe");
+        let sibling = root.join("adb.exe");
+        std::fs::write(&ldconsole, b"ld").unwrap();
+        std::fs::write(&sibling, b"adb").unwrap();
+        let report = discover_adb("missing/adb.exe", Some(&ldconsole), Some(&root));
+        assert_eq!(report.selected_path(), Some(sibling));
+        assert_eq!(report.selected().unwrap().source, "ldplayer_installation");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn explicit_adb_candidate_wins_over_ldplayer_sibling() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("zhfd-adb-config-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let explicit = root.join("explicit-adb.exe");
+        let ldconsole = root.join("ldconsole.exe");
+        let sibling = root.join("adb.exe");
+        std::fs::write(&explicit, b"explicit").unwrap();
+        std::fs::write(&ldconsole, b"ldconsole").unwrap();
+        std::fs::write(&sibling, b"sibling").unwrap();
+        let report = discover_adb(
+            explicit.to_string_lossy().as_ref(),
+            Some(&ldconsole),
+            Some(&root),
+        );
+        assert_eq!(report.selected_path(), Some(explicit));
+        assert_eq!(report.selected().unwrap().source, "config");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ldplayer_sibling_adb_is_fallback_when_config_path_is_missing() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("zhfd-adb-sibling-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ldconsole = root.join("ldconsole.exe");
+        let sibling = root.join("adb.exe");
+        std::fs::write(&ldconsole, b"ldconsole").unwrap();
+        std::fs::write(&sibling, b"adb").unwrap();
+        let report = discover_adb("missing/adb.exe", Some(&ldconsole), Some(&root));
+        assert_eq!(report.selected_path(), Some(sibling));
+        assert_eq!(report.selected().unwrap().source, "ldplayer_installation");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn parses_sizes() {
         assert_eq!(parse_size("Physical size: 900x1600\n"), Some((900, 1600)));

@@ -778,3 +778,8 @@ ZHFD-AutoCheckin-DryRun
 - CLI/GUI 双 EXE 和 dry-run 计划任务使用说明。
 
 发布包不包含 `config.toml`、账号、Cookie、Token、日志、截图或 ADB 状态。
+
+
+## 2026-10-11 Phase 4 engineering worktree (unreleased)
+
+The `feature/phase1-environment-discovery` worktree now carries Phase 1–4 engineering changes, including `RunResult` schema version 2 fields, explicit `ldplayer_reported_port` semantics, consecutive-unknown tracking, a real UiAutomator2 binary manifest fixture, visible GUI startup errors, and Cargo package version `0.2.0`. These changes are **not a release claim**: the implementation agent has intentionally not run tests/builds/device flows for Phase 2–4 after the independent audit's P2 fixes. See [the independent Phase 4 audit prompt](./PHASE4_INDEPENDENT_AUDIT_PROMPT_2026-10-10.md), [P2 remediation record](./PHASE4_P2_REMEDIATION_2026-10-11.md), and [engineering notes](./PHASE4_ENGINEERING_NOTES_2026-10-10.md); independent re-audit must complete before creating a tag or release.

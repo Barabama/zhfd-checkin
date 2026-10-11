@@ -229,6 +229,8 @@ pub fn recent_logs(root: &Path, limit: usize) -> Result<Vec<LogSummary>> {
             let profile = result.profile_id.as_deref().unwrap_or("unknown");
             let status = if result.success {
                 "success"
+            } else if result.field_work_ready {
+                "field_work_ready"
             } else if result.dry_run_ready {
                 "dry-run-ready"
             } else {
@@ -243,8 +245,24 @@ pub fn recent_logs(root: &Path, limit: usize) -> Result<Vec<LogSummary>> {
                 kind: "run".into(),
                 status: status.into(),
                 summary: format!(
-                    "run / {} / {} / {} / clicked={} success={}",
-                    instance, profile, status, result.clicked, result.success
+                    "run / {} / {} / {} / route={} mode={} state={} clicked={} success={}",
+                    instance,
+                    profile,
+                    status,
+                    result
+                        .page_route
+                        .map(|route| route.as_str())
+                        .unwrap_or("unknown"),
+                    result
+                        .checkin_mode
+                        .map(|mode| mode.as_str())
+                        .unwrap_or("unknown"),
+                    result
+                        .checkin_state
+                        .map(|state| state.as_str())
+                        .unwrap_or("unknown"),
+                    result.clicked,
+                    result.success
                 ),
             });
         }
@@ -252,6 +270,63 @@ pub fn recent_logs(root: &Path, limit: usize) -> Result<Vec<LogSummary>> {
     Ok(summaries)
 }
 
+pub fn log_artifact_path(directory: &Path) -> Option<PathBuf> {
+    ["result.json", "sync.json", "events.jsonl"]
+        .into_iter()
+        .map(|name| directory.join(name))
+        .find(|path| path.is_file())
+}
+
+pub fn read_log_artifact(directory: &Path) -> Result<(PathBuf, String)> {
+    let path = log_artifact_path(directory)
+        .ok_or_else(|| anyhow::anyhow!("日志目录没有可展示的结果文件: {}", directory.display()))?;
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("读取日志证据失败: {}", path.display()))?;
+    let display = if path.file_name().is_some_and(|name| name == "events.jsonl") {
+        text
+    } else {
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("解析日志证据失败: {}", path.display()))?;
+        serde_json::to_string_pretty(&json)?
+    };
+    Ok((path, display))
+}
+
+pub fn export_log_artifact(directory: &Path, destination: &Path) -> Result<PathBuf> {
+    let source = log_artifact_path(directory)
+        .ok_or_else(|| anyhow::anyhow!("日志目录没有可导出的结果文件: {}", directory.display()))?;
+    copy_log_artifact(&source, destination)
+}
+
+pub fn export_log_artifact_named(
+    directory: &Path,
+    artifact_name: &str,
+    destination: &Path,
+) -> Result<PathBuf> {
+    if !["result.json", "sync.json", "events.jsonl"].contains(&artifact_name) {
+        bail!("不支持导出的日志证据类型: {artifact_name}");
+    }
+    let source = directory.join(artifact_name);
+    if !source.is_file() {
+        bail!("日志证据不存在: {}", source.display());
+    }
+    copy_log_artifact(&source, destination)
+}
+
+fn copy_log_artifact(source: &Path, destination: &Path) -> Result<PathBuf> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建导出目录: {}", parent.display()))?;
+    }
+    fs::copy(source, destination).with_context(|| {
+        format!(
+            "导出日志证据失败: {} -> {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(destination.to_path_buf())
+}
 pub fn latest_result(root: &Path) -> Result<Option<(PathBuf, RunResult)>> {
     let logs = root.join("logs");
     if !logs.is_dir() {
@@ -300,15 +375,30 @@ mod tests {
         fs::create_dir_all(root.join("logs/2026-01-01_000000")).unwrap();
         fs::create_dir_all(root.join("logs/2026-01-02_000000")).unwrap();
         let result = RunResult {
+            schema_version: 2,
+            run_id: "test-run".into(),
+            started_at: String::new(),
+            finished_at: None,
             mode: "dry-run".into(),
             instance_index: None,
             instance_name: None,
             serial: "serial".into(),
             profile_id: Some("profile".into()),
+            screen_width: None,
+            screen_height: None,
+            density_dpi: None,
             state_history: vec!["gray".into()],
             clicked: false,
             success: false,
             dry_run_ready: false,
+            field_work_ready: false,
+            page_route: None,
+            checkin_mode: None,
+            checkin_state: None,
+            success_date: None,
+            error_stage: None,
+            recovery_action: None,
+            artifact_paths: Vec::new(),
             error: Some("location_timeout".into()),
         };
         fs::write(
@@ -329,15 +419,30 @@ mod tests {
         fs::create_dir_all(root.join("logs/2026-09-27_010000")).unwrap();
         fs::create_dir_all(root.join("logs/sync-2026-09-27_020000")).unwrap();
         let result = RunResult {
+            schema_version: 2,
+            run_id: "test-run".into(),
+            started_at: String::new(),
+            finished_at: None,
             mode: "dry-run".into(),
             instance_index: None,
             instance_name: None,
             serial: "serial".into(),
             profile_id: Some("profile".into()),
+            screen_width: None,
+            screen_height: None,
+            density_dpi: None,
             state_history: vec!["ready".into()],
             clicked: false,
             success: false,
             dry_run_ready: true,
+            field_work_ready: false,
+            page_route: None,
+            checkin_mode: None,
+            checkin_state: None,
+            success_date: None,
+            error_stage: None,
+            recovery_action: None,
+            artifact_paths: Vec::new(),
             error: None,
         };
         fs::write(
@@ -362,6 +467,26 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn named_export_can_select_events_even_when_result_json_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-export-events-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log_dir = root.join("logs/run");
+        fs::create_dir_all(&log_dir).unwrap();
+        fs::write(log_dir.join("result.json"), b"result").unwrap();
+        fs::write(log_dir.join("events.jsonl"), b"event-line\n").unwrap();
+        let destination = root.join("export/events.jsonl");
+        export_log_artifact_named(&log_dir, "events.jsonl", &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"event-line\n");
+        assert!(export_log_artifact_named(&log_dir, "..\\config.toml", &destination).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn diagnostic_report_redacts_notification_url() {
         let root = std::env::temp_dir().join(format!("zhfd-report-{}", std::process::id()));

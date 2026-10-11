@@ -1,9 +1,10 @@
 use crate::config::ConfigStore;
 use crate::domain::RunResult;
 use crate::{
-    ConfigCommand, InstanceTargetArgs, RunArgs, TaskCommand, analyze_image_file, diagnose,
-    dump_ui_hierarchy, inspect_apk_metadata, install_apk, installed_app_version,
-    list_instance_summaries, run, runtime_with_target, sync_profile, task_command,
+    ConfigCommand, InstanceTargetArgs, RunArgs, TaskCommand, analyze_image_file,
+    dependency_diagnostics, diagnose, dump_ui_hierarchy, inspect_apk_metadata, install_apk,
+    installed_app_version, list_instance_summaries, run, runtime_with_target, sync_profile,
+    task_command,
 };
 use crate::{config, logger, profile};
 use eframe::egui;
@@ -46,6 +47,10 @@ struct GuiApp {
     store: ConfigStore,
     tab: usize,
     status: String,
+    dependency_report: Option<crate::DependencyDiagnostics>,
+    selected_ldplayer_candidate: Option<std::path::PathBuf>,
+    selected_adb_candidate: Option<std::path::PathBuf>,
+    dependency_scan: Option<Arc<Mutex<Option<crate::DependencyDiagnostics>>>>,
     apk_path: String,
     job: Option<GuiJob>,
     pending_sync: Option<String>,
@@ -59,6 +64,10 @@ struct GuiApp {
     app_version_checked: bool,
     apk_install_result: Option<String>,
     recent_logs: Vec<logger::LogSummary>,
+    logs_filter: String,
+    selected_log_directory: Option<std::path::PathBuf>,
+    selected_log_artifact: Option<std::path::PathBuf>,
+    selected_log_preview: Option<String>,
     task_name: String,
     task_live: bool,
     task_all_instances: bool,
@@ -113,6 +122,10 @@ impl GuiApp {
             store,
             tab: 0,
             status: "就绪。默认模式为 dry-run。".into(),
+            dependency_report: None,
+            selected_ldplayer_candidate: None,
+            selected_adb_candidate: None,
+            dependency_scan: None,
             apk_path,
             job: None,
             pending_sync: None,
@@ -126,6 +139,10 @@ impl GuiApp {
             app_version_checked: false,
             apk_install_result: None,
             recent_logs: Vec::new(),
+            logs_filter: String::new(),
+            selected_log_directory: None,
+            selected_log_artifact: None,
+            selected_log_preview: None,
             task_name: "ZHFD-AutoCheckin".into(),
             task_live: false,
             task_all_instances: false,
@@ -172,6 +189,27 @@ impl GuiApp {
             result: slot,
         });
         true
+    }
+
+    fn start_dependency_scan(&mut self) {
+        if self.dependency_scan.is_some() {
+            self.status = "依赖扫描正在运行".into();
+            return;
+        }
+        self.dependency_report = None;
+        self.selected_ldplayer_candidate = None;
+        self.selected_adb_candidate = None;
+        let store = self.store.clone();
+        let slot = Arc::new(Mutex::new(None));
+        let result_slot = Arc::clone(&slot);
+        thread::spawn(move || {
+            let report = dependency_diagnostics(&store);
+            if let Ok(mut result) = result_slot.lock() {
+                *result = Some(report);
+            }
+        });
+        self.dependency_scan = Some(slot);
+        self.status = "正在扫描 LDPlayer / ADB 依赖……".into();
     }
 
     fn instance_target(&self) -> InstanceTargetArgs {
@@ -228,9 +266,48 @@ impl GuiApp {
     }
 
     fn refresh_logs(&mut self) {
-        match logger::recent_logs(&self.store.root, 12) {
-            Ok(logs) => self.recent_logs = logs,
+        match logger::recent_logs(&self.store.root, 100) {
+            Ok(logs) => {
+                self.recent_logs = logs;
+                let selected_is_present =
+                    self.selected_log_directory.as_ref().is_some_and(|path| {
+                        self.recent_logs
+                            .iter()
+                            .any(|entry| &entry.directory == path)
+                    });
+                if !selected_is_present {
+                    self.selected_log_directory = self
+                        .recent_logs
+                        .first()
+                        .map(|entry| entry.directory.clone());
+                }
+                self.load_selected_log_artifact();
+            }
             Err(error) => self.status = format!("读取运行日志失败: {:#}", error),
+        }
+    }
+
+    fn select_log_directory(&mut self, directory: std::path::PathBuf) {
+        self.selected_log_directory = Some(directory);
+        self.load_selected_log_artifact();
+    }
+
+    fn load_selected_log_artifact(&mut self) {
+        let Some(directory) = self.selected_log_directory.as_ref() else {
+            self.selected_log_artifact = None;
+            self.selected_log_preview = None;
+            return;
+        };
+        match logger::read_log_artifact(directory) {
+            Ok((path, text)) => {
+                self.selected_log_artifact = Some(path);
+                self.selected_log_preview = Some(text);
+            }
+            Err(error) => {
+                self.selected_log_artifact = None;
+                self.selected_log_preview = None;
+                self.status = format!("读取选中日志失败: {error:#}");
+            }
         }
     }
 
@@ -310,6 +387,33 @@ impl GuiApp {
     }
 }
 
+fn ordered_profiles() -> Vec<&'static profile::Profile> {
+    let mut profiles: Vec<_> = profile::PROFILES.iter().collect();
+    profiles.sort_by(|left, right| {
+        right
+            .calibrated
+            .cmp(&left.calibrated)
+            .then_with(|| left.orientation.as_str().cmp(right.orientation.as_str()))
+            .then_with(|| left.width.cmp(&right.width))
+            .then_with(|| left.height.cmp(&right.height))
+            .then_with(|| left.density_dpi.cmp(&right.density_dpi))
+            .then_with(|| left.id.cmp(right.id))
+    });
+    profiles
+}
+
+fn run_result_status(result: &RunResult) -> String {
+    if result.success {
+        "success_today".into()
+    } else if result.field_work_ready {
+        "field_work_ready (dry-run only)".into()
+    } else if result.dry_run_ready {
+        "dry_run_ready".into()
+    } else {
+        result.error.clone().unwrap_or_else(|| "incomplete".into())
+    }
+}
+
 fn explain_error(error: &str) -> &'static str {
     match error {
         "unknown_state" => "视觉状态未能确认；请查看最新日志截图。",
@@ -321,6 +425,18 @@ fn explain_error(error: &str) -> &'static str {
         "unknown_profile" => "设备分辨率/DPI 没有精确 profile；未执行点击。",
         "uncalibrated_profile" => "当前 profile 尚未完成生产标定；未执行点击。",
         "live_confirmation_required" => "正式模式需要同时指定 --live --confirm；未执行点击。",
+        "field_work_live_unsupported" => "外勤签到目前仅支持 dry-run 观察；请在模拟器中人工完成。",
+        "unsupported_checkin_mode" => "无法确认签到业务类型；程序已停止且没有点击。",
+        "field_work_observation_only" => "外勤页面已记录观察结果；请人工确认页面状态。",
+        "click_authorization_failed" => "点击安全门禁未满足；程序没有继续点击。",
+        "success_text_unconfirmed" => "页面视觉状态为成功，但层级文字未确认；请人工核对。",
+        "success_stale" => "成功页面显示的日期不是今天；不能视为本次签到成功。",
+        "success_date_unknown" => "页面未提供可确认的成功日期；请人工核对。",
+        "app_start_timeout" => "目标 App 未能进入前台；请手动打开 App 并完成登录。",
+        "login_required" => "需要手动登录；程序不会输入凭据或自动点击登录。",
+        "navigation_not_confirmed" => "未能确认进入晚点名签到页；请手动导航后重试。",
+        "page_context_changed" => "运行中页面/签到模式发生变化；安全策略已停止自动点击。",
+        "hierarchy_unavailable" => "无法读取页面结构；为安全起见没有继续点击。",
         other if other.contains("ADB") => "ADB 设备不可用；请检查模拟器和 serial。",
         _ => "请查看诊断报告和运行日志。",
     }
@@ -329,30 +445,61 @@ fn explain_error(error: &str) -> &'static str {
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job();
+        let completed_dependency_scan = self
+            .dependency_scan
+            .as_ref()
+            .and_then(|slot| slot.try_lock().ok().and_then(|mut result| result.take()));
+        if let Some(report) = completed_dependency_scan {
+            self.selected_ldplayer_candidate = report.ldplayer.selected_path();
+            self.selected_adb_candidate = report.adb.selected_path();
+            self.status = format!("{}\n{}", report.ldplayer.summary(), report.adb.summary());
+            self.dependency_report = Some(report);
+            self.dependency_scan = None;
+        }
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.heading("智汇福大自动签到");
-            ui.horizontal(|ui| {
-                for (i, label) in [
-                    "首页",
-                    "诊断",
-                    "实例",
-                    "Profile",
-                    "应用",
-                    "配置",
-                    "计划任务",
-                    "运行日志",
-                    "帮助/About",
-                ]
-                .iter()
-                .enumerate()
-                {
-                    if ui.selectable_label(self.tab == i, *label).clicked() {
-                        self.tab = i;
-                    }
-                }
+        egui::SidePanel::left("navigation")
+            .resizable(true)
+            .default_width(178.0)
+            .min_width(142.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.heading("签到助手");
+                        ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+                        ui.separator();
+                        ui.label(egui::RichText::new("工作台").strong());
+                        for (index, label) in [(0, "运行控制"), (1, "环境诊断"), (2, "模拟器实例")]
+                        {
+                            if ui.selectable_label(self.tab == index, label).clicked() {
+                                self.tab = index;
+                            }
+                        }
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("业务配置").strong());
+                        for (index, label) in [(3, "Profile"), (4, "应用 / APK"), (5, "配置文件")]
+                        {
+                            if ui.selectable_label(self.tab == index, label).clicked() {
+                                self.tab = index;
+                            }
+                        }
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("任务与证据").strong());
+                        for (index, label) in [(6, "计划任务"), (7, "运行日志与结果")] {
+                            if ui.selectable_label(self.tab == index, label).clicked() {
+                                self.tab = index;
+                                if index == 7 && self.recent_logs.is_empty() {
+                                    self.refresh_logs();
+                                }
+                            }
+                        }
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("帮助").strong());
+                        if ui.selectable_label(self.tab == 8, "About / 版本").clicked() {
+                            self.tab = 8;
+                        }
+                    });
             });
-        });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.label(&self.status);
             if let Some(job) = &self.job {
@@ -430,11 +577,22 @@ impl GuiApp {
             ui.label(format!(
                 "最近结果：{} / {}",
                 result.state_history.join(" → "),
-                if result.success {
-                    "success"
-                } else {
-                    result.error.as_deref().unwrap_or("未完成")
-                }
+                run_result_status(result)
+            ));
+            ui.label(format!(
+                "页面：{}；模式：{}；状态：{}",
+                result
+                    .page_route
+                    .map(|route| route.as_str())
+                    .unwrap_or("unknown"),
+                result
+                    .checkin_mode
+                    .map(|mode| mode.as_str())
+                    .unwrap_or("unknown"),
+                result
+                    .checkin_state
+                    .map(|state| state.as_str())
+                    .unwrap_or("unknown"),
             ));
         }
     }
@@ -504,21 +662,53 @@ impl GuiApp {
                     result.profile_id.as_deref().unwrap_or("unknown")
                 ));
                 ui.label(format!(
+                    "页面：{}",
+                    result
+                        .page_route
+                        .map(|route| route.as_str())
+                        .unwrap_or("unknown")
+                ));
+                ui.label(format!(
+                    "业务：{}",
+                    result
+                        .checkin_mode
+                        .map(|mode| mode.as_str())
+                        .unwrap_or("unknown")
+                ));
+                ui.label(format!(
+                    "签到状态：{}",
+                    result
+                        .checkin_state
+                        .map(|state| state.as_str())
+                        .unwrap_or("unknown")
+                ));
+                ui.label(format!(
                     "点击：{}",
                     if result.clicked { "是" } else { "否" }
                 ));
-                ui.label(format!(
-                    "成功：{}",
-                    if result.success { "是" } else { "否" }
-                ));
+                ui.label(format!("结果：{}", run_result_status(result)));
             });
+            if let Some(date) = &result.success_date {
+                ui.label(format!("页面日期：{date}"));
+            }
             if let Some(error) = &result.error {
                 ui.colored_label(
                     egui::Color32::LIGHT_RED,
                     format!("错误：{}（{}）", error, explain_error(error)),
                 );
+            } else if result.field_work_ready {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "外勤签到状态已识别为 ready；仅 dry-run 观察，未执行点击。",
+                );
             } else {
                 ui.colored_label(egui::Color32::LIGHT_GREEN, "未记录运行错误");
+            }
+            if let Some(stage) = &result.error_stage {
+                ui.label(format!("失败阶段：{stage}"));
+            }
+            if let Some(action) = &result.recovery_action {
+                ui.label(format!("建议操作：{action}"));
             }
             ui.label(format!("状态历史：{}", result.state_history.join(" → ")));
             ui.label(format!(
@@ -531,7 +721,7 @@ impl GuiApp {
             ));
         }
         ui.separator();
-        ui.label("当前阶段：默认 dry-run；正式点击必须使用 CLI 的 --live --confirm，并通过 profile 标定和时间窗口门禁。");
+        ui.label("默认模式为 dry-run。只有普通签到页面可进入 live 点击策略；外勤签到与未知模式保持无点击观察。");
     }
 
     fn instances_page(&mut self, ui: &mut egui::Ui) {
@@ -554,7 +744,8 @@ impl GuiApp {
             ui.label("index");
             ui.label("名称");
             ui.label("运行");
-            ui.label("serial");
+            ui.label("TCP ADB serial");
+            ui.label("list2 报告端口（参考）");
             ui.label("尺寸/DPI");
             ui.label("启用");
             ui.end_row();
@@ -563,6 +754,15 @@ impl GuiApp {
                 ui.label(&instance.name);
                 ui.label(if instance.running { "是" } else { "否" });
                 ui.label(&instance.serial);
+                ui.label(
+                    instance
+                        .ldplayer_reported_port
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "未知".into()),
+                )
+                .on_hover_text(
+                    "ldconsole list2 原始报告字段；不是本程序用于 adb connect 的 TCP ADB serial。",
+                );
                 ui.label(format!(
                     "{}x{}@{}",
                     instance.width.unwrap_or(0),
@@ -601,26 +801,37 @@ impl GuiApp {
                 }
             });
         }
-        egui::Grid::new("profiles").striped(true).show(ui, |ui| {
-            ui.label("ID");
-            ui.label("尺寸");
-            ui.label("DPI");
-            ui.label("方向");
-            ui.label("标定");
-            ui.label("操作");
-            ui.end_row();
-            for p in profile::PROFILES {
-                ui.label(p.id);
-                ui.label(format!("{}x{}", p.width, p.height));
-                ui.label(p.density_dpi.to_string());
-                ui.label(p.orientation.as_str());
-                ui.label(if p.calibrated { "是" } else { "否" });
-                if ui.button(format!("准备同步##{}", p.id)).clicked() {
-                    self.pending_sync = Some(p.id.to_string());
-                }
-                ui.end_row();
-            }
-        });
+        ui.label("已标定 Profile 优先显示；未标定项仍可同步配置，但不允许用于 live 点击。");
+        egui::ScrollArea::both()
+            .id_salt("profile_table_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_min_width(720.0);
+                egui::Grid::new("profiles").striped(true).show(ui, |ui| {
+                    ui.label("ID");
+                    ui.label("尺寸");
+                    ui.label("DPI");
+                    ui.label("方向");
+                    ui.label("运行资格");
+                    ui.label("操作");
+                    ui.end_row();
+                    for p in ordered_profiles() {
+                        ui.label(p.id);
+                        ui.label(format!("{}x{}", p.width, p.height));
+                        ui.label(p.density_dpi.to_string());
+                        ui.label(p.orientation.as_str());
+                        ui.label(if p.calibrated {
+                            "已标定"
+                        } else {
+                            "仅 dry-run"
+                        });
+                        if ui.button(format!("准备同步##{}", p.id)).clicked() {
+                            self.pending_sync = Some(p.id.to_string());
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
     }
 
     fn live_confirmation_window(&mut self, ctx: &egui::Context) {
@@ -787,28 +998,184 @@ impl GuiApp {
     }
 
     fn logs_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("运行日志");
-        if ui.button("刷新日志列表").clicked() {
-            self.refresh_logs();
-        }
-        if self.recent_logs.is_empty() {
-            ui.label("尚未找到运行或同步日志。");
-            return;
-        }
-        egui::Grid::new("recent_logs").striped(true).show(ui, |ui| {
-            ui.label("类型");
-            ui.label("状态");
-            ui.label("摘要");
-            ui.label("目录");
-            ui.end_row();
-            for log in &self.recent_logs {
-                ui.label(&log.kind);
-                ui.label(&log.status);
-                ui.label(&log.summary);
-                ui.label(log.directory.display().to_string());
-                ui.end_row();
+        ui.heading("运行日志与结果");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("刷新列表").clicked() {
+                self.refresh_logs();
+            }
+            if ui.button("打开 logs 目录").clicked() {
+                match crate::process::open_path(&self.store.root.join("logs")) {
+                    Ok(()) => self.status = "已打开 logs 目录".into(),
+                    Err(error) => self.status = format!("打开 logs 目录失败: {error:#}"),
+                }
+            }
+            if ui.button("导出诊断报告").clicked() {
+                self.export_report();
+            }
+            if ui.button("打开最近报告").clicked() {
+                match self.report_path.as_ref().map(std::path::PathBuf::from) {
+                    Some(path) => match crate::process::open_path(&path) {
+                        Ok(()) => self.status = "已打开诊断报告".into(),
+                        Err(error) => self.status = format!("打开诊断报告失败: {error:#}"),
+                    },
+                    None => self.status = "请先导出诊断报告".into(),
+                }
+            }
+            ui.add_space(10.0);
+            ui.label("筛选");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.logs_filter)
+                    .hint_text("类型、状态、摘要或路径")
+                    .desired_width(210.0),
+            );
+        });
+
+        // Keep evidence operations outside the scrolling table so they remain
+        // reachable while browsing long directories and event summaries.
+        ui.horizontal_wrapped(|ui| {
+            if let Some(directory) = self.selected_log_directory.clone() {
+                ui.add(egui::Label::new(format!("选中：{}", directory.display())).truncate());
+                if ui.button("打开目录").clicked() {
+                    match crate::process::open_path(&directory) {
+                        Ok(()) => self.status = "已打开选中的日志目录".into(),
+                        Err(error) => self.status = format!("打开日志目录失败: {error:#}"),
+                    }
+                }
+                if ui.button("复制路径").clicked() {
+                    ui.ctx().copy_text(directory.display().to_string());
+                    self.status = "日志目录路径已复制".into();
+                }
+                if ui.button("复制结果/证据").clicked() {
+                    if let Some(preview) = &self.selected_log_preview {
+                        ui.ctx().copy_text(preview.clone());
+                        self.status = "选中的结果/证据文本已复制".into();
+                    } else {
+                        self.status = "选中目录没有可复制的证据文件".into();
+                    }
+                }
+                if ui.button("导出选中 JSON/证据").clicked() {
+                    let file_name = self
+                        .selected_log_artifact
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .unwrap_or_else(|| std::ffi::OsStr::new("result.json"))
+                        .to_string_lossy()
+                        .into_owned();
+                    if let Some(destination) =
+                        rfd::FileDialog::new().set_file_name(file_name).save_file()
+                    {
+                        match logger::export_log_artifact(&directory, &destination) {
+                            Ok(path) => self.status = format!("日志证据已导出：{}", path.display()),
+                            Err(error) => self.status = format!("导出日志证据失败：{error:#}"),
+                        }
+                    }
+                }
+                if directory.join("events.jsonl").is_file()
+                    && ui.button("导出 events.jsonl").clicked()
+                    && let Some(destination) = rfd::FileDialog::new()
+                        .set_file_name("events.jsonl")
+                        .save_file()
+                {
+                    match logger::export_log_artifact_named(
+                        &directory,
+                        "events.jsonl",
+                        &destination,
+                    ) {
+                        Ok(path) => self.status = format!("事件日志已导出：{}", path.display()),
+                        Err(error) => self.status = format!("导出事件日志失败：{error:#}"),
+                    }
+                }
+            } else {
+                ui.label("选择一条日志以查看和导出结果。");
             }
         });
+
+        let filter = self.logs_filter.trim().to_lowercase();
+        let filtered: Vec<logger::LogSummary> = self
+            .recent_logs
+            .iter()
+            .filter(|entry| {
+                filter.is_empty()
+                    || entry.kind.to_lowercase().contains(&filter)
+                    || entry.status.to_lowercase().contains(&filter)
+                    || entry.summary.to_lowercase().contains(&filter)
+                    || entry
+                        .directory
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(filter.as_str())
+            })
+            .cloned()
+            .collect();
+
+        if filtered.is_empty() {
+            ui.separator();
+            ui.label(if self.recent_logs.is_empty() {
+                "尚未找到运行或同步日志。"
+            } else {
+                "没有匹配当前筛选条件的日志。"
+            });
+            return;
+        }
+
+        let mut clicked_directory = None;
+        let selected_directory = self.selected_log_directory.clone();
+        let table_height = (ui.available_height() * 0.55).clamp(150.0, 360.0);
+        egui::ScrollArea::both()
+            .id_salt("run_evidence_table_scroll")
+            .max_height(table_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_min_width(1080.0);
+                egui::Grid::new("recent_logs")
+                    .striped(true)
+                    .min_col_width(88.0)
+                    .show(ui, |ui| {
+                        for heading in ["类型", "状态", "摘要", "日志目录"] {
+                            ui.label(egui::RichText::new(heading).strong());
+                        }
+                        ui.end_row();
+                        for entry in &filtered {
+                            let selected = selected_directory.as_ref() == Some(&entry.directory);
+                            let response = ui.selectable_label(selected, &entry.kind);
+                            if response.clicked() || response.double_clicked() {
+                                clicked_directory = Some(entry.directory.clone());
+                            }
+                            ui.label(&entry.status);
+                            let response = ui.add_sized(
+                                [430.0, 24.0],
+                                egui::Button::selectable(selected, &entry.summary).truncate(),
+                            );
+                            if response.clicked() || response.double_clicked() {
+                                clicked_directory = Some(entry.directory.clone());
+                            }
+                            ui.add_sized(
+                                [420.0, 24.0],
+                                egui::Label::new(entry.directory.display().to_string()).truncate(),
+                            );
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some(directory) = clicked_directory {
+            self.select_log_directory(directory);
+        }
+
+        if let (Some(artifact), Some(preview)) =
+            (&self.selected_log_artifact, &self.selected_log_preview)
+        {
+            ui.horizontal(|ui| {
+                ui.label("证据预览");
+                ui.add(egui::Label::new(artifact.display().to_string()).truncate());
+            });
+            egui::ScrollArea::both()
+                .id_salt("selected_log_preview")
+                .max_height((ui.available_height() - 28.0).max(90.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(preview).monospace()).wrap());
+                });
+        }
     }
 
     fn apk_install_confirmation_window(&mut self, ctx: &egui::Context) {
@@ -933,17 +1300,128 @@ impl GuiApp {
 
     fn config_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("配置");
-        ui.label(format!(
-            "配置文件位于 EXE 根目录：{}",
-            self.store.path.display()
-        ));
-        if ui.button("用系统默认编辑器打开 config.toml").clicked() {
-            match crate::config_command(&self.store, ConfigCommand::Open) {
-                Ok(_) => self.status = "已打开配置文件".into(),
-                Err(e) => self.status = format!("打开失败: {:#}", e),
+        ui.label(format!("配置文件：{}", self.store.path.display()));
+        ui.horizontal(|ui| {
+            if ui.button("扫描 LDPlayer / ADB 依赖").clicked() {
+                self.start_dependency_scan();
             }
+            if ui.button("保存选中的发现路径").clicked() {
+                let Some(report) = self.dependency_report.clone() else {
+                    self.status = "请先扫描依赖，再选择并保存候选路径。".into();
+                    return;
+                };
+                let original_ldconsole_path = self.store.config.emulator.ldconsole_path.clone();
+                let original_adb_path = self.store.config.emulator.adb_path.clone();
+                let mut changed = false;
+                if let Some(path) = &self.selected_ldplayer_candidate
+                    && report
+                        .ldplayer
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.exists && &candidate.path == path)
+                {
+                    self.store.config.emulator.ldconsole_path =
+                        config::path_for_config(&self.store.root, path);
+                    changed = true;
+                }
+                if let Some(path) = &self.selected_adb_candidate
+                    && report
+                        .adb
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.exists && &candidate.path == path)
+                {
+                    self.store.config.emulator.adb_path =
+                        config::path_for_config(&self.store.root, path);
+                    changed = true;
+                }
+                self.dependency_report = Some(report.clone());
+                if changed {
+                    match self.store.save() {
+                        Ok(()) => self.status = "已保存选中的 LDPlayer / ADB 路径".into(),
+                        Err(error) => {
+                            self.store.config.emulator.ldconsole_path = original_ldconsole_path;
+                            self.store.config.emulator.adb_path = original_adb_path;
+                            self.status = format!("保存发现路径失败：{error:#}");
+                        }
+                    }
+                } else {
+                    self.status =
+                        format!("{}\n{}", report.ldplayer.summary(), report.adb.summary());
+                }
+            }
+            if ui.button("打开 config.toml").clicked() {
+                match crate::config_command(&self.store, ConfigCommand::Open) {
+                    Ok(_) => self.status = "已打开 config.toml".into(),
+                    Err(error) => self.status = format!("打开配置失败: {error:#}"),
+                }
+            }
+        });
+        ui.label(
+            "Windows 路径推荐使用 TOML 单引号 literal string，无需双写反斜杠；正斜杠路径也可用。",
+        );
+        if let Some(report) = &self.dependency_report {
+            ui.separator();
+            ui.heading("依赖发现结果");
+            Self::dependency_candidate_selector(
+                ui,
+                "LDPlayer",
+                &report.ldplayer,
+                &mut self.selected_ldplayer_candidate,
+            );
+            Self::dependency_candidate_selector(
+                ui,
+                "ADB",
+                &report.adb,
+                &mut self.selected_adb_candidate,
+            );
         }
+        ui.separator();
+        ui.label("当前配置内容");
         ui.code(toml::to_string_pretty(&self.store.config).unwrap_or_default());
+    }
+
+    fn dependency_candidate_selector(
+        ui: &mut egui::Ui,
+        label: &str,
+        report: &crate::discovery::DiscoveryReport,
+        selected: &mut Option<std::path::PathBuf>,
+    ) {
+        let selected_text = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.exists && Some(&candidate.path) == selected.as_ref())
+            .map(|candidate| format!("{} [{}]", candidate.path.display(), candidate.source))
+            .unwrap_or_else(|| "没有可选的已安装候选".into());
+        egui::ComboBox::from_label(label)
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for candidate in report
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.exists)
+                {
+                    ui.selectable_value(
+                        selected,
+                        Some(candidate.path.clone()),
+                        format!("{} [{}]", candidate.path.display(), candidate.source),
+                    );
+                }
+            });
+        ui.collapsing(format!("{label} 候选诊断"), |ui| {
+            for candidate in report.candidates.iter().take(20) {
+                let marker = if candidate.exists { "✓" } else { "·" };
+                ui.label(format!(
+                    "{marker} {} [{}]",
+                    candidate.path.display(),
+                    candidate.source
+                ));
+            }
+            let omitted = report.candidates.len().saturating_sub(20);
+            if omitted > 0 {
+                ui.label(format!("另有 {omitted} 个候选未展开。"));
+            }
+        });
     }
 
     fn about(&mut self, ui: &mut egui::Ui) {
@@ -954,7 +1432,7 @@ impl GuiApp {
         ui.hyperlink_to("智汇福大官网", "https://app.fzu.edu.cn/fd-app/m/index.html");
         ui.separator();
         ui.label("支持的 Profile：");
-        for supported in profile::PROFILES {
+        for supported in ordered_profiles() {
             ui.label(format!(
                 "{} {}x{}@{} {} calibrated={}",
                 supported.id,
@@ -981,6 +1459,40 @@ impl GuiApp {
 mod tests {
     use super::*;
 
+    #[test]
+    fn profiles_sort_calibrated_first_with_a_stable_geometry_tiebreaker() {
+        let profiles = ordered_profiles();
+        assert!(profiles.first().is_some_and(|profile| profile.calibrated));
+        assert!(profiles.last().is_some_and(|profile| !profile.calibrated));
+        for pair in profiles.windows(2) {
+            let left = pair[0];
+            let right = pair[1];
+            assert!(left.calibrated || !right.calibrated);
+            if left.calibrated == right.calibrated {
+                let left_key = (
+                    left.orientation.as_str(),
+                    left.width,
+                    left.height,
+                    left.density_dpi,
+                    left.id,
+                );
+                let right_key = (
+                    right.orientation.as_str(),
+                    right.width,
+                    right.height,
+                    right.density_dpi,
+                    right.id,
+                );
+                assert!(left_key <= right_key);
+            }
+        }
+        let first_order: Vec<_> = profiles.iter().map(|profile| profile.id).collect();
+        let second_order: Vec<_> = ordered_profiles()
+            .iter()
+            .map(|profile| profile.id)
+            .collect();
+        assert_eq!(first_order, second_order);
+    }
     #[test]
     fn all_instances_run_clears_single_instance_target() {
         let target = run_target_for_selection(true, 1);

@@ -1,21 +1,22 @@
 mod adb;
 mod apk;
 mod config;
+mod discovery;
 mod domain;
 mod gui;
 mod ldplayer;
 mod logger;
+mod process;
 mod profile;
 mod vision;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use config::ConfigStore;
-use domain::{ExitCode, Mode, RunResult};
+use domain::{CheckinMode, CheckinState, ConsecutiveUnknown, ExitCode, Mode, PageRoute, RunResult};
 use logger::{RunLog, SyncGeometry, SyncLog, SyncResult};
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     thread,
     time::{Duration, Instant},
 };
@@ -220,7 +221,7 @@ fn resolve_instance_target(
 
     let index_from_serial = requested_serial.as_deref().and_then(|serial| {
         instances.iter().find_map(|instance| {
-            let default_serial = ldplayer::LdPlayer::serial_for_index(instance.index);
+            let default_serial = ldplayer::LdPlayer::tcp_serial_for_index(instance.index)?;
             let configured_match = configured_instances.iter().any(|configured| {
                 configured.instance_index == instance.index && configured.serial.trim() == serial
             });
@@ -268,7 +269,8 @@ fn resolve_instance_target(
             (index == store.config.emulator.instance_index && !configured.is_empty())
                 .then(|| configured.to_string())
         })
-        .unwrap_or_else(|| ldplayer::LdPlayer::serial_for_index(index));
+        .or(ldplayer::LdPlayer::tcp_serial_for_index(index))
+        .with_context(|| format!("LDPlayer 实例 index 超出 TCP ADB 端口范围: {index}"))?;
     let name = configured_instance
         .as_ref()
         .filter(|configured| !configured.name.trim().is_empty())
@@ -288,7 +290,7 @@ pub(crate) struct InstanceSummary {
     pub name: String,
     pub running: bool,
     pub serial: String,
-    pub adb_port: Option<u16>,
+    pub ldplayer_reported_port: Option<u16>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub dpi: Option<u32>,
@@ -297,35 +299,44 @@ pub(crate) struct InstanceSummary {
 }
 
 pub(crate) fn list_instance_summaries(store: &ConfigStore) -> Result<Vec<InstanceSummary>> {
-    let ld = ldplayer::LdPlayer::discover(&store.config.emulator.ldconsole_path, &store.root)?;
+    let ld = ldplayer::LdPlayer::discover(
+        &configured_path(store, &store.config.emulator.ldconsole_path),
+        &store.root,
+    )?;
     let configured_instances = store.config.emulator.effective_instances();
-    Ok(ld
-        .instances()?
+    ld.instances()?
         .into_iter()
-        .map(|instance| {
+        .map(|instance| -> Result<InstanceSummary> {
             let configured = configured_instances
                 .iter()
                 .find(|configured| configured.instance_index == instance.index);
-            InstanceSummary {
+            let serial =
+                match configured
+                    .filter(|configured| !configured.serial.trim().is_empty())
+                    .map(|configured| configured.serial.clone())
+                {
+                    Some(serial) => serial,
+                    None => ldplayer::LdPlayer::tcp_serial_for_index(instance.index).with_context(
+                        || format!("实例 index 超出 TCP ADB 端口范围: {}", instance.index),
+                    )?,
+                };
+            Ok(InstanceSummary {
                 index: instance.index,
                 name: configured
                     .filter(|item| !item.name.trim().is_empty())
                     .map(|item| item.name.clone())
                     .unwrap_or(instance.name),
                 running: instance.running,
-                serial: configured
-                    .filter(|item| !item.serial.trim().is_empty())
-                    .map(|item| item.serial.clone())
-                    .unwrap_or_else(|| ldplayer::LdPlayer::serial_for_index(instance.index)),
-                adb_port: instance.adb_port,
+                serial,
+                ldplayer_reported_port: instance.ldplayer_reported_port,
                 width: instance.width,
                 height: instance.height,
                 dpi: instance.dpi,
                 configured: configured.is_some(),
                 enabled: configured.is_some_and(|item| item.enabled),
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn instance_command(store: &ConfigStore, command: InstanceCommand) -> Result<ExitCode> {
@@ -333,12 +344,12 @@ fn instance_command(store: &ConfigStore, command: InstanceCommand) -> Result<Exi
         InstanceCommand::List => {
             for instance in list_instance_summaries(store)? {
                 println!(
-                    "index={} name={} running={} serial={} adb_port={:?} size={:?}x{:?} dpi={:?} configured={} enabled={}",
+                    "index={} name={} running={} serial={} ldplayer_reported_port={:?} size={:?}x{:?} dpi={:?} configured={} enabled={}",
                     instance.index,
                     instance.name,
                     instance.running,
                     instance.serial,
-                    instance.adb_port,
+                    instance.ldplayer_reported_port,
                     instance.width,
                     instance.height,
                     instance.dpi,
@@ -372,21 +383,9 @@ fn launch_gui_companion() -> Result<ExitCode> {
             gui_exe.display()
         );
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        Command::new(&gui_exe)
-            .creation_flags(DETACHED_PROCESS)
-            .spawn()
-            .with_context(|| format!("无法启动 GUI: {}", gui_exe.display()))?;
-    }
-    #[cfg(not(windows))]
-    {
-        Command::new(&gui_exe)
-            .spawn()
-            .with_context(|| format!("无法启动 GUI: {}", gui_exe.display()))?;
-    }
+    process::detached_command(&gui_exe)
+        .spawn()
+        .with_context(|| format!("无法启动 GUI: {}", gui_exe.display()))?;
     Ok(ExitCode::Ok)
 }
 
@@ -459,7 +458,7 @@ fn config_command(store: &ConfigStore, command: ConfigCommand) -> Result<ExitCod
         ConfigCommand::Open => {
             #[cfg(windows)]
             {
-                Command::new("cmd")
+                process::command("cmd")
                     .args(["/C", "start", "", &store.path.to_string_lossy()])
                     .spawn()
                     .context("无法打开系统编辑器")?;
@@ -574,7 +573,10 @@ fn sync_profile_inner(
     sync_log: &SyncLog,
     record: &mut SyncResult,
 ) -> Result<()> {
-    let ld = ldplayer::LdPlayer::discover(&store.config.emulator.ldconsole_path, &store.root)?;
+    let ld = ldplayer::LdPlayer::discover(
+        &configured_path(store, &store.config.emulator.ldconsole_path),
+        &store.root,
+    )?;
     let selected = resolve_instance_target(&ld, store, Some(instance_target))?;
     record.instance_index = selected.index;
     let index = selected.index;
@@ -792,24 +794,64 @@ fn restore_sync_backup<R: SyncLifecycle>(
     Ok(())
 }
 
+fn configured_path(store: &ConfigStore, value: &str) -> String {
+    config::resolve_path(&store.root, value)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DependencyDiagnostics {
+    pub ldplayer: discovery::DiscoveryReport,
+    pub adb: discovery::DiscoveryReport,
+}
+
+pub(crate) fn dependency_diagnostics(store: &ConfigStore) -> DependencyDiagnostics {
+    let ldplayer = ldplayer::LdPlayer::discover_report(
+        &configured_path(store, &store.config.emulator.ldconsole_path),
+        &store.root,
+    );
+    let adb = adb::discover_adb(
+        &store.config.emulator.adb_path,
+        ldplayer
+            .selected()
+            .map(|candidate| candidate.path.as_path()),
+        Some(&store.root),
+    );
+    DependencyDiagnostics { ldplayer, adb }
+}
+
 fn diagnose(store: &ConfigStore, instance_target: &InstanceTargetArgs) -> Result<ExitCode> {
-    let ld = ldplayer::LdPlayer::discover(&store.config.emulator.ldconsole_path, &store.root)?;
-    println!("LDPlayer: {}", ld.executable.display());
+    let report = dependency_diagnostics(store);
+    println!("{}", report.ldplayer.summary());
+    println!("{}", report.adb.summary());
+    let Some(ld_path) = report.ldplayer.selected_path() else {
+        return Ok(ExitCode::DeviceFailure);
+    };
+    let ld = ldplayer::LdPlayer {
+        executable: ld_path,
+    };
     let instances = ld.instances()?;
     if instances.is_empty() {
         println!("实例: none");
         return Ok(ExitCode::DeviceFailure);
     }
-    for i in &instances {
+    for instance in &instances {
         println!(
-            "instance={} name={} running={} adb_port={:?} size={:?}x{:?} dpi={:?}",
-            i.index, i.name, i.running, i.adb_port, i.width, i.height, i.dpi
+            "instance={} name={} running={} ldplayer_reported_port={:?} size={:?}x{:?} dpi={:?}",
+            instance.index,
+            instance.name,
+            instance.running,
+            instance.ldplayer_reported_port,
+            instance.width,
+            instance.height,
+            instance.dpi
         );
     }
     let (_, device, info) = runtime_with_target(store, false, Some(instance_target))?;
     print_device(&device.serial, &info);
-    if let Some(p) = profile::find_profile(info.width, info.height, info.density_dpi) {
-        println!("profile={} calibrated={}", p.id, p.calibrated);
+    if let Some(profile) = profile::find_profile(info.width, info.height, info.density_dpi) {
+        println!("profile={} calibrated={}", profile.id, profile.calibrated);
     } else {
         println!("profile=unknown");
     }
@@ -940,7 +982,7 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
             let task_run = build_task_command_line(&exe, mode, all_instances, &target);
             let store = ConfigStore::load()?;
             let start = store.config.window.start.clone();
-            let output = Command::new("schtasks.exe")
+            let output = process::command("schtasks.exe")
                 .args([
                     "/Create", "/TN", &name, "/TR", &task_run, "/SC", "DAILY", "/ST", &start, "/F",
                 ])
@@ -955,7 +997,7 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
             println!("已创建计划任务 {}: {}", name, task_run);
         }
         TaskCommand::Delete { name } => {
-            let output = Command::new("schtasks.exe")
+            let output = process::command("schtasks.exe")
                 .args(["/Delete", "/TN", &name, "/F"])
                 .output()
                 .context("无法执行 schtasks.exe")?;
@@ -968,7 +1010,7 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
             println!("已删除计划任务 {}", name);
         }
         TaskCommand::Query { name } => {
-            let output = Command::new("schtasks.exe")
+            let output = process::command("schtasks.exe")
                 .args(["/Query", "/TN", &name, "/FO", "LIST"])
                 .output()
                 .context("无法执行 schtasks.exe")?;
@@ -1010,21 +1052,46 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
     }
     let log = RunLog::new(&store.root)?;
     let mut result = RunResult {
+        schema_version: 2,
+        run_id: log
+            .dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        started_at: chrono::Local::now().to_rfc3339(),
+        finished_at: None,
         mode: mode.as_str().into(),
         instance_index: args.target.instance_index,
         instance_name: None,
         serial: String::new(),
         profile_id: None,
+        screen_width: None,
+        screen_height: None,
+        density_dpi: None,
         state_history: vec![],
         clicked: false,
         success: false,
         dry_run_ready: false,
+        field_work_ready: false,
+        page_route: None,
+        checkin_mode: None,
+        checkin_state: None,
+        success_date: None,
+        error_stage: None,
+        recovery_action: None,
+        artifact_paths: Vec::new(),
         error: None,
     };
+    seed_result_identity(store, &args.target, &mut result);
     log.event("start", serde_json::json!({"mode":mode.as_str()}))?;
     if mode == Mode::Live && !args.confirm {
-        result.error = Some("live_confirmation_required".into());
-        finalize_run(&log, &result)?;
+        set_run_failure(
+            &mut result,
+            "live_confirmation_required",
+            "click_authorization",
+            "正式模式需要显式 --confirm；未执行签到点击。",
+        );
+        finalize_run(&log, &mut result)?;
         println!("结果: {}", serde_json::to_string_pretty(&result)?);
         return Ok(ExitCode::BusinessFailure);
     }
@@ -1036,17 +1103,32 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
             if result.error.is_none() {
                 result.error = Some(format!("{:#}", error));
             }
+            if result.error_stage.is_none() {
+                result.error_stage = Some("runtime".into());
+            }
+            if result.recovery_action.is_none() {
+                result.recovery_action = Some("请查看诊断报告和最新运行截图后重试。".into());
+            }
             eprintln!("运行失败: {:#}", error);
             ExitCode::DeviceFailure
         }
     };
 
-    finalize_run(&log, &result)?;
+    finalize_run(&log, &mut result)?;
     println!("结果: {}", serde_json::to_string_pretty(&result)?);
     Ok(code)
 }
 
-fn finalize_run(log: &RunLog, result: &RunResult) -> Result<()> {
+fn finalize_run(log: &RunLog, result: &mut RunResult) -> Result<()> {
+    result.finished_at = Some(chrono::Local::now().to_rfc3339());
+    result.artifact_paths = [
+        log.dir.join("result.json"),
+        log.dir.join("events.jsonl"),
+        log.dir.join("screenshots"),
+    ]
+    .iter()
+    .map(|path| path.display().to_string())
+    .collect();
     log.save_json("result.json", result)?;
     log.event("finish", result)?;
     Ok(())
@@ -1098,11 +1180,154 @@ fn run_inner(
     log: &RunLog,
     result: &mut RunResult,
 ) -> Result<ExitCode> {
-    run_inner_with_device(store, args, mode, log, result, |store, launch, target| {
-        runtime_with_target(store, launch, Some(target))
-    })
+    run_inner_with_device(
+        store,
+        args,
+        mode,
+        log,
+        result,
+        |store, launch, target, result| {
+            runtime_with_target_recording(store, launch, Some(target), Some(result))
+        },
+    )
 }
 
+fn seed_result_identity(store: &ConfigStore, target: &InstanceTargetArgs, result: &mut RunResult) {
+    let configured_instances = store.config.emulator.effective_instances();
+    let explicit_serial = target
+        .serial
+        .as_deref()
+        .filter(|serial| !serial.trim().is_empty());
+    let index_from_serial = explicit_serial.and_then(|serial| {
+        configured_instances
+            .iter()
+            .find(|instance| instance.serial.trim() == serial)
+            .map(|instance| instance.instance_index)
+            .or_else(|| {
+                configured_instances.iter().find_map(|instance| {
+                    (ldplayer::LdPlayer::tcp_serial_for_index(instance.instance_index).as_deref()
+                        == Some(serial))
+                    .then_some(instance.instance_index)
+                })
+            })
+    });
+    let index = target.instance_index.or(index_from_serial).or_else(|| {
+        explicit_serial
+            .is_none()
+            .then_some(store.config.emulator.instance_index)
+    });
+    result.instance_index = index;
+    result.serial = explicit_serial
+        .map(str::to_string)
+        .or_else(|| {
+            index.and_then(|index| {
+                configured_instances
+                    .iter()
+                    .find(|instance| instance.instance_index == index)
+                    .filter(|instance| !instance.serial.trim().is_empty())
+                    .map(|instance| instance.serial.clone())
+            })
+        })
+        .or_else(|| {
+            index
+                .filter(|index| *index == store.config.emulator.instance_index)
+                .and_then(|_| {
+                    let serial = store.config.emulator.serial.trim();
+                    (!serial.is_empty()).then(|| serial.to_string())
+                })
+        })
+        .or_else(|| index.and_then(ldplayer::LdPlayer::tcp_serial_for_index))
+        .unwrap_or_default();
+    result.instance_name = index.and_then(|index| {
+        configured_instances
+            .iter()
+            .find(|instance| instance.instance_index == index)
+            .map(|instance| instance.name.clone())
+            .filter(|name| !name.trim().is_empty())
+    });
+}
+
+fn set_run_failure(result: &mut RunResult, code: &str, stage: &str, recovery_action: &str) {
+    result.error = Some(code.into());
+    result.error_stage = Some(stage.into());
+    result.recovery_action = Some(recovery_action.into());
+}
+
+fn checkin_state_from_visual(state: vision::ButtonState) -> CheckinState {
+    match state {
+        vision::ButtonState::Gray => CheckinState::Gray,
+        vision::ButtonState::Locating => CheckinState::Locating,
+        vision::ButtonState::Ready => CheckinState::Ready,
+        vision::ButtonState::Success | vision::ButtonState::Unknown => CheckinState::Unknown,
+    }
+}
+
+fn extract_dates_from_text(text: &str) -> Vec<chrono::NaiveDate> {
+    let mut dates = Vec::new();
+    for (start, ch) in text.char_indices() {
+        if ch != '2' {
+            continue;
+        }
+        let candidate: String = text[start..]
+            .chars()
+            .take_while(|ch| {
+                ch.is_ascii_digit() || matches!(*ch, '-' | '/' | '.' | '年' | '月' | '日')
+            })
+            .collect();
+        let normalized = candidate
+            .replace(['年', '月'], "-")
+            .replace('日', "")
+            .replace(['/', '.'], "-");
+        let parts: Vec<_> = normalized
+            .split('-')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.len() >= 3
+            && let (Ok(year), Ok(month), Ok(day)) = (
+                parts[0].parse::<i32>(),
+                parts[1].parse::<u32>(),
+                parts[2].parse::<u32>(),
+            )
+            && (2000..=2100).contains(&year)
+            && let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            && !dates.contains(&date)
+        {
+            dates.push(date);
+        }
+    }
+    dates
+}
+
+fn extract_hierarchy_date(xml: &str) -> Option<chrono::NaiveDate> {
+    let mut all_dates = Vec::new();
+    let mut contextual_dates = Vec::new();
+    for attribute in ["text=\"", "content-desc=\""] {
+        let mut cursor = 0;
+        while let Some(relative) = xml.get(cursor..)?.find(attribute) {
+            let value_start = cursor + relative + attribute.len();
+            let value_length = xml.get(value_start..)?.find('"')?;
+            let value_end = value_start + value_length;
+            let value = &xml[value_start..value_end];
+            let has_checkin_context = value.contains("签到成功") || value.contains("已签到");
+            let has_explicit_date_label = value.trim_start().starts_with("日期");
+            for date in extract_dates_from_text(value) {
+                if !all_dates.contains(&date) {
+                    all_dates.push(date);
+                }
+                if (has_checkin_context || has_explicit_date_label)
+                    && !contextual_dates.contains(&date)
+                {
+                    contextual_dates.push(date);
+                }
+            }
+            cursor = value_end + 1;
+        }
+    }
+    if contextual_dates.len() != 1 || all_dates.iter().any(|date| *date != contextual_dates[0]) {
+        return None;
+    }
+    contextual_dates.first().copied()
+}
 fn run_inner_with_device<F>(
     store: &ConfigStore,
     args: &RunArgs,
@@ -1116,17 +1341,26 @@ where
         &ConfigStore,
         bool,
         &InstanceTargetArgs,
+        &mut RunResult,
     ) -> Result<(ldplayer::LdPlayer, adb::AdbDevice, adb::DeviceInfo)>,
 {
-    let (ld, device, info) = runtime_provider(store, true, &args.target)?;
+    result.error_stage = Some("device_setup".into());
+    let (ld, device, info) = runtime_provider(store, true, &args.target, result)?;
     result.serial = device.serial.clone();
     let selected = resolve_instance_target(&ld, store, Some(&args.target))?;
     result.instance_index = Some(selected.index);
     result.instance_name = Some(selected.name);
+
+    result.error_stage = Some("profile_detection".into());
     let profile = match profile::find_profile(info.width, info.height, info.density_dpi) {
-        Some(p) => p,
+        Some(profile) => profile,
         None => {
-            result.error = Some("unknown_profile".into());
+            set_run_failure(
+                result,
+                "unknown_profile",
+                "profile_detection",
+                "同步或选择与设备分辨率/DPI 匹配的 Profile 后重试；未执行签到点击。",
+            );
             log.event(
                 "profile_unknown",
                 serde_json::json!({"width":info.width,"height":info.height,"dpi":info.density_dpi}),
@@ -1135,91 +1369,309 @@ where
         }
     };
     result.profile_id = Some(profile.id.to_string());
+    result.screen_width = Some(info.width);
+    result.screen_height = Some(info.height);
+    result.density_dpi = Some(info.density_dpi);
     if mode == Mode::Live && !profile.calibrated {
-        result.error = Some("uncalibrated_profile".into());
+        set_run_failure(
+            result,
+            "uncalibrated_profile",
+            "click_authorization",
+            "选择已标定 Profile；未执行签到点击。",
+        );
         return Ok(ExitCode::BusinessFailure);
     }
+
+    result.error_stage = Some("app_launch".into());
     device.launch_package(
         &store.config.app.package_name,
         &store.config.app.activity_name,
     )?;
-    wait_for_package(
+    result.error_stage = Some("app_foreground".into());
+    if wait_for_package(
         &device,
         &store.config.app.package_name,
         Duration::from_secs(store.config.runtime.startup_timeout_seconds),
-    )?;
+    )
+    .is_err()
+    {
+        set_run_failure(
+            result,
+            "app_start_timeout",
+            "app_foreground",
+            "请在模拟器中手动打开目标 App 并完成登录，然后重新诊断/运行。",
+        );
+        return Ok(ExitCode::Timeout);
+    }
     thread::sleep(Duration::from_millis(800));
+
+    result.error_stage = Some("navigation".into());
     let navigation = locate_or_navigate(&device, profile, log)?;
+    result.page_route = Some(navigation.route);
+    result.checkin_mode = Some(navigation.checkin_mode);
     log.event(
-        "page_route",
-        serde_json::json!({"route": navigation.route.as_str()}),
+        "page_observation",
+        serde_json::json!({
+            "route": navigation.route.as_str(),
+            "checkin_mode": navigation.checkin_mode.as_str(),
+        }),
     )?;
     if navigation.route != PageRoute::Checkin {
-        result.error = Some(navigation.route.error_code().into());
+        let (code, recovery) = if navigation.route == PageRoute::Login {
+            (
+                "login_required",
+                "请在模拟器中手动完成登录；本程序不会输入账号、密码、验证码或点击一键登录。",
+            )
+        } else {
+            (
+                "navigation_not_confirmed",
+                "请手动进入“晚点名签到”页面后重新运行；未执行签到点击。",
+            )
+        };
+        set_run_failure(result, code, "navigation", recovery);
         return Ok(ExitCode::VisionFailure);
     }
+    if navigation.checkin_mode == CheckinMode::Unsupported {
+        result.checkin_state = Some(CheckinState::Unknown);
+        set_run_failure(
+            result,
+            "unsupported_checkin_mode",
+            "checkin_classification",
+            "当前签到按钮文案/业务模式未识别；请人工确认页面并提供脱敏 hierarchy 证据。",
+        );
+        return Ok(ExitCode::BusinessFailure);
+    }
+
+    if navigation.checkin_mode == CheckinMode::FieldWork {
+        result.error_stage = Some("field_work_observation".into());
+        log.event(
+            "field_work_observation",
+            serde_json::json!({
+                "route": navigation.route.as_str(),
+                "mode": navigation.checkin_mode.as_str(),
+                "state": "observation_pending",
+                "clicked": false,
+            }),
+        )?;
+        if mode == Mode::Live {
+            result.checkin_state = Some(CheckinState::Unknown);
+            set_run_failure(
+                result,
+                "field_work_live_unsupported",
+                "click_authorization",
+                "外勤签到尚未开放自动点击；请在模拟器中人工确认并完成签到。",
+            );
+            return Ok(ExitCode::BusinessFailure);
+        }
+
+        let bytes = device.screenshot()?;
+        log.save_bytes("field_work_observation.png", &bytes)?;
+        if navigation.field_work_ready {
+            result
+                .state_history
+                .push(CheckinState::FieldWorkReady.as_str().into());
+            result.checkin_state = Some(CheckinState::FieldWorkReady);
+            result.field_work_ready = true;
+            result.error_stage = None;
+            log.event(
+                "field_work_visual_state",
+                serde_json::json!({"state":"field_work_ready","clicked":false}),
+            )?;
+            return Ok(ExitCode::Ok);
+        }
+        result.checkin_state = Some(CheckinState::Unknown);
+        set_run_failure(
+            result,
+            "field_work_observation_only",
+            "field_work_observation",
+            "外勤页面状态无法从层级结构确认；仅保存 dry-run 截图，请人工确认并完成签到。",
+        );
+        log.event(
+            "field_work_visual_state",
+            serde_json::json!({"state":"unknown","clicked":false}),
+        )?;
+        return Ok(ExitCode::BusinessFailure);
+    }
+
+    // Page route and mode remain explicit and are re-read before every state
+    // observation. A changed or unobservable page never enters the tap path.
     let started = Instant::now();
-    let mut unknowns = 0u32;
+    let mut unknowns = ConsecutiveUnknown::default();
     let mut ready_frames = 0u32;
     let mut click_deadline: Option<Instant> = None;
     loop {
         if click_deadline.is_none() {
+            result.error_stage = Some("time_window".into());
             let within_window = domain::in_configured_window(
                 &store.config.window.start,
                 &store.config.window.end,
                 &store.config.window.timezone,
             )?;
             if !within_window {
-                result.error = Some("outside_window".into());
+                set_run_failure(
+                    result,
+                    "outside_window",
+                    "time_window",
+                    "请在配置的签到时间窗口内重新运行。",
+                );
                 break;
             }
             if started.elapsed()
                 >= Duration::from_secs(store.config.runtime.location_timeout_seconds)
             {
-                result.error = Some("location_timeout".into());
+                set_run_failure(
+                    result,
+                    "location_timeout",
+                    "checkin_wait",
+                    "请检查网络/定位权限和页面状态，之后重新运行。",
+                );
                 break;
             }
         }
 
+        result.error_stage = Some("page_observation".into());
+        let hierarchy = match device.dump_hierarchy() {
+            Ok(hierarchy) => hierarchy,
+            Err(_) => {
+                set_run_failure(
+                    result,
+                    "hierarchy_unavailable",
+                    "page_observation",
+                    "请保持目标签到页在前台并重新运行诊断；页面无法确认时不会点击。",
+                );
+                break;
+            }
+        };
+        let current_route = detect_page_route(&hierarchy);
+        let current_mode = detect_checkin_mode(&hierarchy);
+        result.page_route = Some(current_route);
+        result.checkin_mode = Some(current_mode);
+        if current_route != PageRoute::Checkin || current_mode != CheckinMode::Ordinary {
+            set_run_failure(
+                result,
+                "page_context_changed",
+                "page_observation",
+                "请返回普通晚点名签到页面并重新运行；程序已停止自动点击。",
+            );
+            break;
+        }
+
+        result.error_stage = Some("visual_observation".into());
         let bytes = device.screenshot()?;
         log.save_bytes(
             &format!("state_{}.png", result.state_history.len() + 1),
             &bytes,
         )?;
         let image = vision::decode(&bytes)?;
-        // Dynamic color detection is only trusted after locate_or_navigate has
-        // explicitly confirmed the check-in route. Otherwise a colorful home
-        // service tile could be classified as ready/success and be clicked.
         let button = vision::find_colored_button(&image)
             .unwrap_or_else(|| vision::fallback_button(&image, profile));
         let analysis = vision::classify_button(&image, button);
         let state = format!("{:?}", analysis.state).to_lowercase();
         result.state_history.push(state.clone());
+        result.checkin_state = Some(checkin_state_from_visual(analysis.state));
         log.event("state", &analysis)?;
+
         if analysis.state == vision::ButtonState::Success {
-            result.success = true;
+            result.error_stage = Some("success_confirmation".into());
+            if !["签到成功", "已签到"]
+                .iter()
+                .any(|marker| hierarchy.contains(marker))
+            {
+                result.checkin_state = Some(CheckinState::Unknown);
+                log.event(
+                    "checkin_semantic_state",
+                    serde_json::json!({
+                        "route": current_route.as_str(),
+                        "mode": current_mode.as_str(),
+                        "state": CheckinState::Unknown.as_str(),
+                        "reason": "success_text_unconfirmed",
+                    }),
+                )?;
+                if unknowns.observe(true) >= store.config.runtime.unknown_retries {
+                    set_run_failure(
+                        result,
+                        "success_text_unconfirmed",
+                        "success_confirmation",
+                        "页面视觉与层级文字不一致；请人工确认签到结果。",
+                    );
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            match extract_hierarchy_date(&hierarchy) {
+                Some(detected_date) => {
+                    let today = domain::configured_date(&store.config.window.timezone)?;
+                    result.success_date = Some(detected_date.to_string());
+                    if detected_date == today {
+                        result.checkin_state = Some(CheckinState::SuccessToday);
+                        result.success = true;
+                        result.error_stage = None;
+                        result.recovery_action = None;
+                    } else {
+                        result.checkin_state = Some(CheckinState::SuccessStale);
+                        set_run_failure(
+                            result,
+                            "success_stale",
+                            "success_confirmation",
+                            "签到页面显示的成功日期不是当前配置时区的今天；请确认是否需要签到。",
+                        );
+                    }
+                }
+                None => {
+                    result.checkin_state = Some(CheckinState::SuccessDateUnknown);
+                    set_run_failure(
+                        result,
+                        "success_date_unknown",
+                        "success_confirmation",
+                        "无法从签到页面确认成功日期；请人工核对，不按当天成功处理。",
+                    );
+                }
+            }
+            log.event(
+                "checkin_semantic_state",
+                serde_json::json!({
+                    "route": current_route.as_str(),
+                    "mode": current_mode.as_str(),
+                    "state": result.checkin_state.map(|state| state.as_str()),
+                    "success_date": result.success_date.as_deref(),
+                }),
+            )?;
             break;
         }
+        log.event(
+            "checkin_semantic_state",
+            serde_json::json!({
+                "route": current_route.as_str(),
+                "mode": current_mode.as_str(),
+                "state": result.checkin_state.map(|state| state.as_str()),
+            }),
+        )?;
+
         if let Some(deadline) = click_deadline {
             if deadline.elapsed()
                 > Duration::from_secs(store.config.runtime.success_timeout_seconds)
             {
-                result.error = Some("success_timeout".into());
+                set_run_failure(
+                    result,
+                    "success_timeout",
+                    "success_confirmation",
+                    "本次点击后没有确认到当天成功；请人工核对页面，避免重复点击。",
+                );
                 break;
             }
-            // A delayed UI frame may still look ready after the tap. Once a
-            // tap has happened, only wait for success; never tap again.
+            // After one authorized tap, never revisit the Ready tap branch.
             thread::sleep(Duration::from_secs(3));
             continue;
         }
+
         match analysis.state {
-            vision::ButtonState::Gray => {
+            vision::ButtonState::Gray | vision::ButtonState::Locating => {
                 ready_frames = 0;
-                sleep_for_next_poll(store, started)?;
-            }
-            vision::ButtonState::Locating => {
-                ready_frames = 0;
-                sleep_for_next_poll(store, started)?;
+                unknowns.reset();
+                thread::sleep(Duration::from_secs(
+                    store.config.runtime.locating_poll_seconds,
+                ));
             }
             vision::ButtonState::Ready => {
                 let within_window = domain::in_configured_window(
@@ -1228,22 +1680,49 @@ where
                     &store.config.window.timezone,
                 )?;
                 if !within_window {
-                    result.error = Some("outside_window".into());
+                    set_run_failure(
+                        result,
+                        "outside_window",
+                        "time_window",
+                        "请在配置的签到时间窗口内重新运行。",
+                    );
                     break;
                 }
                 ready_frames += 1;
+                unknowns.reset();
                 if ready_frames < store.config.runtime.stable_frames {
                     thread::sleep(Duration::from_millis(700));
                     continue;
                 }
                 if mode == Mode::DryRun {
                     result.dry_run_ready = true;
+                    result.error_stage = None;
+                    break;
+                }
+
+                result.error_stage = Some("click_authorization".into());
+                let confirmation_hierarchy = device.dump_hierarchy()?;
+                let confirmed_route = detect_page_route(&confirmation_hierarchy);
+                let confirmed_mode = detect_checkin_mode(&confirmation_hierarchy);
+                if confirmed_route != PageRoute::Checkin || confirmed_mode != CheckinMode::Ordinary
+                {
+                    set_run_failure(
+                        result,
+                        "page_context_changed",
+                        "click_authorization",
+                        "请确认普通签到页仍处于前台；程序未执行点击。",
+                    );
                     break;
                 }
                 let foreground_matches =
                     device.current_package().unwrap_or_default() == store.config.app.package_name;
                 if !foreground_matches {
-                    result.error = Some("foreground_package_changed".into());
+                    set_run_failure(
+                        result,
+                        "foreground_package_changed",
+                        "click_authorization",
+                        "请将目标 App 的普通签到页置于前台后重新运行；程序未执行点击。",
+                    );
                     break;
                 }
                 let confirm_bytes = device.screenshot()?;
@@ -1251,18 +1730,36 @@ where
                 let confirm_button = vision::find_colored_button(&confirm_image).unwrap_or(button);
                 let confirm = vision::classify_button(&confirm_image, confirm_button);
                 if confirm.state != vision::ButtonState::Ready {
-                    result.error = Some("ready_confirmation_failed".into());
+                    set_run_failure(
+                        result,
+                        "ready_confirmation_failed",
+                        "click_authorization",
+                        "点击前 ready 二次确认失败；程序未执行点击，请重新运行。",
+                    );
                     break;
                 }
+                result.error_stage = Some("time_window".into());
                 let policy_window = domain::in_configured_window(
                     &store.config.window.start,
                     &store.config.window.end,
                     &store.config.window.timezone,
                 )?;
+                if !policy_window {
+                    set_run_failure(
+                        result,
+                        "outside_window",
+                        "time_window",
+                        "签到时间窗口已结束；程序未执行点击。",
+                    );
+                    break;
+                }
+                result.error_stage = Some("click_authorization".into());
                 match guarded_tap(
                     &device,
                     TapRequest {
                         state: confirm.state,
+                        route: confirmed_route,
+                        checkin_mode: confirmed_mode,
                         mode,
                         explicit_confirmation: args.confirm,
                         profile_calibrated: profile.calibrated,
@@ -1276,41 +1773,59 @@ where
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
-                        result.error = Some("ready_confirmation_failed".into());
+                        set_run_failure(
+                            result,
+                            "click_authorization_failed",
+                            "click_authorization",
+                            "点击门禁未授权；程序未执行点击。",
+                        );
                         break;
                     }
-                    Err(policy_error) => {
-                        result.error = Some(policy_error.to_string());
+                    Err(error) => {
+                        set_run_failure(
+                            result,
+                            "click_authorization_failed",
+                            "click_authorization",
+                            "点击门禁失败；程序未执行点击。",
+                        );
+                        log.event(
+                            "click_denied",
+                            serde_json::json!({"reason":error.to_string()}),
+                        )?;
                         break;
                     }
                 }
                 result.clicked = true;
                 log.event(
-                    "clicked_ready",
+                    "tap",
                     serde_json::json!({"x":confirm_button.cx,"y":confirm_button.cy}),
                 )?;
                 click_deadline = Some(Instant::now());
             }
-            vision::ButtonState::Success => {
-                result.success = true;
-                break;
-            }
+            vision::ButtonState::Success => unreachable!("handled above with date evidence"),
             vision::ButtonState::Unknown => {
-                unknowns += 1;
                 ready_frames = 0;
-                if unknowns >= store.config.runtime.unknown_retries {
-                    result.error = Some("unknown_state".into());
+                result.checkin_state = Some(CheckinState::Unknown);
+                if unknowns.observe(true) >= store.config.runtime.unknown_retries {
+                    set_run_failure(
+                        result,
+                        "unknown_state",
+                        "visual_observation",
+                        "请查看最新截图与页面层级，确认按钮状态后重新运行。",
+                    );
                     break;
                 }
                 thread::sleep(Duration::from_secs(1));
             }
         }
     }
-    let code = if result.success || result.dry_run_ready {
+
+    let code = if result.success || result.dry_run_ready || result.field_work_ready {
         ExitCode::Ok
-    } else if result.error.as_deref() == Some("location_timeout")
-        || result.error.as_deref() == Some("success_timeout")
-    {
+    } else if matches!(
+        result.error.as_deref(),
+        Some("location_timeout" | "success_timeout")
+    ) {
         ExitCode::Timeout
     } else {
         ExitCode::BusinessFailure
@@ -1330,6 +1845,8 @@ impl TapDevice for adb::AdbDevice {
 
 struct TapRequest {
     state: vision::ButtonState,
+    route: PageRoute,
+    checkin_mode: CheckinMode,
     mode: Mode,
     explicit_confirmation: bool,
     profile_calibrated: bool,
@@ -1345,6 +1862,7 @@ fn guarded_tap<D: TapDevice>(device: &D, request: TapRequest) -> Result<bool> {
     if request.state != vision::ButtonState::Ready {
         return Ok(false);
     }
+    domain::authorize_page_action(request.route, request.checkin_mode)?;
     domain::authorize_click(
         request.mode,
         request.explicit_confirmation,
@@ -1358,6 +1876,7 @@ fn guarded_tap<D: TapDevice>(device: &D, request: TapRequest) -> Result<bool> {
     Ok(true)
 }
 
+#[expect(dead_code, reason = "reserved for bounded scheduled waiting")]
 fn sleep_for_next_poll(store: &ConfigStore, started: Instant) -> Result<()> {
     let location_remaining = Duration::from_secs(
         store
@@ -1386,8 +1905,25 @@ pub(crate) fn runtime_with_target(
     launch: bool,
     instance_target: Option<&InstanceTargetArgs>,
 ) -> Result<(ldplayer::LdPlayer, adb::AdbDevice, adb::DeviceInfo)> {
-    let ld = ldplayer::LdPlayer::discover(&store.config.emulator.ldconsole_path, &store.root)?;
+    runtime_with_target_recording(store, launch, instance_target, None)
+}
+
+fn runtime_with_target_recording(
+    store: &ConfigStore,
+    launch: bool,
+    instance_target: Option<&InstanceTargetArgs>,
+    result: Option<&mut RunResult>,
+) -> Result<(ldplayer::LdPlayer, adb::AdbDevice, adb::DeviceInfo)> {
+    let ld = ldplayer::LdPlayer::discover(
+        &configured_path(store, &store.config.emulator.ldconsole_path),
+        &store.root,
+    )?;
     let selected = resolve_instance_target(&ld, store, instance_target)?;
+    if let Some(result) = result {
+        result.instance_index = Some(selected.index);
+        result.instance_name = Some(selected.name.clone());
+        result.serial = selected.serial.clone();
+    }
     let instance = ld.instance(selected.index)?;
     if launch && store.config.emulator.auto_launch && !instance.running {
         ld.launch_wait(
@@ -1395,7 +1931,11 @@ pub(crate) fn runtime_with_target(
             Duration::from_secs(store.config.runtime.startup_timeout_seconds),
         )?;
     }
-    let adb_path = adb::find_adb(&store.config.emulator.adb_path)?;
+    let adb_path = adb::find_adb_for_ldplayer(
+        &store.config.emulator.adb_path,
+        Some(&ld.executable),
+        Some(&store.root),
+    )?;
     let device = connect_adb_device(
         &adb_path,
         &selected.serial,
@@ -1412,7 +1952,10 @@ pub(crate) fn runtime_with_target(
 fn connect_adb_device(adb_path: &Path, serial: &str, timeout: Duration) -> Result<adb::AdbDevice> {
     let deadline = Instant::now() + timeout;
     loop {
-        let connect_error = match Command::new(adb_path).args(["connect", serial]).output() {
+        let connect_error = match process::command(adb_path)
+            .args(["connect", serial])
+            .output()
+        {
             Ok(output) if !output.status.success() => Some(format!(
                 "adb connect 失败: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -1447,145 +1990,173 @@ fn wait_for_package(device: &adb::AdbDevice, package: &str, timeout: Duration) -
     bail!("等待 App 前台超时: {}", package)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PageRoute {
-    Home,
-    Services,
-    Checkin,
-    Login,
-    Unknown,
-}
-
-impl PageRoute {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Home => "home",
-            Self::Services => "services",
-            Self::Checkin => "checkin",
-            Self::Login => "login",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    fn error_code(self) -> &'static str {
-        match self {
-            Self::Login => "login_required",
-            Self::Home | Self::Services | Self::Unknown => "navigation_not_confirmed",
-            Self::Checkin => "",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct NavigationResult {
     route: PageRoute,
+    checkin_mode: CheckinMode,
+    field_work_ready: bool,
+}
+
+fn detect_checkin_mode(xml: &str) -> CheckinMode {
+    if xml.contains("外勤签到") {
+        return CheckinMode::FieldWork;
+    }
+    if [
+        "点击签到",
+        "无法签到",
+        "未到签到时间",
+        "定位中",
+        "签到成功",
+        "已签到",
+    ]
+    .iter()
+    .any(|label| xml.contains(label))
+    {
+        return CheckinMode::Ordinary;
+    }
+    CheckinMode::Unsupported
 }
 
 fn detect_page_route(xml: &str) -> PageRoute {
     if xml.contains("一键登录") || xml.contains("其他账户登录") {
         return PageRoute::Login;
     }
-    if [
-        "未签到",
-        "无法签到",
-        "未到签到时间",
-        "定位中",
-        "点击签到",
-        "签到成功",
-    ]
-    .iter()
-    .any(|label| xml.contains(label))
-    {
-        return PageRoute::Checkin;
-    }
+
+    // Page-level navigation labels outrank status words that may also appear
+    // on a home/service-card summary (for example, an already-completed card).
     if xml.contains("我的服务") {
         return PageRoute::Home;
     }
     if xml.contains("业务") {
         return PageRoute::Services;
     }
+
+    // A status/action word alone is not sufficient page identity: the same
+    // text can occur on summaries, overlays, and unrelated pages. The observed
+    // check-in hierarchy exposes its page title, so require that context.
+    let has_checkin_title = xml.contains("晚点名签到");
+    let ordinary_checkin_markers = [
+        "无法签到",
+        "未到签到时间",
+        "定位中",
+        "点击签到",
+        "签到成功",
+        "已签到",
+    ];
+    let has_ordinary_checkin_marker = ordinary_checkin_markers
+        .iter()
+        .any(|marker| xml.contains(marker));
+    let field_work_context_markers = ["未签到", "当前位置", "当前地点", "签到时间"];
+    let field_work_context_count = field_work_context_markers
+        .iter()
+        .filter(|marker| xml.contains(**marker))
+        .count();
+    if has_checkin_title
+        && (has_ordinary_checkin_marker
+            || (xml.contains("外勤签到") && field_work_context_count >= 1))
+    {
+        return PageRoute::Checkin;
+    }
     PageRoute::Unknown
 }
 
+fn is_navigable_catalog_route(route: PageRoute) -> bool {
+    matches!(route, PageRoute::Home | PageRoute::Services)
+}
 fn locate_or_navigate(
     device: &adb::AdbDevice,
     profile: &profile::Profile,
     log: &RunLog,
 ) -> Result<NavigationResult> {
-    let bytes = device.screenshot()?;
-    let image = vision::decode(&bytes)?;
-
-    // A home-page service tile can contain saturated colors and white text that
-    // look like a locating button to the visual detector. Inspect hierarchy
-    // first and only trust dynamic color detection after the check-in route is
-    // explicitly confirmed.
-    let mut xml = device.dump_hierarchy().unwrap_or_default();
+    let mut bytes = device.screenshot()?;
+    let mut image = vision::decode(&bytes)?;
+    let mut xml = device.dump_hierarchy()?;
     let initial_route = detect_page_route(&xml);
-    if initial_route == PageRoute::Login {
+    if matches!(initial_route, PageRoute::Login | PageRoute::Checkin) {
         log.save_bytes("navigation_result.png", &bytes)?;
+        let checkin_mode = detect_checkin_mode(&xml);
         return Ok(NavigationResult {
             route: initial_route,
-        });
-    }
-    if initial_route == PageRoute::Checkin {
-        log.save_bytes("navigation_result.png", &bytes)?;
-        return Ok(NavigationResult {
-            route: initial_route,
+            checkin_mode,
+            field_work_ready: checkin_mode == CheckinMode::FieldWork
+                && xml.contains("未签到")
+                && xml.contains("外勤签到"),
         });
     }
 
     let min_entry_y = image.height() / 8;
     let mut navigated = false;
 
-    // 1. The check-in entry may already be a clickable node on the current page.
-    if let Some((x, y)) = find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y) {
+    // First use a hierarchy-confirmed entry only on a known home/services page.
+    if matches!(initial_route, PageRoute::Home | PageRoute::Services)
+        && let Some((x, y)) = find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y)
+    {
         device.tap(x, y)?;
         thread::sleep(Duration::from_secs(3));
         navigated = true;
+        xml = device.dump_hierarchy()?;
     }
 
-    // 2. Some layouts keep the check-in tile below the fold on the home page,
-    //    so scroll the current page and rescan before trying other routes.
-    //    Scrolling a check-in page cannot activate the sign-in control.
-    if !navigated {
+    // Some home layouts put the entry below the fold. Scroll only while the
+    // hierarchy still identifies a known home/services page; never blind-tap a
+    // service-icon coordinate as a fallback.
+    if !navigated && matches!(initial_route, PageRoute::Home | PageRoute::Services) {
         for attempt in 0..4 {
             log.event("home_scroll", serde_json::json!({"attempt": attempt + 1}))?;
             device.swipe(
                 image.width() / 2,
                 image.height() * 3 / 4,
-                image.width() / 2,
+                image.width() * 2 / 5,
                 image.height() * 2 / 5,
                 500,
             )?;
             thread::sleep(Duration::from_secs(1));
-            xml = device.dump_hierarchy().unwrap_or_default();
+            xml = device.dump_hierarchy()?;
+            let route = detect_page_route(&xml);
+            if !is_navigable_catalog_route(route) {
+                break;
+            }
             if let Some((x, y)) = find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y)
             {
                 device.tap(x, y)?;
                 thread::sleep(Duration::from_secs(3));
                 navigated = true;
+                xml = device.dump_hierarchy()?;
                 break;
             }
         }
     }
 
-    // 3. Landscape layouts hide the service catalogue behind the "业务" tab and
-    //    may require one or more vertical swipes before the check-in tile
-    //    becomes part of the accessibility hierarchy.
-    if !navigated && let Some((x, y)) = find_clickable_labeled_bounds(&xml, "业务", 0) {
+    // Landscape service catalogues can expose the entry only after opening the
+    // explicitly labelled "业务" tab. Each navigation action is followed by a
+    // fresh hierarchy read before any next action.
+    if !navigated
+        && matches!(
+            detect_page_route(&xml),
+            PageRoute::Home | PageRoute::Services
+        )
+        && let Some((x, y)) = find_clickable_labeled_bounds(&xml, "业务", 0)
+    {
         device.tap(x, y)?;
         thread::sleep(Duration::from_secs(2));
+        xml = device.dump_hierarchy()?;
         for attempt in 0..6 {
-            let page_xml = device.dump_hierarchy().unwrap_or_default();
+            if !is_navigable_catalog_route(detect_page_route(&xml)) {
+                break;
+            }
             if let Some((entry_x, entry_y)) =
-                find_clickable_labeled_bounds(&page_xml, "晚点名签到", min_entry_y)
+                find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y)
             {
                 device.tap(entry_x, entry_y)?;
                 thread::sleep(Duration::from_secs(3));
-                navigated = true;
+                xml = device.dump_hierarchy()?;
                 break;
             }
             if attempt < 5 {
+                let current_route = detect_page_route(&xml);
+                if !matches!(current_route, PageRoute::Home | PageRoute::Services) {
+                    break;
+                }
                 device.swipe(
                     image.width() / 2,
                     image.height() * 3 / 4,
@@ -1594,75 +2165,64 @@ fn locate_or_navigate(
                     500,
                 )?;
                 thread::sleep(Duration::from_secs(1));
+                xml = device.dump_hierarchy()?;
             }
         }
     }
 
-    // 4. Legacy positional fallback when no accessibility entry was found.
-    if !navigated {
-        device.tap(
-            (profile.service_icon_center_ratio.0 * image.width() as f32) as u32,
-            (profile.service_icon_center_ratio.1 * image.height() as f32) as u32,
-        )?;
-        thread::sleep(Duration::from_secs(3));
-    }
-
-    let mut bytes = device.screenshot()?;
-    let mut image = vision::decode(&bytes)?;
-    let mut route = if navigated {
-        PageRoute::Checkin
+    bytes = device.screenshot()?;
+    image = vision::decode(&bytes)?;
+    let mut route = detect_page_route(&xml);
+    let mut checkin_mode = if route == PageRoute::Checkin {
+        detect_checkin_mode(&xml)
     } else {
-        detect_page_route(&device.dump_hierarchy().unwrap_or_default())
+        CheckinMode::Unsupported
     };
-
-    // If the positional fallback did not lead to a page that identifies itself
-    // as the check-in screen, fail closed. In particular, do not let a home
-    // page tile become a dynamic ready/success candidate.
-    if route != PageRoute::Checkin {
-        log.save_bytes("navigation_result.png", &bytes)?;
-        return Ok(NavigationResult { route });
-    }
-
-    for attempt in 0..4 {
-        if let Some(button) = vision::find_colored_button(&image) {
-            let analysis = vision::classify_button(&image, button);
-            if analysis.state != vision::ButtonState::Unknown {
-                log.save_bytes("navigation_result.png", &bytes)?;
-                return Ok(NavigationResult {
-                    route: PageRoute::Checkin,
-                });
+    if route == PageRoute::Checkin && checkin_mode == CheckinMode::Ordinary {
+        // Ordinary check-in requires hierarchy evidence plus a visible button
+        // candidate. If the button is below the fold, a bounded non-clicking
+        // scroll is allowed only while route and mode remain confirmed.
+        let mut visible_state = vision::ButtonState::Unknown;
+        for attempt in 0..4 {
+            let button = vision::find_colored_button(&image)
+                .unwrap_or_else(|| vision::fallback_button(&image, profile));
+            visible_state = vision::classify_button(&image, button).state;
+            if visible_state != vision::ButtonState::Unknown || attempt == 3 {
+                break;
+            }
+            device.swipe(
+                image.width() / 2,
+                image.height() * 3 / 4,
+                image.width() / 2,
+                image.height() / 4,
+                500,
+            )?;
+            thread::sleep(Duration::from_secs(1));
+            bytes = device.screenshot()?;
+            image = vision::decode(&bytes)?;
+            xml = device.dump_hierarchy()?;
+            route = detect_page_route(&xml);
+            checkin_mode = if route == PageRoute::Checkin {
+                detect_checkin_mode(&xml)
+            } else {
+                CheckinMode::Unsupported
+            };
+            if route != PageRoute::Checkin || checkin_mode != CheckinMode::Ordinary {
+                break;
             }
         }
-        let fallback = vision::fallback_button(&image, profile);
-        if vision::classify_button(&image, fallback).state != vision::ButtonState::Unknown {
-            log.save_bytes("navigation_result.png", &bytes)?;
-            return Ok(NavigationResult {
-                route: PageRoute::Checkin,
-            });
-        }
-        if !navigated || attempt == 3 {
-            break;
-        }
-        // Some landscape WebView layouts render the check-in circle below the
-        // initial viewport. Scroll only after selecting the check-in tile;
-        // this cannot activate the sign-in control.
-        device.swipe(
-            image.width() / 2,
-            image.height() * 3 / 4,
-            image.width() / 2,
-            image.height() / 4,
-            500,
-        )?;
-        thread::sleep(Duration::from_secs(1));
-        bytes = device.screenshot()?;
-        image = vision::decode(&bytes)?;
-        route = detect_page_route(&device.dump_hierarchy().unwrap_or_default());
-        if route != PageRoute::Checkin {
-            break;
+        if visible_state == vision::ButtonState::Unknown {
+            route = PageRoute::Unknown;
         }
     }
     log.save_bytes("navigation_result.png", &bytes)?;
-    Ok(NavigationResult { route })
+    Ok(NavigationResult {
+        route,
+        checkin_mode,
+        field_work_ready: checkin_mode == CheckinMode::FieldWork
+            && xml.contains("未签到")
+            && xml.contains("外勤签到"),
+    })
 }
 
 #[allow(dead_code)]
@@ -1753,7 +2313,10 @@ mod tests {
         detect_page_route, find_clickable_labeled_bounds, find_labeled_bounds, guarded_tap,
         restore_sync_backup,
     };
-    use crate::{domain::Mode, vision::ButtonState};
+    use crate::{
+        domain::{CheckinMode, Mode},
+        vision::ButtonState,
+    };
     use anyhow::Result;
     use std::{
         cell::{Cell, RefCell},
@@ -1794,9 +2357,98 @@ mod tests {
             detect_page_route(r#"<node text="晚点名签到"/><node text="无法签到"/>"#),
             PageRoute::Checkin
         );
+        assert_eq!(
+            detect_page_route(
+                r#"<node text="晚点名签到"/><node text="未签到"/><node text="外勤签到"/><node text="当前位置"/>"#
+            ),
+            PageRoute::Checkin
+        );
+        assert_eq!(
+            detect_page_route(r#"<node text="我的服务"/><node text="外勤签到"/>"#),
+            PageRoute::Home
+        );
         assert_eq!(detect_page_route("<hierarchy />"), PageRoute::Unknown);
     }
 
+    #[test]
+    fn page_route_prioritizes_home_and_services_over_checkin_card_status_words() {
+        assert_eq!(
+            detect_page_route(
+                r#"<node text="我的服务"/><node text="晚点名签到"/><node text="已签到"/>"#
+            ),
+            PageRoute::Home
+        );
+        assert_eq!(
+            detect_page_route(r#"<node text="业务"/><node text="签到成功"/>"#),
+            PageRoute::Services
+        );
+        assert!(super::is_navigable_catalog_route(PageRoute::Home));
+        assert!(super::is_navigable_catalog_route(PageRoute::Services));
+        assert!(!super::is_navigable_catalog_route(PageRoute::Unknown));
+        assert!(!super::is_navigable_catalog_route(PageRoute::Login));
+        assert!(!super::is_navigable_catalog_route(PageRoute::Checkin));
+    }
+    #[test]
+    fn checkin_action_or_success_words_without_page_title_remain_unknown() {
+        assert_eq!(
+            detect_page_route(r#"<node text="点击签到"/>"#),
+            PageRoute::Unknown
+        );
+        assert_eq!(
+            detect_page_route(r#"<node text="已签到"/>"#),
+            PageRoute::Unknown
+        );
+        assert_eq!(
+            detect_page_route(
+                r#"<node text="外勤签到"/><node text="未签到"/><node text="当前位置"/>"#
+            ),
+            PageRoute::Unknown
+        );
+    }
+    #[test]
+    fn checkin_mode_is_distinct_from_visual_color() {
+        assert_eq!(
+            super::detect_checkin_mode(
+                r#"<node text="晚点名签到"/><node text="未签到"/><node text="外勤签到"/>"#
+            ),
+            CheckinMode::FieldWork
+        );
+        assert_eq!(
+            super::detect_checkin_mode(r#"<node text="无法签到"/><node text="点击签到"/>"#),
+            CheckinMode::Ordinary
+        );
+        assert_eq!(
+            super::detect_checkin_mode("<hierarchy />"),
+            CheckinMode::Unsupported
+        );
+    }
+
+    #[test]
+    fn success_date_parser_supports_chinese_and_numeric_formats() {
+        assert_eq!(
+            super::extract_hierarchy_date(r#"<node text="签到成功：2026年10月10日"/>"#),
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 10)
+        );
+        assert_eq!(
+            super::extract_hierarchy_date(r#"<node text="日期 2026-10-10"/>"#),
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 10)
+        );
+        assert_eq!(
+            super::extract_hierarchy_date(r#"<node text="没有日期"/>"#),
+            None
+        );
+    }
+
+    #[test]
+    fn unrelated_update_date_is_not_accepted_as_success_date() {
+        let hierarchy = r#"<node text="签到成功"/><node text="上次更新 2026-10-11"/>"#;
+        assert_eq!(super::extract_hierarchy_date(hierarchy), None);
+    }
+    #[test]
+    fn hierarchy_date_is_unknown_when_success_and_unrelated_dates_conflict() {
+        let hierarchy = r#"<node text="2026年10月11日"/><node text="签到成功：2026年10月10日"/>"#;
+        assert_eq!(super::extract_hierarchy_date(hierarchy), None);
+    }
     #[test]
     fn gui_task_creation_targets_cli_companion() {
         assert_eq!(
@@ -1842,6 +2494,8 @@ mod tests {
     fn request(state: ButtonState) -> TapRequest {
         TapRequest {
             state,
+            route: PageRoute::Checkin,
+            checkin_mode: CheckinMode::Ordinary,
             mode: Mode::Live,
             explicit_confirmation: true,
             profile_calibrated: true,
@@ -1864,6 +2518,14 @@ mod tests {
         ] {
             assert!(!guarded_tap(&device, request(state)).unwrap());
         }
+
+        let mut field_work = request(ButtonState::Ready);
+        field_work.checkin_mode = CheckinMode::FieldWork;
+        assert!(guarded_tap(&device, field_work).is_err());
+
+        let mut wrong_route = request(ButtonState::Ready);
+        wrong_route.route = PageRoute::Home;
+        assert!(guarded_tap(&device, wrong_route).is_err());
 
         let mut not_stable = request(ButtonState::Ready);
         not_stable.ready_frames = 1;

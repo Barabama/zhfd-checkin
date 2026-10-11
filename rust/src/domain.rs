@@ -1,11 +1,114 @@
 use anyhow::{Result, bail};
-use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     DryRun,
     Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageRoute {
+    Login,
+    Home,
+    Services,
+    Checkin,
+    Unknown,
+}
+
+impl PageRoute {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Home => "home",
+            Self::Services => "services",
+            Self::Checkin => "checkin",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckinMode {
+    Ordinary,
+    FieldWork,
+    Unsupported,
+}
+
+impl CheckinMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::FieldWork => "field_work",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckinState {
+    Gray,
+    Locating,
+    Ready,
+    SuccessToday,
+    SuccessStale,
+    SuccessDateUnknown,
+    FieldWorkReady,
+    Unknown,
+}
+
+impl CheckinState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gray => "gray",
+            Self::Locating => "locating",
+            Self::Ready => "ready",
+            Self::SuccessToday => "success_today",
+            Self::SuccessStale => "success_stale",
+            Self::SuccessDateUnknown => "success_date_unknown",
+            Self::FieldWorkReady => "field_work_ready",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConsecutiveUnknown {
+    count: u32,
+}
+
+impl ConsecutiveUnknown {
+    pub fn observe(&mut self, is_unknown: bool) -> u32 {
+        if is_unknown {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.count = 0;
+        }
+        self.count
+    }
+
+    pub fn reset(&mut self) {
+        self.count = 0;
+    }
+
+    #[cfg(test)]
+    pub fn count(self) -> u32 {
+        self.count
+    }
+}
+
+pub fn authorize_page_action(route: PageRoute, checkin_mode: CheckinMode) -> Result<()> {
+    if route != PageRoute::Checkin {
+        bail!("页面路线未确认为签到页，禁止签到动作");
+    }
+    if checkin_mode != CheckinMode::Ordinary {
+        bail!("仅支持普通签到模式，外勤/未知模式禁止自动点击");
+    }
+    Ok(())
 }
 
 impl Mode {
@@ -36,6 +139,14 @@ pub enum ExitCode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub finished_at: Option<String>,
     pub mode: String,
     #[serde(default)]
     pub instance_index: Option<u32>,
@@ -43,11 +154,38 @@ pub struct RunResult {
     pub instance_name: Option<String>,
     pub serial: String,
     pub profile_id: Option<String>,
+    #[serde(default)]
+    pub screen_width: Option<u32>,
+    #[serde(default)]
+    pub screen_height: Option<u32>,
+    #[serde(default)]
+    pub density_dpi: Option<u32>,
     pub state_history: Vec<String>,
     pub clicked: bool,
     pub success: bool,
     pub dry_run_ready: bool,
+    #[serde(default)]
+    pub field_work_ready: bool,
+    #[serde(default)]
+    pub page_route: Option<PageRoute>,
+    #[serde(default)]
+    pub checkin_mode: Option<CheckinMode>,
+    #[serde(default)]
+    pub checkin_state: Option<CheckinState>,
+    #[serde(default)]
+    pub success_date: Option<String>,
+    #[serde(default)]
+    pub error_stage: Option<String>,
+    #[serde(default)]
+    pub recovery_action: Option<String>,
+    #[serde(default)]
+    pub artifact_paths: Vec<String>,
     pub error: Option<String>,
+}
+
+pub fn configured_date(timezone: &str) -> Result<NaiveDate> {
+    let offset = timezone_offset(timezone)?;
+    Ok(Utc::now().with_timezone(&offset).date_naive())
 }
 
 pub fn in_window(start: &str, end: &str, now: NaiveTime) -> Result<bool> {
@@ -72,6 +210,10 @@ pub fn in_configured_window(start: &str, end: &str, timezone: &str) -> Result<bo
 /// configured window ends. `None` means the current time is outside the
 /// window. Keeping this calculation here makes the run loop testable without
 /// depending on the host timezone or wall clock.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "reserved for bounded scheduled waiting")
+)]
 pub fn seconds_until_configured_window_end(
     start: &str,
     end: &str,
@@ -82,6 +224,10 @@ pub fn seconds_until_configured_window_end(
     seconds_until_configured_window_end_at(start, end, now)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "reserved for bounded scheduled waiting")
+)]
 pub fn seconds_until_configured_window_end_at(
     start: &str,
     end: &str,
@@ -118,6 +264,10 @@ fn timezone_offset(timezone: &str) -> Result<FixedOffset> {
     .ok_or_else(|| anyhow::anyhow!("无效 UTC offset"))
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the scheduled-window helper tests")
+)]
 fn in_window_values(start: NaiveTime, end: NaiveTime, now: NaiveTime) -> bool {
     if start <= end {
         now >= start && now <= end
@@ -200,6 +350,36 @@ mod tests {
         assert!(!in_window("23:30", "00:30", time(12, 0)).unwrap());
     }
 
+    #[test]
+    fn page_action_authorization_requires_checkin_ordinary_context() {
+        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::Ordinary).is_ok());
+        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::FieldWork).is_err());
+        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::Unsupported).is_err());
+        assert!(authorize_page_action(PageRoute::Home, CheckinMode::Ordinary).is_err());
+    }
+
+    #[test]
+    fn consecutive_unknown_counter_resets_after_any_known_state() {
+        let mut tracker = ConsecutiveUnknown::default();
+        assert_eq!(tracker.observe(true), 1);
+        assert_eq!(tracker.observe(true), 2);
+        assert_eq!(tracker.observe(false), 0);
+        assert_eq!(tracker.observe(true), 1);
+        tracker.reset();
+        assert_eq!(tracker.count(), 0);
+    }
+
+    #[test]
+    fn interleaved_known_frames_reset_unknown_threshold_to_contiguous_run_only() {
+        let mut tracker = ConsecutiveUnknown::default();
+        assert_eq!(tracker.observe(true), 1);
+        assert_eq!(tracker.observe(false), 0); // gray / locating / ready all reset
+        assert_eq!(tracker.observe(true), 1);
+        assert_eq!(tracker.observe(false), 0);
+        assert_eq!(tracker.observe(true), 1);
+        assert_eq!(tracker.observe(true), 2);
+        assert_eq!(tracker.observe(true), 3);
+    }
     #[test]
     fn rejects_invalid_window_time() {
         assert!(in_window("25:00", "23:59", time(22, 0)).is_err());
