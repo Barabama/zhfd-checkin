@@ -380,6 +380,80 @@ impl ConfigStore {
         self.created_default = false;
         Ok(())
     }
+
+    /// Copy this complete data root to a user-selected directory without
+    /// changing the current store until the destination has a valid config.
+    pub fn migrate_to_root(&self, destination: &Path) -> Result<Self> {
+        let destination = if destination.is_absolute() {
+            destination.to_path_buf()
+        } else {
+            env::current_dir()?.join(destination)
+        };
+        if destination == self.root {
+            anyhow::bail!("目标数据目录与当前目录相同: {}", destination.display());
+        }
+        if is_path_within(&destination, &self.root) || is_path_within(&self.root, &destination) {
+            anyhow::bail!(
+                "目标数据目录不能是当前目录的父目录或子目录: {}",
+                destination.display()
+            );
+        }
+        ensure_runtime_dirs(&destination)?;
+        if self.path.is_file() {
+            // Keep a recoverable source copy before beginning migration.
+            create_config_backup(&self.root, &self.path)?;
+        }
+        for name in ["logs", "captures", "reports", "backups"] {
+            copy_tree_if_missing(&self.root.join(name), &destination.join(name))
+                .with_context(|| format!("迁移 {} 目录失败", name))?;
+        }
+        let destination_config = destination.join("config.toml");
+        write_config(&destination, &destination_config, &self.config)?;
+        let origin = if local_app_data_root().as_deref() == Some(destination.as_path()) {
+            ConfigOrigin::LocalAppData
+        } else {
+            ConfigOrigin::Explicit
+        };
+        Self::load_root(destination, destination_config, origin, false)
+    }
+}
+
+fn is_path_within(candidate: &Path, parent: &Path) -> bool {
+    let candidate = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.to_path_buf());
+    let parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    candidate.starts_with(parent)
+}
+
+fn copy_tree_if_missing(source: &Path, destination: &Path) -> Result<()> {
+    if !source.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_tree_if_missing(&source_path, &destination_path)?;
+        } else if !destination_path.exists() {
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "复制文件失败: {} -> {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub fn recommended_local_app_data_root() -> Option<PathBuf> {
+    local_app_data_root()
 }
 
 fn local_app_data_root() -> Option<PathBuf> {
@@ -687,6 +761,41 @@ mod tests {
             7
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migrate_to_root_copies_data_and_keeps_source() {
+        let source =
+            std::env::temp_dir().join(format!("zhfd-migrate-source-{}", std::process::id()));
+        let destination =
+            std::env::temp_dir().join(format!("zhfd-migrate-destination-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&destination);
+        fs::create_dir_all(source.join("logs")).unwrap();
+        fs::write(
+            source.join("config.toml"),
+            toml::to_string_pretty(&Config::default()).unwrap(),
+        )
+        .unwrap();
+        fs::write(source.join("logs/example.txt"), "evidence").unwrap();
+        let store = ConfigStore {
+            root: source.clone(),
+            path: source.join("config.toml"),
+            config: Config::default(),
+            origin: ConfigOrigin::Explicit,
+            created_default: false,
+            recovery_error: None,
+        };
+        let migrated = store.migrate_to_root(&destination).unwrap();
+        assert_eq!(migrated.root, destination);
+        assert!(migrated.path.is_file());
+        assert_eq!(
+            fs::read_to_string(destination.join("logs/example.txt")).unwrap(),
+            "evidence"
+        );
+        assert!(source.join("config.toml").is_file());
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(destination);
     }
 
     #[test]

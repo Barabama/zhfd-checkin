@@ -294,6 +294,7 @@ pub(crate) struct InstanceSummary {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub dpi: Option<u32>,
+    pub profile_id: Option<String>,
     pub configured: bool,
     pub enabled: bool,
 }
@@ -332,6 +333,13 @@ pub(crate) fn list_instance_summaries(store: &ConfigStore) -> Result<Vec<Instanc
                 width: instance.width,
                 height: instance.height,
                 dpi: instance.dpi,
+                profile_id: instance
+                    .width
+                    .zip(instance.height)
+                    .zip(instance.dpi)
+                    .and_then(|((width, height), dpi)| {
+                        profile::find_profile(width, height, dpi).map(|item| item.id.to_string())
+                    }),
                 configured: configured.is_some(),
                 enabled: configured.is_some_and(|item| item.enabled),
             })

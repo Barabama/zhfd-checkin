@@ -54,6 +54,13 @@ pub struct LogSummary {
     pub summary: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct EventSummary {
+    pub at: String,
+    pub kind: String,
+    pub summary: String,
+}
+
 #[derive(Debug, Serialize)]
 struct Event<'a, T: Serialize> {
     at: String,
@@ -181,6 +188,74 @@ pub fn write_diagnostic_report(store: &ConfigStore) -> Result<PathBuf> {
     fs::write(&path, serde_json::to_vec_pretty(&report)?)
         .with_context(|| format!("写入诊断报告失败: {}", path.display()))?;
     Ok(path)
+}
+
+pub fn read_recent_events(dir: &Path, limit: usize) -> Result<Vec<EventSummary>> {
+    let path = dir.join("events.jsonl");
+    if !path.is_file() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut events = Vec::new();
+    for line in fs::read_to_string(&path)?.lines() {
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let at = value
+            .get("at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let kind = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let data = value
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let summary = event_summary(&kind, &data);
+        events.push(EventSummary { at, kind, summary });
+    }
+    let start = events.len().saturating_sub(limit);
+    Ok(events.into_iter().skip(start).collect())
+}
+
+fn event_summary(kind: &str, data: &serde_json::Value) -> String {
+    let field = |name: &str| data.get(name).map(value_summary).unwrap_or_default();
+    match kind {
+        "hierarchy_observation" => format!(
+            "stage={} status={} bytes={} markers={}",
+            field("stage"),
+            field("status"),
+            field("bytes"),
+            field("marker_summary")
+        ),
+        "foreground_snapshot" => format!(
+            "stage={} package={} error={}",
+            field("stage"),
+            field("package"),
+            field("error")
+        ),
+        "page_route" => format!("route={}", field("route")),
+        "state" => format!(
+            "button={} coverage={}",
+            field("state"),
+            field("color_coverage")
+        ),
+        "home_scroll" => format!("attempt={}", field("attempt")),
+        "clicked_ready" => format!("x={} y={}", field("x"), field("y")),
+        _ => serde_json::to_string(data).unwrap_or_else(|_| "{}".into()),
+    }
+}
+
+fn value_summary(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Null => "unknown".into(),
+        other => other.to_string(),
+    }
 }
 
 pub fn recent_logs(root: &Path, limit: usize) -> Result<Vec<LogSummary>> {
