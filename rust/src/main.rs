@@ -2152,6 +2152,17 @@ fn locate_or_navigate(
             if !is_navigable_catalog_route(route) {
                 break;
             }
+            let route_after_scroll = detect_page_route(&xml);
+            if matches!(
+                route_after_scroll,
+                PageRoute::Checkin | PageRoute::UnsupportedCheckin
+            ) {
+                let current_bytes = device.screenshot()?;
+                log.save_bytes("navigation_result.png", &current_bytes)?;
+                return Ok(NavigationResult {
+                    route: route_after_scroll,
+                });
+            }
             if let Some((x, y)) = find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y)
             {
                 device.tap(x, y)?;
@@ -2179,6 +2190,17 @@ fn locate_or_navigate(
         for attempt in 0..6 {
             if !is_navigable_catalog_route(detect_page_route(&xml)) {
                 break;
+            }
+            let route_after_services_scan = detect_page_route(&page_xml);
+            if matches!(
+                route_after_services_scan,
+                PageRoute::Checkin | PageRoute::UnsupportedCheckin
+            ) {
+                let current_bytes = device.screenshot()?;
+                log.save_bytes("navigation_result.png", &current_bytes)?;
+                return Ok(NavigationResult {
+                    route: route_after_services_scan,
+                });
             }
             if let Some((entry_x, entry_y)) =
                 find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y)

@@ -408,6 +408,12 @@ impl ConfigStore {
                 .with_context(|| format!("迁移 {} 目录失败", name))?;
         }
         let destination_config = destination.join("config.toml");
+        if destination_config.is_file() {
+            anyhow::bail!(
+                "目标数据目录已有 config.toml，迁移已停止且未覆盖目标配置: {}",
+                destination_config.display()
+            );
+        }
         write_config(&destination, &destination_config, &self.config)?;
         let origin = if local_app_data_root().as_deref() == Some(destination.as_path()) {
             ConfigOrigin::LocalAppData
@@ -810,7 +816,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "OPEN P1: migration replaces an existing destination config; needs product decision"]
     fn audit_migration_must_not_silently_replace_existing_destination_config() {
         let source = std::env::temp_dir().join(format!(
             "zhfd-audit-mig-src-{}-{}",
