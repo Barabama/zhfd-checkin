@@ -275,7 +275,15 @@ pub fn recent_logs(root: &Path, limit: usize) -> Result<Vec<LogSummary>> {
         let sync_path = dir.join("sync.json");
         let run_path = dir.join("result.json");
         if sync_path.is_file() {
-            let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&sync_path)?)?;
+            // A single truncated or partially written artifact must not hide the
+            // whole log list; skip unreadable entries and keep the rest.
+            let value: serde_json::Value = match fs::read_to_string(&sync_path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+            {
+                Some(value) => value,
+                None => continue,
+            };
             let profile = value
                 .get("profile_id")
                 .and_then(serde_json::Value::as_str)
@@ -300,7 +308,13 @@ pub fn recent_logs(root: &Path, limit: usize) -> Result<Vec<LogSummary>> {
                 summary,
             });
         } else if run_path.is_file() {
-            let result: RunResult = serde_json::from_str(&fs::read_to_string(&run_path)?)?;
+            let result: RunResult = match fs::read_to_string(&run_path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+            {
+                Some(result) => result,
+                None => continue,
+            };
             let profile = result.profile_id.as_deref().unwrap_or("unknown");
             let status = if result.success {
                 "success"
@@ -443,6 +457,131 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // ===== v0.3.0 independent audit counterexamples =====
+
+    #[test]
+    fn audit_v02_result_json_remains_readable() {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-audit-v02-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("logs/2026-10-11_221046_211_7940");
+        fs::create_dir_all(&dir).unwrap();
+        // Representative v0.2 result.json (contains fields removed in v0.3).
+        let v02 = serde_json::json!({
+            "schema_version": 2,
+            "run_id": "2026-10-11_221046_211_7940",
+            "started_at": "2026-10-11T22:10:46+08:00",
+            "finished_at": "2026-10-11T22:10:56+08:00",
+            "mode": "dry-run",
+            "instance_index": 1,
+            "instance_name": "签到实例 1",
+            "serial": "127.0.0.1:5557",
+            "profile_id": "portrait_900x1600_d320",
+            "screen_width": 900,
+            "screen_height": 1600,
+            "density_dpi": 320,
+            "state_history": ["ready", "ready"],
+            "clicked": false,
+            "success": false,
+            "dry_run_ready": true,
+            "field_work_ready": false,
+            "page_route": "checkin",
+            "checkin_mode": "ordinary",
+            "checkin_state": "ready",
+            "success_date": null,
+            "error_stage": null,
+            "recovery_action": null,
+            "artifact_paths": ["D:\\logs\\x\\result.json"],
+            "error": null
+        });
+        fs::write(
+            dir.join("result.json"),
+            serde_json::to_vec_pretty(&v02).unwrap(),
+        )
+        .unwrap();
+        let loaded = latest_result(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let (_, result) = loaded.expect("v0.2 result.json 无法读取");
+        assert!(result.dry_run_ready);
+        assert_eq!(result.serial, "127.0.0.1:5557");
+    }
+
+    #[test]
+    fn audit_one_corrupt_result_json_must_not_hide_all_logs() {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-audit-corrupt-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let good = root.join("logs/2026-10-11_010000_000_1");
+        let bad = root.join("logs/2026-10-11_020000_000_1");
+        fs::create_dir_all(&good).unwrap();
+        fs::create_dir_all(&bad).unwrap();
+        let result = RunResult {
+            schema_version: 3,
+            run_id: "good".into(),
+            started_at: String::new(),
+            finished_at: None,
+            mode: "dry-run".into(),
+            status: Some("failed".into()),
+            blocked_by: None,
+            error_code: Some("navigation_not_confirmed".into()),
+            instance_index: Some(0),
+            instance_name: Some("one".into()),
+            serial: "127.0.0.1:5555".into(),
+            profile_id: None,
+            screen_width: None,
+            screen_height: None,
+            density_dpi: None,
+            state_history: vec![],
+            clicked: false,
+            success: false,
+            dry_run_ready: false,
+            field_work_ready: false,
+            page_route: Some(crate::domain::PageRoute::Unknown),
+            checkin_mode: Some(crate::domain::CheckinMode::Unsupported),
+            checkin_state: Some(crate::domain::CheckinState::Unknown),
+            success_date: None,
+            error_stage: Some("navigation".into()),
+            recovery_action: None,
+            artifact_paths: Vec::new(),
+            route: Some("unknown".into()),
+            page_loading: None,
+            button_state: None,
+            location_state: None,
+            foreground_package: None,
+            app_version: Some("0.3.0".into()),
+            git_commit: Some("test".into()),
+            build_id: Some("0.3.0-test".into()),
+            error: Some("navigation_not_confirmed".into()),
+        };
+        fs::write(
+            good.join("result.json"),
+            serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
+        // A truncated / partially written result.json (e.g. process killed mid-write).
+        fs::write(bad.join("result.json"), b"{\"schema_version\":3,").unwrap();
+        let logs = recent_logs(&root, 10);
+        let _ = fs::remove_dir_all(&root);
+        match logs {
+            Ok(entries) => assert!(
+                entries.iter().any(|e| e.summary.contains("instance=0")),
+                "有效日志未出现在列表中"
+            ),
+            Err(error) => panic!("单个损坏 result.json 使整个日志列表失败: {error:#}"),
+        }
+    }
     #[test]
     fn latest_result_reads_newest_timestamped_log() {
         let root = std::env::temp_dir().join(format!("zhfd-logger-{}", std::process::id()));
@@ -525,17 +664,17 @@ mod tests {
             success: false,
             dry_run_ready: true,
             field_work_ready: false,
-            page_route: None,
-            checkin_mode: None,
-            checkin_state: None,
+            page_route: Some(crate::domain::PageRoute::Checkin),
+            checkin_mode: Some(crate::domain::CheckinMode::Ordinary),
+            checkin_state: Some(crate::domain::CheckinState::Ready),
             success_date: None,
             error_stage: None,
             recovery_action: None,
             artifact_paths: Vec::new(),
-            route: None,
-            page_loading: None,
-            button_state: None,
-            location_state: None,
+            route: Some("checkin".into()),
+            page_loading: Some(false),
+            button_state: Some("ready".into()),
+            location_state: Some("ready".into()),
             foreground_package: None,
             app_version: None,
             git_commit: None,

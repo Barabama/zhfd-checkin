@@ -419,13 +419,46 @@ impl ConfigStore {
 }
 
 fn is_path_within(candidate: &Path, parent: &Path) -> bool {
-    let candidate = candidate
-        .canonicalize()
-        .unwrap_or_else(|_| candidate.to_path_buf());
-    let parent = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
-    candidate.starts_with(parent)
+    // Canonicalize both sides together: a non-existent destination cannot be
+    // canonicalized, and mixing a canonicalized `\\?\` path with a raw path
+    // would never match, silently disabling the nesting guard.
+    match (candidate.canonicalize(), parent.canonicalize()) {
+        (Ok(candidate), Ok(parent)) => path_prefix_matches(&candidate, &parent),
+        _ => path_prefix_matches(
+            &lexically_normalize(candidate),
+            &lexically_normalize(parent),
+        ),
+    }
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn path_prefix_matches(candidate: &Path, parent: &Path) -> bool {
+    let candidate = candidate.to_string_lossy().replace('/', "\\");
+    let parent = parent.to_string_lossy().replace('/', "\\");
+    let candidate = candidate.trim_end_matches('\\');
+    let parent = parent.trim_end_matches('\\');
+    let (candidate, parent) = if cfg!(windows) {
+        (candidate.to_lowercase(), parent.to_lowercase())
+    } else {
+        (candidate.to_string(), parent.to_string())
+    };
+    candidate == parent
+        || candidate
+            .strip_prefix(&parent)
+            .is_some_and(|rest| rest.starts_with('\\'))
 }
 
 fn copy_tree_if_missing(source: &Path, destination: &Path) -> Result<()> {
@@ -763,6 +796,114 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    // ===== v0.3.0 independent audit counterexamples =====
+
+    fn audit_store(root: &Path, config: Config) -> ConfigStore {
+        ConfigStore {
+            root: root.to_path_buf(),
+            path: root.join("config.toml"),
+            config,
+            origin: ConfigOrigin::Explicit,
+            created_default: false,
+            recovery_error: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "OPEN P1: migration replaces an existing destination config; needs product decision"]
+    fn audit_migration_must_not_silently_replace_existing_destination_config() {
+        let source = std::env::temp_dir().join(format!(
+            "zhfd-audit-mig-src-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let destination = std::env::temp_dir().join(format!(
+            "zhfd-audit-mig-dst-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&destination);
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+
+        let mut source_config = Config::default();
+        source_config.runtime.stable_frames = 7;
+        fs::write(
+            source.join("config.toml"),
+            toml::to_string_pretty(&source_config).unwrap(),
+        )
+        .unwrap();
+
+        let mut destination_config = Config::default();
+        destination_config.runtime.stable_frames = 1;
+        fs::write(
+            destination.join("config.toml"),
+            toml::to_string_pretty(&destination_config).unwrap(),
+        )
+        .unwrap();
+
+        let store = audit_store(&source, source_config);
+        let result = store.migrate_to_root(&destination);
+
+        let destination_after = fs::read_to_string(destination.join("config.toml")).unwrap();
+        let parsed: Config = toml::from_str(&destination_after).unwrap();
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&destination);
+
+        // Safe expectation: an existing destination config is never silently
+        // replaced; migration must fail or preserve it pending user confirmation.
+        assert!(
+            result.is_err() || parsed.runtime.stable_frames == 1,
+            "迁移静默用源配置覆盖了目标目录已有 config.toml（stable_frames={}）",
+            parsed.runtime.stable_frames
+        );
+    }
+
+    #[test]
+    fn audit_explicit_invalid_config_is_not_silently_defaulted() {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-audit-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "[not valid toml").unwrap();
+        let result = ConfigStore::load_with_config_path(Some(&path));
+        let bytes_after = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert!(result.is_err(), "损坏的显式配置被静默接受");
+        assert_eq!(bytes_after, "[not valid toml", "损坏的显式配置被改写");
+    }
+
+    #[test]
+    fn audit_migration_rejects_child_and_parent_targets() {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-audit-nest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let store = audit_store(&root, Config::default());
+        assert!(store.migrate_to_root(&root.join("child")).is_err());
+        assert!(store.migrate_to_root(root.parent().unwrap()).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
     #[test]
     fn migrate_to_root_copies_data_and_keeps_source() {
         let source =

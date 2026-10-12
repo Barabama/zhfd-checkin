@@ -425,6 +425,7 @@ fn explain_error(error: &str) -> &'static str {
         }
         "foreground_query_failed" => "无法读取前台应用；安全策略阻止继续操作。",
         "route_candidate_unconfirmed" => "页面截图仅能形成候选，层级证据未确认；未执行点击。",
+        "unsupported_checkin_mode" => "当前是外勤或其他不支持的签到页面；未执行点击。",
         "route_evidence_conflict" => "页面截图与层级证据冲突；安全策略阻止继续操作。",
         "ready_confirmation_failed" => "点击前二次 ready 确认失败；未执行点击。",
         "unknown_profile" => "设备分辨率/DPI 没有精确 profile；未执行点击。",
