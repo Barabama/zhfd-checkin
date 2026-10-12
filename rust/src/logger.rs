@@ -556,6 +556,9 @@ mod tests {
             recovery_action: None,
             artifact_paths: Vec::new(),
             route: Some("unknown".into()),
+            page_refresh_attempted: None,
+            page_refresh_confirmed: None,
+
             page_loading: None,
             button_state: None,
             location_state: None,
@@ -617,6 +620,9 @@ mod tests {
             recovery_action: None,
             artifact_paths: Vec::new(),
             route: None,
+            page_refresh_attempted: None,
+            page_refresh_confirmed: None,
+
             page_loading: None,
             button_state: None,
             location_state: None,
@@ -672,6 +678,9 @@ mod tests {
             recovery_action: None,
             artifact_paths: Vec::new(),
             route: Some("checkin".into()),
+            page_refresh_attempted: Some(false),
+            page_refresh_confirmed: Some(false),
+
             page_loading: Some(false),
             button_state: Some("ready".into()),
             location_state: Some("ready".into()),

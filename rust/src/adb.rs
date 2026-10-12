@@ -174,6 +174,11 @@ impl AdbDevice {
         Ok(())
     }
 
+    pub fn back(&self) -> Result<()> {
+        self.shell(&["input", "keyevent", "4"])?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn swipe(&self, x1: u32, y1: u32, x2: u32, y2: u32, duration_ms: u32) -> Result<()> {
         self.shell(&[

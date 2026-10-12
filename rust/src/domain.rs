@@ -193,6 +193,11 @@ pub struct RunResult {
     #[serde(default)]
     pub route: Option<String>,
     #[serde(default)]
+    pub page_refresh_attempted: Option<bool>,
+    #[serde(default)]
+    pub page_refresh_confirmed: Option<bool>,
+    #[serde(default)]
+    #[serde(default)]
     pub page_loading: Option<bool>,
     #[serde(default)]
     pub button_state: Option<String>,
@@ -212,6 +217,11 @@ pub struct RunResult {
 pub fn configured_date(timezone: &str) -> Result<NaiveDate> {
     let offset = timezone_offset(timezone)?;
     Ok(Utc::now().with_timezone(&offset).date_naive())
+}
+
+pub fn today_iso_date(timezone: &str) -> Result<String> {
+    Ok(configured_date(timezone)?.format("%Y-%m-%d").to_string())
+}
 }
 
 pub fn in_window(start: &str, end: &str, now: NaiveTime) -> Result<bool> {
