@@ -54,6 +54,7 @@ pub struct LogSummary {
     pub summary: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct EventSummary {
     pub at: String,
@@ -190,6 +191,7 @@ pub fn write_diagnostic_report(store: &ConfigStore) -> Result<PathBuf> {
     Ok(path)
 }
 
+#[allow(dead_code)]
 pub fn read_recent_events(dir: &Path, limit: usize) -> Result<Vec<EventSummary>> {
     let path = dir.join("events.jsonl");
     if !path.is_file() || limit == 0 {
@@ -222,6 +224,7 @@ pub fn read_recent_events(dir: &Path, limit: usize) -> Result<Vec<EventSummary>>
     Ok(events.into_iter().skip(start).collect())
 }
 
+#[allow(dead_code)]
 fn event_summary(kind: &str, data: &serde_json::Value) -> String {
     let field = |name: &str| data.get(name).map(value_summary).unwrap_or_default();
     match kind {
@@ -250,6 +253,7 @@ fn event_summary(kind: &str, data: &serde_json::Value) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn value_summary(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),

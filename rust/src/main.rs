@@ -1101,6 +1101,8 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
         error_stage: None,
         recovery_action: None,
         artifact_paths: Vec::new(),
+        page_refresh_attempted: Some(false),
+        page_refresh_confirmed: Some(false),
         route: None,
         page_loading: None,
         button_state: None,
@@ -1438,6 +1440,8 @@ where
     let navigation = locate_or_navigate(&device, profile, log)?;
     result.page_route = Some(navigation.route);
     result.checkin_mode = Some(navigation.checkin_mode);
+    result.page_refresh_attempted = Some(navigation.page_refresh_attempted);
+    result.page_refresh_confirmed = Some(navigation.page_refresh_confirmed);
     log.event(
         "page_observation",
         serde_json::json!({
@@ -2031,6 +2035,8 @@ struct NavigationResult {
     route: PageRoute,
     checkin_mode: CheckinMode,
     field_work_ready: bool,
+    page_refresh_attempted: bool,
+    page_refresh_confirmed: bool,
 }
 
 fn detect_checkin_mode(xml: &str) -> CheckinMode {
@@ -2108,16 +2114,48 @@ fn locate_or_navigate(
     let mut image = vision::decode(&bytes)?;
     let mut xml = device.dump_hierarchy()?;
     let initial_route = detect_page_route(&xml);
-    if matches!(initial_route, PageRoute::Login | PageRoute::Checkin) {
+    let mut page_refresh_attempted = false;
+    let mut page_refresh_confirmed = false;
+    if initial_route == PageRoute::Login {
         log.save_bytes("navigation_result.png", &bytes)?;
-        let checkin_mode = detect_checkin_mode(&xml);
         return Ok(NavigationResult {
             route: initial_route,
-            checkin_mode,
-            field_work_ready: checkin_mode == CheckinMode::FieldWork
-                && xml.contains("未签到")
-                && xml.contains("外勤签到"),
+            checkin_mode: CheckinMode::Unsupported,
+            field_work_ready: false,
+            page_refresh_attempted,
+            page_refresh_confirmed,
         });
+    }
+    if matches!(
+        initial_route,
+        PageRoute::Checkin | PageRoute::UnsupportedCheckin
+    ) {
+        page_refresh_attempted = true;
+        log.event("page_refresh", serde_json::json!({"reason":"checkin_page_at_start","before_route":initial_route.as_str(),"action":"back"}))?;
+        device.back()?;
+        thread::sleep(Duration::from_millis(800));
+        let fresh_xml = device.dump_hierarchy()?;
+        let fresh_route = detect_page_route(&fresh_xml);
+        page_refresh_confirmed = matches!(fresh_route, PageRoute::Home | PageRoute::Services);
+        log.event("page_refresh", serde_json::json!({"reason":"checkin_page_at_start","before_route":initial_route.as_str(),"after_route":fresh_route.as_str(),"confirmed":page_refresh_confirmed}))?;
+        if !page_refresh_confirmed {
+            let route = if fresh_route == PageRoute::Unknown {
+                PageRoute::RouteCandidateUnconfirmed
+            } else {
+                PageRoute::RouteEvidenceConflict
+            };
+            log.save_bytes("navigation_result.png", &bytes)?;
+            return Ok(NavigationResult {
+                route,
+                checkin_mode: CheckinMode::Unsupported,
+                field_work_ready: false,
+                page_refresh_attempted,
+                page_refresh_confirmed,
+            });
+        }
+        xml = fresh_xml;
+        bytes = device.screenshot()?;
+        image = vision::decode(&bytes)?;
     }
 
     let min_entry_y = image.height() / 8;
@@ -2161,6 +2199,14 @@ fn locate_or_navigate(
                 log.save_bytes("navigation_result.png", &current_bytes)?;
                 return Ok(NavigationResult {
                     route: route_after_scroll,
+                    checkin_mode: if route_after_scroll == PageRoute::Checkin {
+                        detect_checkin_mode(&xml)
+                    } else {
+                        CheckinMode::Unsupported
+                    },
+                    field_work_ready: false,
+                    page_refresh_attempted,
+                    page_refresh_confirmed,
                 });
             }
             if let Some((x, y)) = find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y)
@@ -2191,7 +2237,7 @@ fn locate_or_navigate(
             if !is_navigable_catalog_route(detect_page_route(&xml)) {
                 break;
             }
-            let route_after_services_scan = detect_page_route(&page_xml);
+            let route_after_services_scan = detect_page_route(&xml);
             if matches!(
                 route_after_services_scan,
                 PageRoute::Checkin | PageRoute::UnsupportedCheckin
@@ -2200,6 +2246,14 @@ fn locate_or_navigate(
                 log.save_bytes("navigation_result.png", &current_bytes)?;
                 return Ok(NavigationResult {
                     route: route_after_services_scan,
+                    checkin_mode: if route_after_services_scan == PageRoute::Checkin {
+                        detect_checkin_mode(&xml)
+                    } else {
+                        CheckinMode::Unsupported
+                    },
+                    field_work_ready: false,
+                    page_refresh_attempted,
+                    page_refresh_confirmed,
                 });
             }
             if let Some((entry_x, entry_y)) =
@@ -2286,28 +2340,9 @@ fn locate_or_navigate(
         field_work_ready: checkin_mode == CheckinMode::FieldWork
             && xml.contains("未签到")
             && xml.contains("外勤签到"),
+        page_refresh_attempted,
+        page_refresh_confirmed,
     })
-}
-
-fn log_foreground_snapshot(device: &adb::AdbDevice, log: &RunLog, stage: &str) -> Result<()> {
-    match device.current_package() {
-        Ok(package) => log.event(
-            "foreground_snapshot",
-            serde_json::json!({"stage":stage,"package":package}),
-        ),
-        Err(error) => log.event(
-            "foreground_snapshot",
-            serde_json::json!({"stage":stage,"error":format!("{error:#}")}),
-        ),
-    }
-}
-
-fn hierarchy_xml(device: &adb::AdbDevice, log: &RunLog, stage: &str) -> Result<(String, bool)> {
-    let observation = device.dump_hierarchy_observation(stage)?;
-    let ok = matches!(observation.status, adb::HierarchyStatus::DumpSucceeded);
-    log.event("hierarchy_observation", &observation)?;
-    let xml = observation.xml.unwrap_or_else(String::new);
-    Ok((xml, ok))
 }
 
 #[allow(dead_code)]

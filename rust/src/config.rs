@@ -191,6 +191,7 @@ impl Config {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     pub root: PathBuf,
@@ -208,6 +209,7 @@ pub enum ConfigOrigin {
     LocalAppData,
 }
 
+#[allow(dead_code)]
 impl ConfigStore {
     pub fn load() -> Result<Self> {
         Self::load_with_config_path(None)
@@ -424,6 +426,7 @@ impl ConfigStore {
     }
 }
 
+#[allow(dead_code)]
 fn is_path_within(candidate: &Path, parent: &Path) -> bool {
     // Canonicalize both sides together: a non-existent destination cannot be
     // canonicalized, and mixing a canonicalized `\\?\` path with a raw path
@@ -437,6 +440,7 @@ fn is_path_within(candidate: &Path, parent: &Path) -> bool {
     }
 }
 
+#[allow(dead_code)]
 fn lexically_normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -451,6 +455,7 @@ fn lexically_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
+#[allow(dead_code)]
 fn path_prefix_matches(candidate: &Path, parent: &Path) -> bool {
     let candidate = candidate.to_string_lossy().replace('/', "\\");
     let parent = parent.to_string_lossy().replace('/', "\\");
@@ -467,6 +472,7 @@ fn path_prefix_matches(candidate: &Path, parent: &Path) -> bool {
             .is_some_and(|rest| rest.starts_with('\\'))
 }
 
+#[allow(dead_code)]
 fn copy_tree_if_missing(source: &Path, destination: &Path) -> Result<()> {
     if !source.is_dir() {
         return Ok(());
@@ -491,6 +497,7 @@ fn copy_tree_if_missing(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn recommended_local_app_data_root() -> Option<PathBuf> {
     local_app_data_root()
 }

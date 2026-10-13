@@ -432,7 +432,6 @@ fn explain_error(error: &str) -> &'static str {
         "uncalibrated_profile" => "当前 profile 尚未完成生产标定；未执行点击。",
         "live_confirmation_required" => "正式模式需要同时指定 --live --confirm；未执行点击。",
         "field_work_live_unsupported" => "外勤签到目前仅支持 dry-run 观察；请在模拟器中人工完成。",
-        "unsupported_checkin_mode" => "无法确认签到业务类型；程序已停止且没有点击。",
         "field_work_observation_only" => "外勤页面已记录观察结果；请人工确认页面状态。",
         "click_authorization_failed" => "点击安全门禁未满足；程序没有继续点击。",
         "success_text_unconfirmed" => "页面视觉状态为成功，但层级文字未确认；请人工核对。",
