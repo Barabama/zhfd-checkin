@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
-    process::Output,
+    process::{Command, Output},
 };
 
 #[derive(Debug, Clone)]

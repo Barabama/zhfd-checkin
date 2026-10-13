@@ -209,6 +209,10 @@ pub enum ConfigOrigin {
 }
 
 impl ConfigStore {
+    pub fn load() -> Result<Self> {
+        Self::load_with_config_path(None)
+    }
+
     pub fn load_with_config_path(config_path: Option<&Path>) -> Result<Self> {
         if let Some(path) = config_path {
             let path = if path.is_absolute() {
