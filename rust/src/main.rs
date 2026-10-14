@@ -1988,6 +1988,20 @@ where
         set_run_failure(result, code, "navigation", &recovery);
         return Ok(ExitCode::VisionFailure);
     }
+    // Field work ("外勤签到") is reached from its own control and is a different
+    // business action from the ordinary evening check-in. It therefore has its
+    // own opt-in switch (`runtime.allow_field_work_live`) instead of being
+    // folded into the ordinary-mode gate:
+    //
+    //   dry-run  -> always observe only, never tap;
+    //   live     -> refused unless the operator opted in;
+    //   live+opt -> continue into the same observe/confirm/tap loop below.
+    //
+    // The opt-in never widens any other gate: route must still be the check-in
+    // page, the profile must be calibrated, the app must be in the foreground,
+    // the configured window must be open, the control must be Ready for the
+    // configured number of frames, and the pre-tap re-observation still runs.
+    let allow_field_work = store.config.runtime.allow_field_work_live;
     if navigation.checkin_mode == CheckinMode::FieldWork {
         result.error_stage = Some("field_work_observation".into());
         log.event(
@@ -1996,47 +2010,63 @@ where
                 "route": navigation.route.as_str(),
                 "mode": navigation.checkin_mode.as_str(),
                 "state": "observation_pending",
+                "allow_field_work_live": allow_field_work,
                 "clicked": false,
             }),
         )?;
-        if mode == Mode::Live {
+        if mode == Mode::Live && !allow_field_work {
             result.checkin_state = Some(CheckinState::Unknown);
             set_run_failure(
                 result,
                 "field_work_live_unsupported",
                 "click_authorization",
-                "外勤签到尚未开放自动点击；请在模拟器中人工确认并完成签到。",
+                "外勤签到自动点击未启用；请在 config.toml 设置 runtime.allow_field_work_live = true，或在模拟器中人工完成签到。",
             );
             return Ok(ExitCode::BusinessFailure);
         }
 
-        let bytes = device.screenshot()?;
-        log.save_bytes("field_work_observation.png", &bytes)?;
-        if navigation.field_work_ready {
-            result
-                .state_history
-                .push(CheckinState::FieldWorkReady.as_str().into());
-            result.checkin_state = Some(CheckinState::FieldWorkReady);
-            result.field_work_ready = true;
-            result.error_stage = None;
+        if mode == Mode::DryRun {
+            let bytes = device.screenshot()?;
+            log.save_bytes("field_work_observation.png", &bytes)?;
+            if navigation.field_work_ready {
+                result
+                    .state_history
+                    .push(CheckinState::FieldWorkReady.as_str().into());
+                result.checkin_state = Some(CheckinState::FieldWorkReady);
+                result.field_work_ready = true;
+                result.error_stage = None;
+                log.event(
+                    "field_work_visual_state",
+                    serde_json::json!({"state":"field_work_ready","clicked":false}),
+                )?;
+                return Ok(ExitCode::Ok);
+            }
+            result.checkin_state = Some(CheckinState::Unknown);
+            set_run_failure(
+                result,
+                "field_work_observation_only",
+                "field_work_observation",
+                "外勤页面状态无法从层级结构确认；仅保存 dry-run 截图，请人工确认并完成签到。",
+            );
             log.event(
                 "field_work_visual_state",
-                serde_json::json!({"state":"field_work_ready","clicked":false}),
+                serde_json::json!({"state":"unknown","clicked":false}),
             )?;
-            return Ok(ExitCode::Ok);
+            return Ok(ExitCode::BusinessFailure);
         }
-        result.checkin_state = Some(CheckinState::Unknown);
-        set_run_failure(
-            result,
-            "field_work_observation_only",
-            "field_work_observation",
-            "外勤页面状态无法从层级结构确认；仅保存 dry-run 截图，请人工确认并完成签到。",
-        );
+
+        // Live with the opt-in: fall through to the shared run loop. The loop
+        // re-observes the page and the foreground package before every state
+        // observation and before the tap, exactly as it does for ordinary mode.
         log.event(
-            "field_work_visual_state",
-            serde_json::json!({"state":"unknown","clicked":false}),
+            "field_work_live_authorized",
+            serde_json::json!({
+                "route": navigation.route.as_str(),
+                "mode": navigation.checkin_mode.as_str(),
+                "allow_field_work_live": true,
+                "clicked": false,
+            }),
         )?;
-        return Ok(ExitCode::BusinessFailure);
     }
 
     // Page route and mode remain explicit and are re-read before every state
@@ -2145,7 +2175,12 @@ where
                 );
                 break;
             }
+            // Ordinary check-in is always authorized on the check-in page.
             PageRoute::Checkin if current_mode == CheckinMode::Ordinary => {}
+            // Field work only reaches the loop when the operator opted in; if
+            // the page flips back to FieldWork mid-run without the opt-in it
+            // must stop here rather than being tapped.
+            PageRoute::Checkin if current_mode == CheckinMode::FieldWork && allow_field_work => {}
             PageRoute::Checkin => {
                 // Defensive fallback: observe_page_route normally classifies a
                 // confirmed check-in page as Ordinary or FieldWork. If a future
@@ -2155,7 +2190,11 @@ where
                     result,
                     "unsupported_checkin_mode",
                     "checkin_classification",
-                    "当前签到模式不是普通晚点名签到；程序已停止自动点击。",
+                    if current_mode == CheckinMode::FieldWork {
+                        "页面已切换到外勤签到，而其自动点击未启用；程序已停止自动点击。"
+                    } else {
+                        "当前签到模式不是普通晚点名签到；程序已停止自动点击。"
+                    },
                 );
                 break;
             }
@@ -2392,14 +2431,27 @@ where
                     set_run_failure(result, code, "click_authorization", recovery);
                     break;
                 }
-                if confirmed_mode != CheckinMode::Ordinary {
-                    // Still the check-in page, but no longer the ordinary mode:
-                    // the tap is not authorized for field work or unknown modes.
+                // The mode that authorizes the tap must match the mode this run
+                // was admitted with. Ordinary is always allowed; field work only
+                // when the operator opted in; anything else fails closed.
+                let mode_authorized = match confirmed_mode {
+                    CheckinMode::Ordinary => true,
+                    CheckinMode::FieldWork => allow_field_work,
+                    CheckinMode::Unsupported => false,
+                };
+                if !mode_authorized {
+                    // Still the check-in page, but no longer a mode this run may
+                    // tap: the tap is not authorized for an unconfirmed mode, nor
+                    // for field work without the explicit opt-in.
                     set_run_failure(
                         result,
                         "page_context_changed",
                         "click_authorization",
-                        "签到模式已不是普通晚点名签到；程序未执行点击，请确认页面后重试。",
+                        if confirmed_mode == CheckinMode::FieldWork {
+                            "页面已切换到外勤签到，而其自动点击未启用；程序未执行点击。"
+                        } else {
+                            "签到模式已无法确认；程序未执行点击，请确认页面后重试。"
+                        },
                     );
                     break;
                 }
@@ -2452,6 +2504,7 @@ where
                         state: confirm.state,
                         route: confirmed_route,
                         checkin_mode: confirmed_mode,
+                        allow_field_work: store.config.runtime.allow_field_work_live,
                         mode,
                         explicit_confirmation: args.confirm,
                         profile_calibrated: profile.calibrated,
@@ -2539,6 +2592,10 @@ struct TapRequest {
     state: vision::ButtonState,
     route: PageRoute,
     checkin_mode: CheckinMode,
+    /// Operator opt-in for tapping the field-work control
+    /// (`runtime.allow_field_work_live`). Carried through to
+    /// `authorize_page_action` so the policy decision lives in `domain`.
+    allow_field_work: bool,
     mode: Mode,
     explicit_confirmation: bool,
     profile_calibrated: bool,
@@ -2554,7 +2611,11 @@ fn guarded_tap<D: TapDevice>(device: &D, request: TapRequest) -> Result<bool> {
     if request.state != vision::ButtonState::Ready {
         return Ok(false);
     }
-    domain::authorize_page_action(request.route, request.checkin_mode)?;
+    domain::authorize_page_action(
+        request.route,
+        request.checkin_mode,
+        request.allow_field_work,
+    )?;
     domain::authorize_click(
         request.mode,
         request.explicit_confirmation,
@@ -4682,6 +4743,7 @@ mod tests {
             state,
             route: PageRoute::Checkin,
             checkin_mode: CheckinMode::Ordinary,
+            allow_field_work: false,
             mode: Mode::Live,
             explicit_confirmation: true,
             profile_calibrated: true,
@@ -4705,9 +4767,25 @@ mod tests {
             assert!(!guarded_tap(&device, request(state)).unwrap());
         }
 
+        // Field work stays denied while the operator has not opted in.
         let mut field_work = request(ButtonState::Ready);
         field_work.checkin_mode = CheckinMode::FieldWork;
         assert!(guarded_tap(&device, field_work).is_err());
+        assert!(device.taps.borrow().is_empty());
+
+        // With the opt-in the same request is authorized and taps once.
+        let mut field_work_allowed = request(ButtonState::Ready);
+        field_work_allowed.checkin_mode = CheckinMode::FieldWork;
+        field_work_allowed.allow_field_work = true;
+        assert!(guarded_tap(&device, field_work_allowed).unwrap());
+        assert_eq!(device.taps.borrow().len(), 1);
+
+        // An unconfirmed business mode is refused even with the opt-in.
+        let mut unsupported = request(ButtonState::Ready);
+        unsupported.checkin_mode = CheckinMode::Unsupported;
+        unsupported.allow_field_work = true;
+        assert!(guarded_tap(&device, unsupported).is_err());
+        assert_eq!(device.taps.borrow().len(), 1);
 
         let mut wrong_route = request(ButtonState::Ready);
         wrong_route.route = PageRoute::Home;
@@ -4729,7 +4807,9 @@ mod tests {
         outside_window.within_window = false;
         assert!(guarded_tap(&device, outside_window).is_err());
 
-        assert!(device.taps.borrow().is_empty());
+        // Exactly one tap happened in this test: the explicitly opted-in
+        // field-work request. Every denied request above must not have tapped.
+        assert_eq!(device.taps.borrow().len(), 1);
     }
 
     #[test]

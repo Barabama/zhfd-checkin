@@ -172,14 +172,28 @@ impl ConsecutiveUnknown {
     }
 }
 
-pub fn authorize_page_action(route: PageRoute, checkin_mode: CheckinMode) -> Result<()> {
+/// Authorize a page action for the given page route and check-in mode.
+///
+/// `allow_field_work` mirrors the user-facing `runtime.allow_field_work_live`
+/// switch. Field work is a *different* business action from the ordinary
+/// evening check-in, so it stays denied unless the operator explicitly opts in;
+/// an unknown mode is never authorized under any configuration.
+pub fn authorize_page_action(
+    route: PageRoute,
+    checkin_mode: CheckinMode,
+    allow_field_work: bool,
+) -> Result<()> {
     if route != PageRoute::Checkin {
         bail!("页面路线未确认为签到页，禁止签到动作");
     }
-    if checkin_mode != CheckinMode::Ordinary {
-        bail!("仅支持普通签到模式，外勤/未知模式禁止自动点击");
+    match checkin_mode {
+        CheckinMode::Ordinary => Ok(()),
+        CheckinMode::FieldWork if allow_field_work => Ok(()),
+        CheckinMode::FieldWork => {
+            bail!("外勤签到未启用自动点击（runtime.allow_field_work_live=false）")
+        }
+        CheckinMode::Unsupported => bail!("无法确认签到业务类型，禁止自动点击"),
     }
-    Ok(())
 }
 
 impl Mode {
@@ -456,10 +470,19 @@ mod tests {
 
     #[test]
     fn page_action_authorization_requires_checkin_ordinary_context() {
-        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::Ordinary).is_ok());
-        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::FieldWork).is_err());
-        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::Unsupported).is_err());
-        assert!(authorize_page_action(PageRoute::Home, CheckinMode::Ordinary).is_err());
+        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::Ordinary, false).is_ok());
+        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::Ordinary, true).is_ok());
+        // Field work is denied by default and only allowed on explicit opt-in.
+        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::FieldWork, false).is_err());
+        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::FieldWork, true).is_ok());
+        // An unconfirmed business mode is never authorized, opt-in or not.
+        assert!(
+            authorize_page_action(PageRoute::Checkin, CheckinMode::Unsupported, false).is_err()
+        );
+        assert!(authorize_page_action(PageRoute::Checkin, CheckinMode::Unsupported, true).is_err());
+        // The route itself must be the check-in page in every case.
+        assert!(authorize_page_action(PageRoute::Home, CheckinMode::Ordinary, true).is_err());
+        assert!(authorize_page_action(PageRoute::Home, CheckinMode::FieldWork, true).is_err());
     }
 
     #[test]

@@ -67,14 +67,15 @@
 | `stale_page_refresh_failed` | 启动时停留在旧签到页，返回后没回到服务页；在模拟器中手动返回首页后重新运行。程序未点击。 |
 | `stale_page_refresh_unconfirmed` | 启动时停留在旧签到页，返回后页面无法确认；在模拟器中手动返回首页后重新运行。程序未点击。 |
 | `app_left_foreground` / `target_app_not_foreground` | 返回后目标 App 已不在前台（可能退到了桌面）；在模拟器中手动把 App 的普通签到页切回前台后重新运行。程序不会自动拉起或重启 App。 |
+| `field_work_live_unsupported` | 检测到外勤签到。默认不执行 live 点击；如经风险确认确需启用，请在当前 data root 的 `config.toml` 中设置 `runtime.allow_field_work_live = true`，再由用户明确运行 `--live --confirm`。 |
 | `location_wait_timeout` | 定位等待达到上限；检查模拟器中的定位状态，之后由用户决定是否重试。定位中不会点击。 |
 | `blocked` / `shared_preflight_failed` | 公共依赖检查失败；先修复依赖路径，批次没有启动设备操作。 |
-
 任何页面未知、证据冲突或意外弹窗都应先停止并人工确认。不要为了“试出来”而连续盲目运行。
 
 ## 6. 日常使用
 
 - **日常检查**：选择目标实例，先运行 dry-run；从“运行日志与结果”核对 route、mode、state 和截图。
+- **外勤 live**：默认关闭。如果用户经风险确认决定启用，在“配置”页勾选外勤 live 授权（或在当前 data root 的 `config.toml` 设置 `runtime.allow_field_work_live = true`），保存后再由用户明确运行 `--live --confirm`；先完成外勤页面 dry-run，确认实例、定位和按钮后再执行。
 - **多实例**：先逐个确认实例映射与单实例 dry-run，再按需要选择全部已启用实例。批量结果会同时写入实例级 `result.json` 和批次 `summary.json`。
 - **配置修改**：通过“配置文件”或“首次设置 / 配置修复”调整；覆盖配置前会创建备份。迁移数据目录前检查目标路径和剩余空间。
 - **长期计划任务**：优先使用 dry-run 计划任务。不要将 live 配置为无人值守任务。
@@ -82,7 +83,7 @@
 
 ## 7. live 模式须知
 
-本指南不会指导用户把首次运行直接切到 live。live 会尝试真实签到点击，必须由用户明确发起并确认；还要满足目标页面、普通签到模式、校准 Profile、前台应用、配置时间窗、连续 ready 状态和点击前再次确认等全部门禁。外勤/未知模式、弹窗遮挡、页面未确认或任何门禁不满足时都不会点击。
+本指南不会指导用户把首次运行直接切到 live。live 会尝试真实签到点击，必须由用户明确发起并确认；普通签到仍需满足目标页面、普通业务模式、校准 Profile、前台应用、配置时间窗、连续 ready 状态和点击前再次确认等全部门禁。外勤 live 默认关闭；只有在当前 data root 的 `config.toml` 明确设置 `runtime.allow_field_work_live = true` 后，才会进入外勤独立点击路径，并继续满足同等门禁。未知模式、弹窗遮挡、页面未确认或任何门禁不满足时都不会点击。
 
 live 的完整安全契约见 [CHECKIN_SAFETY.md](./CHECKIN_SAFETY.md)。如不确定某个结果或页面状态，请停留在 dry-run 并先检查日志。
 

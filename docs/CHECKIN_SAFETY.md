@@ -1,6 +1,6 @@
 # 签到页面状态与安全策略
 
-更新时间：2026-10-11（Asia/Shanghai）
+更新时间：2026-10-14（Asia/Shanghai）
 
 ## 三个独立维度
 
@@ -26,7 +26,9 @@ AND second Ready confirmation AND this run has not tapped
 
 ## 外勤/未知模式
 
-外勤模式与普通签到分离；当前实现只在层级同时确认晚点名页、未签到状态及“外勤签到”入口/按钮证据时生成 `field_work_ready` dry-run 观察结果。外勤 Live 明确拒绝。Unsupported 或 hierarchy 证据不足时停止并给恢复建议。
+外勤模式与普通签到分离；层级同时确认晚点名页、未签到状态及“外勤签到”入口/按钮证据时生成 `field_work_ready` dry-run 观察结果。**外勤 live 默认关闭**；只有用户在当前 data root 的 `config.toml` 中明确设置 `runtime.allow_field_work_live = true`，并使用 `--live --confirm`，才允许进入外勤 live 的共享状态机。该 opt-in 不会把外勤当作普通签到，也不会绕过 Profile、时间窗、前台、连续 Ready、点击前二次 route/mode 复核或 `guarded_tap` 的其他门禁。
+
+外勤 live 使用外勤页面当前识别出的按钮坐标；按钮必须由本轮截图分类为 Ready，且点击前重新读取 hierarchy/前台包名并确认仍是 `Checkin + FieldWork`。Unsupported、证据冲突或任一门禁不足时停止且不点击。
 
 本工具不自动输入账号、密码、验证码，不自动点击一键登录，不伪造定位或设备身份。遇登录页，要求用户在模拟器手动登录。
 

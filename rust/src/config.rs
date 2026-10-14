@@ -35,6 +35,10 @@ success_timeout_seconds = 60
 startup_timeout_seconds = 30
 stable_frames = 2
 unknown_retries = 3
+# Field work ("外勤签到") uses a different live control. It stays disabled by
+# default; set true only after confirming the field-work action, device, location,
+# instance, and consequences for the account. See CHECKIN_SAFETY.md.
+allow_field_work_live = false
 
 [notifications]
 bark_url = ""
@@ -128,6 +132,12 @@ pub struct RuntimeConfig {
     pub stable_frames: u32,
     #[serde(default = "default_unknown_retries")]
     pub unknown_retries: u32,
+    /// Opt-in switch for tapping the field-work ("外勤签到") control in live
+    /// runs. Defaults to `false`: field work is a different business action
+    /// from the ordinary evening check-in, so enabling it is an explicit
+    /// operator decision recorded in the config file.
+    #[serde(default)]
+    pub allow_field_work_live: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -713,6 +723,12 @@ mod tests {
         assert_eq!(config.runtime.location_timeout_seconds, 120);
         assert_eq!(config.runtime.success_timeout_seconds, 60);
         assert_eq!(config.runtime.stable_frames, 2);
+        // Field-work tapping is opt-in: the embedded default must never enable
+        // it silently, and an older config written before the key existed must
+        // still deserialize to "denied".
+        assert!(!config.runtime.allow_field_work_live);
+        let legacy: RuntimeConfig = toml::from_str("mode = \"live\"\n").unwrap();
+        assert!(!legacy.allow_field_work_live);
         assert_eq!(config.window.start, "21:00");
         assert_eq!(config.window.end, "23:59");
         assert_eq!(config.window.timezone, "Asia/Shanghai");

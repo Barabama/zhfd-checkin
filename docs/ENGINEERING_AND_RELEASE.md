@@ -17,7 +17,7 @@ CLI/GUI 共享业务函数，不把 UI 的按钮/输入当作第二套业务策�
 
 ## 版本与发布状态
 
-- Cargo package 元数据当前是 `0.3.0`；
+- Cargo package 元数据当前是 `0.3.0`；本次 field-work live opt-in 修复计划作为 `v0.3.1` 发布；
 - P2 复核后的本地审计包版本和清单见 [Phase 4 审计报告](./audits/PHASE4_INDEPENDENT_AUDIT_REPORT_2026-10-11.md)；
 - 当前没有基于 `0.3.0` 的正式发布声明；本地工作区不等于发布；
 - 独立审计明确：真实 LDPlayer、多实例设备级联、完整 GUI 视觉验收、GitHub CI/release runner 尚未验证。因此 Phase 4 总体验收尚未通过。

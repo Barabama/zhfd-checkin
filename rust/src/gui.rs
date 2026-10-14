@@ -584,7 +584,9 @@ fn explain_error(error: &str) -> &'static str {
         "unknown_profile" => "设备分辨率/DPI 没有精确 profile；未执行点击。",
         "uncalibrated_profile" => "当前 profile 尚未完成生产标定；未执行点击。",
         "live_confirmation_required" => "正式模式需要同时指定 --live --confirm；未执行点击。",
-        "field_work_live_unsupported" => "外勤签到目前仅支持 dry-run 观察；请在模拟器中人工完成。",
+        "field_work_live_unsupported" => {
+            "外勤 live 默认关闭；请在当前 config.toml 设置 runtime.allow_field_work_live = true，并重新明确确认 live。"
+        }
         "field_work_observation_only" => "外勤页面已记录观察结果；请人工确认页面状态。",
         "click_authorization_failed" => "点击安全门禁未满足；程序没有继续点击。",
         "success_text_unconfirmed" => "页面视觉状态为成功，但层级文字未确认；请人工核对。",
@@ -789,7 +791,7 @@ impl GuiApp {
             });
 
         ui.separator();
-        ui.label("安全边界：未知页面、证据不足或不支持的签到类型会停止；dry-run 不点击。live 只对明确确认的普通签到流程开放，且不自动登录、不自动同意、不自动关闭广告。");
+        ui.label("安全边界：未知页面、证据不足或不支持的签到类型会停止；dry-run 不点击。普通 live 仍要求明确确认。外勤 live 还要求在 config.toml 中显式设置 runtime.allow_field_work_live = true；程序不自动登录、不自动同意、不自动关闭广告。");
         if ui.button("打开安全策略说明").clicked() {
             self.tab = 8;
         }
@@ -1483,7 +1485,7 @@ impl GuiApp {
                     "当前选择的实例"
                 };
                 ui.colored_label(egui::Color32::YELLOW, format!("范围：{}", scope));
-                ui.label("将执行真实签到点击。程序仍会检查 calibrated Profile、时间窗口、前台包名、连续 ready 和点击前二次确认。");
+                ui.label("将执行真实签到点击。普通签到仍检查 calibrated Profile、时间窗口、前台包名、连续 ready 和点击前二次确认；外勤签到还要求 config.toml 中显式设置 runtime.allow_field_work_live = true，并使用外勤页面自己的按钮。程序不会把外勤降级为普通签到。" );
                 ui.label("请确认设备、实例和当前页面均正确；确认后将调用 CLI 同一套 run --live --confirm 业务逻辑。");
                 ui.horizontal(|ui| {
                     if ui.button("确认 live").clicked() {
@@ -2066,6 +2068,32 @@ impl GuiApp {
                 &mut self.selected_adb_candidate,
             );
         }
+        ui.separator();
+        ui.label("外勤签到 live 授权");
+        let mut allow_field_work_live = self.store.config.runtime.allow_field_work_live;
+        if ui
+            .checkbox(
+                &mut allow_field_work_live,
+                "允许 live 点击外勤签到按钮（高风险，需明确确认）",
+            )
+            .changed()
+        {
+            self.store.config.runtime.allow_field_work_live = allow_field_work_live;
+            match self.store.save() {
+                Ok(()) => {
+                    self.status = if allow_field_work_live {
+                        "已启用外勤 live；请确认页面、实例和定位后再执行。".into()
+                    } else {
+                        "已关闭外勤 live；外勤页面将只允许 dry-run 观察。".into()
+                    };
+                }
+                Err(error) => {
+                    self.store.config.runtime.allow_field_work_live = !allow_field_work_live;
+                    self.status = format!("保存外勤 live 设置失败：{error:#}");
+                }
+            }
+        }
+        ui.label("默认关闭。启用后仍需 --live --confirm、校准 Profile、时间窗口、目标 App 前台、连续 Ready，以及点击前 route/mode/前台二次复核；未知模式和证据冲突仍会停止。 ");
         ui.separator();
         ui.label("当前配置内容");
         ui.code(toml::to_string_pretty(&self.store.config).unwrap_or_default());
