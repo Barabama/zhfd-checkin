@@ -191,7 +191,6 @@ impl Config {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     pub root: PathBuf,
@@ -209,12 +208,7 @@ pub enum ConfigOrigin {
     LocalAppData,
 }
 
-#[allow(dead_code)]
 impl ConfigStore {
-    pub fn load() -> Result<Self> {
-        Self::load_with_config_path(None)
-    }
-
     pub fn load_with_config_path(config_path: Option<&Path>) -> Result<Self> {
         if let Some(path) = config_path {
             let path = if path.is_absolute() {
@@ -326,11 +320,17 @@ impl ConfigStore {
         })
     }
 
+    /// Build the Repair handle for a config that failed to load.
+    ///
+    /// The path must be the SAME file `load_with_config_path` actually tried,
+    /// otherwise the Repair page would display, reload and overwrite a
+    /// different file than the damaged one (frozen decision D-01/D-03). So when
+    /// no explicit path is given the same candidate order is re-walked here.
     pub fn recovery(path: Option<&Path>, error: String) -> Result<Self> {
         let path = match path {
             Some(path) if path.is_absolute() => path.to_path_buf(),
             Some(path) => env::current_dir()?.join(path),
-            None => exe_root()?.join("config.toml"),
+            None => Self::default_config_path()?,
         };
         let root = path
             .parent()
@@ -344,6 +344,27 @@ impl ConfigStore {
             created_default: false,
             recovery_error: Some(error),
         })
+    }
+
+    /// The config path `load_with_config_path(None)` would use, without
+    /// requiring it to be valid.
+    ///
+    /// Mirrors that function's priority chain: an existing portable config, an
+    /// existing LocalAppData config, then the portable candidate (which is also
+    /// the fallback when the EXE directory turns out to be unwritable).
+    pub fn default_config_path() -> Result<PathBuf> {
+        let portable_root = exe_root()?;
+        let portable_config = portable_root.join("config.toml");
+        if portable_config.is_file() {
+            return Ok(portable_config);
+        }
+        if let Some(local_root) = local_app_data_root() {
+            let local_config = local_root.join("config.toml");
+            if local_config.is_file() {
+                return Ok(local_config);
+            }
+        }
+        Ok(portable_config)
     }
 
     pub fn load_alternate(path: &Path) -> Result<Self> {
@@ -400,6 +421,16 @@ impl ConfigStore {
                 destination.display()
             );
         }
+        // Reject an occupied destination BEFORE writing anything into it: a
+        // refused migration must leave the destination exactly as the user left
+        // it, not half-populated with copied evidence directories.
+        let destination_config = destination.join("config.toml");
+        if destination_config.is_file() {
+            anyhow::bail!(
+                "目标数据目录已有 config.toml，迁移已停止且未覆盖目标配置: {}",
+                destination_config.display()
+            );
+        }
         ensure_runtime_dirs(&destination)?;
         if self.path.is_file() {
             // Keep a recoverable source copy before beginning migration.
@@ -408,13 +439,6 @@ impl ConfigStore {
         for name in ["logs", "captures", "reports", "backups"] {
             copy_tree_if_missing(&self.root.join(name), &destination.join(name))
                 .with_context(|| format!("迁移 {} 目录失败", name))?;
-        }
-        let destination_config = destination.join("config.toml");
-        if destination_config.is_file() {
-            anyhow::bail!(
-                "目标数据目录已有 config.toml，迁移已停止且未覆盖目标配置: {}",
-                destination_config.display()
-            );
         }
         write_config(&destination, &destination_config, &self.config)?;
         let origin = if local_app_data_root().as_deref() == Some(destination.as_path()) {
@@ -426,7 +450,6 @@ impl ConfigStore {
     }
 }
 
-#[allow(dead_code)]
 fn is_path_within(candidate: &Path, parent: &Path) -> bool {
     // Canonicalize both sides together: a non-existent destination cannot be
     // canonicalized, and mixing a canonicalized `\\?\` path with a raw path
@@ -440,7 +463,6 @@ fn is_path_within(candidate: &Path, parent: &Path) -> bool {
     }
 }
 
-#[allow(dead_code)]
 fn lexically_normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -455,7 +477,6 @@ fn lexically_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
-#[allow(dead_code)]
 fn path_prefix_matches(candidate: &Path, parent: &Path) -> bool {
     let candidate = candidate.to_string_lossy().replace('/', "\\");
     let parent = parent.to_string_lossy().replace('/', "\\");
@@ -472,7 +493,6 @@ fn path_prefix_matches(candidate: &Path, parent: &Path) -> bool {
             .is_some_and(|rest| rest.starts_with('\\'))
 }
 
-#[allow(dead_code)]
 fn copy_tree_if_missing(source: &Path, destination: &Path) -> Result<()> {
     if !source.is_dir() {
         return Ok(());
@@ -497,7 +517,6 @@ fn copy_tree_if_missing(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub fn recommended_local_app_data_root() -> Option<PathBuf> {
     local_app_data_root()
 }
@@ -949,6 +968,196 @@ mod tests {
         assert!(source.join("config.toml").is_file());
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(destination);
+    }
+
+    // ===== v0.3.0 first-run / recovery counterexamples (D-01/D-03/D-06) =====
+
+    #[test]
+    fn explicit_config_path_uses_its_parent_as_data_root() {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-explicit-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let data_root = root.join("UserData");
+        fs::create_dir_all(&data_root).unwrap();
+        let config_path = data_root.join("config.toml");
+        fs::write(&config_path, DEFAULT_CONFIG).unwrap();
+
+        let store = ConfigStore::load_with_config_path(Some(&config_path)).unwrap();
+        assert_eq!(
+            store.root, data_root,
+            "显式 --config 的父目录必须是 data root"
+        );
+        assert_eq!(store.path, config_path);
+        assert_eq!(store.origin, ConfigOrigin::Explicit);
+        for name in ["logs", "captures", "reports", "backups"] {
+            assert!(
+                data_root.join(name).is_dir(),
+                "显式 data root 必须创建 {name} 目录"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn damaged_config_enters_recovery_without_touching_the_file() {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let damaged = "[app]\npackage_name = 1\n";
+        fs::write(&path, damaged).unwrap();
+
+        let load_error = ConfigStore::load_with_config_path(Some(&path)).unwrap_err();
+        let store = ConfigStore::recovery(Some(&path), format!("{load_error:#}")).unwrap();
+
+        assert_eq!(store.path, path);
+        assert_eq!(store.root, root);
+        assert!(store.recovery_error.is_some(), "修复模式必须携带原始错误");
+        assert!(!store.created_default);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            damaged,
+            "进入修复模式不得改写损坏文件"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_save_candidate_repairs_in_place_and_keeps_a_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-recovery-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let damaged = "not = valid = toml";
+        fs::write(&path, damaged).unwrap();
+
+        let mut store = ConfigStore::recovery(Some(&path), "解析失败".into()).unwrap();
+        let mut candidate = Config::default();
+        candidate.emulator.ldconsole_path = "tools/ldconsole.exe".into();
+        store.save_candidate(candidate).unwrap();
+
+        assert!(store.recovery_error.is_none(), "修复成功后必须清除错误状态");
+        let reloaded: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reloaded.emulator.ldconsole_path, "tools/ldconsole.exe");
+        let backups: Vec<_> = fs::read_dir(root.join("backups"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "覆盖已存在配置前必须保留一份备份");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_migration_leaves_the_source_store_usable() {
+        let source = std::env::temp_dir().join(format!(
+            "zhfd-mig-fail-src-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let destination = std::env::temp_dir().join(format!(
+            "zhfd-mig-fail-dst-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&destination);
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let mut source_config = Config::default();
+        source_config.runtime.stable_frames = 4;
+        fs::write(
+            source.join("config.toml"),
+            toml::to_string_pretty(&source_config).unwrap(),
+        )
+        .unwrap();
+        // A destination that already owns a config must never be overwritten.
+        fs::write(destination.join("config.toml"), "# 用户已有配置\n").unwrap();
+
+        let store = audit_store(&source, source_config);
+        let error = store.migrate_to_root(&destination).unwrap_err();
+        assert!(
+            error.to_string().contains("已有 config.toml"),
+            "迁移必须明确拒绝覆盖目标配置: {error:#}"
+        );
+        assert_eq!(store.root, source, "迁移失败后必须继续使用源 root");
+        assert!(source.join("config.toml").is_file());
+        assert_eq!(
+            fs::read_to_string(destination.join("config.toml")).unwrap(),
+            "# 用户已有配置\n",
+            "迁移失败不得改写目标配置"
+        );
+        // A refused migration must not have written anything into the
+        // destination either: the rejection happens before any copy.
+        let mut entries: Vec<_> = fs::read_dir(&destination)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["config.toml".to_string()],
+            "被拒绝的迁移不得在目标目录留下任何复制内容: {entries:?}"
+        );
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&destination);
+    }
+
+    #[test]
+    fn alternate_config_load_does_not_touch_the_current_file() {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-alternate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let directory = root.join("other");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        let mut config = Config::default();
+        config.emulator.adb_path = "tools/adb.exe".into();
+        fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        let store = ConfigStore::load_alternate(&path).unwrap();
+        assert_eq!(store.root, directory);
+        assert_eq!(store.config.emulator.adb_path, "tools/adb.exe");
+        assert_eq!(store.origin, ConfigOrigin::Explicit);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

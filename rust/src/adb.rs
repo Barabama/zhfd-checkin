@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
 };
 
 #[derive(Debug, Clone)]
@@ -13,12 +13,26 @@ pub struct AdbDevice {
 }
 
 #[allow(clippy::enum_variant_names)]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HierarchyStatus {
     DumpSucceeded,
     DumpFailed,
     DumpEmptyOrTruncated,
+}
+
+impl HierarchyStatus {
+    /// Stable machine label persisted in events and in the run result
+    /// (requirement FR-011). `DumpSucceeded` is reported separately because a
+    /// successful dump can still fail to identify the page
+    /// (`route_markers_missing`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DumpSucceeded => "dump_succeeded",
+            Self::DumpFailed => "dump_failed",
+            Self::DumpEmptyOrTruncated => "dump_empty_or_truncated",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +45,16 @@ pub struct HierarchyObservation {
     pub exit_code: Option<i32>,
     pub stderr_summary: Option<String>,
     pub marker_summary: Option<String>,
+    /// Distinct `package` attributes in document order. A package other than
+    /// the target app means another window is on screen, which is what makes a
+    /// popup or advertisement diagnosable after the fact.
+    pub packages: Vec<String>,
+    /// `package` of the first node, i.e. the package that owns the dumped
+    /// window. `None` when the dump omits the attribute.
+    pub root_package: Option<String>,
+    /// Number of `<node` elements in the dump. A page that renders normally
+    /// carries far more than an overlay card does.
+    pub node_count: usize,
     #[serde(skip)]
     pub xml: Option<String>,
 }
@@ -130,6 +154,38 @@ impl AdbDevice {
         })
     }
 
+    /// The raw `mCurrentFocus=`/`mFocusedApp=` line, length-limited.
+    ///
+    /// `current_package` only yields a package name, which cannot distinguish
+    /// "the app's own page" from "a dialog rendered inside the app's window
+    /// stack". Keeping the raw line makes an overlay diagnosable instead of
+    /// merely suspected.
+    pub fn focused_window(&self) -> Result<String> {
+        let text = self.shell(&["dumpsys", "window"])?;
+        for line in text.lines() {
+            if line.contains("mCurrentFocus=") || line.contains("mFocusedApp=") {
+                return Ok(limit_error(line));
+            }
+        }
+        bail!("无法读取当前前台窗口")
+    }
+
+    /// The package owning the currently focused window, if the window dump
+    /// exposes one. This is stronger overlay evidence than an arbitrary
+    /// descendant package in the accessibility hierarchy.
+    #[expect(dead_code, reason = "used by focused-window diagnostics tests")]
+    pub fn focused_package(&self) -> Result<String> {
+        let text = self.shell(&["dumpsys", "window"])?;
+        for line in text.lines() {
+            if (line.contains("mCurrentFocus=") || line.contains("mFocusedApp="))
+                && let Some(package) = parse_package(line)
+            {
+                return Ok(package);
+            }
+        }
+        bail!("无法读取当前前台窗口包名")
+    }
+
     pub fn current_package(&self) -> Result<String> {
         let text = self.shell(&["dumpsys", "window"])?;
         for line in text.lines() {
@@ -163,7 +219,10 @@ impl AdbDevice {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "reserved for a future bounded recovery path; never used to restart an unknown page"
+    )]
     pub fn force_stop(&self, package: &str) -> Result<()> {
         self.shell(&["am", "force-stop", package])?;
         Ok(())
@@ -179,7 +238,6 @@ impl AdbDevice {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn swipe(&self, x1: u32, y1: u32, x2: u32, y2: u32, duration_ms: u32) -> Result<()> {
         self.shell(&[
             "input",
@@ -200,7 +258,7 @@ impl AdbDevice {
 
     pub fn dump_hierarchy_observation(&self, stage: &str) -> Result<HierarchyObservation> {
         let started = std::time::Instant::now();
-        let dump = Command::new(&self.adb)
+        let dump = crate::process::command(&self.adb)
             .args([
                 "-s",
                 &self.serial,
@@ -221,10 +279,13 @@ impl AdbDevice {
                 exit_code: dump.status.code(),
                 stderr_summary: Some(limit_error(&text(&dump.stderr))),
                 marker_summary: None,
+                packages: Vec::new(),
+                root_package: None,
+                node_count: 0,
                 xml: None,
             });
         }
-        let cat = Command::new(&self.adb)
+        let cat = crate::process::command(&self.adb)
             .args(["-s", &self.serial, "shell", "cat", "/sdcard/window.xml"])
             .output()
             .with_context(|| format!("读取 hierarchy XML 失败: {}", self.serial))?;
@@ -239,6 +300,12 @@ impl AdbDevice {
         } else {
             HierarchyStatus::DumpSucceeded
         };
+        let readable = matches!(status, HierarchyStatus::DumpSucceeded);
+        let packages = if readable {
+            observed_packages(&xml)
+        } else {
+            Vec::new()
+        };
         Ok(HierarchyObservation {
             stage: stage.into(),
             elapsed_ms: started.elapsed().as_millis(),
@@ -247,8 +314,15 @@ impl AdbDevice {
             utf8_valid,
             exit_code: cat.status.code(),
             stderr_summary: (!cat.status.success()).then(|| limit_error(&text(&cat.stderr))),
-            marker_summary: Some(marker_summary(&xml)),
-            xml: matches!(status, HierarchyStatus::DumpSucceeded).then_some(xml),
+            marker_summary: readable.then(|| marker_summary(&xml)),
+            root_package: packages.first().cloned(),
+            node_count: if readable {
+                xml.matches("<node").count()
+            } else {
+                0
+            },
+            packages,
+            xml: readable.then_some(xml),
         })
     }
 
@@ -272,14 +346,24 @@ impl AdbDevice {
     }
 }
 
+/// Truncate an error message for the persisted observation.
+///
+/// Truncation must land on a character boundary: slicing a UTF-8 string at a
+/// raw byte index panics, and a panic here would turn a recoverable ADB error
+/// into a crash inside the error-reporting path.
 fn limit_error(value: &str) -> String {
     const LIMIT: usize = 512;
     let trimmed = value.trim();
     if trimmed.len() <= LIMIT {
-        trimmed.to_string()
-    } else {
-        format!("{}…", &trimmed[..LIMIT])
+        return trimmed.to_string();
     }
+    let end = trimmed
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= LIMIT)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &trimmed[..end])
 }
 
 fn marker_summary(xml: &str) -> String {
@@ -296,6 +380,52 @@ fn marker_summary(xml: &str) -> String {
     .copied()
     .collect::<Vec<_>>()
     .join(",")
+}
+
+/// Distinct `package` attributes of a hierarchy dump, in document order.
+///
+/// Only used for diagnostics: it answers "whose window is this?" without
+/// needing another ADB round trip.
+fn observed_packages(xml: &str) -> Vec<String> {
+    let mut packages: Vec<String> = Vec::new();
+    for chunk in xml.split("<node").skip(1) {
+        let Some(end) = chunk.find('>') else { continue };
+        let tag = &chunk[..end];
+        let Some(value) = attribute_value(tag, "package") else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        if !packages.iter().any(|existing| existing == value) {
+            packages.push(value.to_string());
+        }
+    }
+    packages
+}
+
+/// Value of `name="..."` inside a `<node ...>` tag body.
+///
+/// The preceding character must be whitespace (or the start of the body) so an
+/// attribute name cannot be matched inside another attribute's value.
+fn attribute_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=\"");
+    let mut cursor = 0usize;
+    while let Some(relative) = tag[cursor..].find(&prefix) {
+        let start = cursor + relative;
+        let at_boundary = start == 0
+            || tag[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        let value_start = start + prefix.len();
+        let length = tag[value_start..].find('"')?;
+        if at_boundary {
+            return Some(&tag[value_start..value_start + length]);
+        }
+        cursor = value_start + length;
+    }
+    None
 }
 
 pub fn find_adb(configured: &str) -> Result<PathBuf> {
@@ -419,6 +549,13 @@ fn parse_number_after(text: &str, word: &str) -> Option<u32> {
         })
     })
 }
+/// Extract a package name from the raw `focused_window` line without issuing a
+/// second window dump. Keeping this pure lets callers bind focus and hierarchy
+/// evidence to the same observation round.
+pub fn package_from_focused_window(line: &str) -> Option<String> {
+    parse_package(line)
+}
+
 fn parse_package(line: &str) -> Option<String> {
     let after = line.split_whitespace().find(|x| x.contains("/"))?;
     let token = after.trim_matches(|c| c == '}' || c == '{' || c == ',');
@@ -429,6 +566,73 @@ fn parse_package(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observed_packages_reports_foreign_windows_in_document_order() {
+        // A real dump names the owning package on every node. The first entry is
+        // the window root, which is what identifies a blocking overlay.
+        let xml = r#"<hierarchy><node index="0" package="com.example.ad" text="" bounds="[0,0][900,1600]"><node index="0" package="com.example.ad" text="关闭" bounds="[10,10][20,20]"/></node></hierarchy>"#;
+        assert_eq!(
+            observed_packages(xml),
+            vec!["com.example.ad".to_string()],
+            "重复包名必须去重且保持文档顺序"
+        );
+
+        let mixed = r#"<hierarchy><node package="cn.edu.fzu.fdxypa" text="晚点名签到"/><node package="android" text=""/></hierarchy>"#;
+        assert_eq!(
+            observed_packages(mixed),
+            vec!["cn.edu.fzu.fdxypa".to_string(), "android".to_string()]
+        );
+    }
+
+    #[test]
+    fn observed_packages_tolerates_missing_and_empty_attributes() {
+        // Fixtures and partially written dumps may omit the attribute entirely.
+        assert!(observed_packages("<hierarchy><node text=\"x\"/></hierarchy>").is_empty());
+        assert!(observed_packages(r#"<node package="" text="x"/>"#).is_empty());
+    }
+
+    #[test]
+    fn attribute_value_requires_a_leading_boundary() {
+        // `mypackage="..."` must not satisfy a lookup for `package`.
+        let tag = r#" mypackage="decoy" package="real" bounds="[0,0][1,1]""#;
+        assert_eq!(attribute_value(tag, "package"), Some("real"));
+        assert_eq!(attribute_value(tag, "bounds"), Some("[0,0][1,1]"));
+        assert_eq!(attribute_value(tag, "clickable"), None);
+        // A value that itself contains `package="` must not win.
+        let nested = r#" content-desc="x package=&quot;decoy&quot;" package="real""#;
+        assert_eq!(attribute_value(nested, "package"), Some("real"));
+    }
+
+    #[test]
+    fn hierarchy_status_labels_are_distinct_and_stable() {
+        let labels = [
+            HierarchyStatus::DumpSucceeded.as_str(),
+            HierarchyStatus::DumpFailed.as_str(),
+            HierarchyStatus::DumpEmptyOrTruncated.as_str(),
+        ];
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "层级状态标签必须互不相同");
+        assert_eq!(HierarchyStatus::DumpFailed.as_str(), "dump_failed");
+        assert_eq!(
+            HierarchyStatus::DumpEmptyOrTruncated.as_str(),
+            "dump_empty_or_truncated"
+        );
+        // `route_markers_missing` is the fourth FR-011 outcome and is produced
+        // when a successful dump carries no usable page identity.
+        assert!(!labels.contains(&"route_markers_missing"));
+    }
+
+    #[test]
+    fn limit_error_truncates_on_a_character_boundary() {
+        // A long run of multi-byte characters previously panicked when the
+        // 512-byte cut landed inside a character.
+        let long = "错".repeat(400);
+        let limited = limit_error(&long);
+        assert!(limited.ends_with('…'));
+        assert!(limited.len() <= 512 + '…'.len_utf8());
+        assert_eq!(limit_error("短错误"), "短错误");
+    }
+
     #[test]
     fn configured_adb_path_wins_over_ldplayer_sibling_candidate() {
         let nonce = std::time::SystemTime::now()

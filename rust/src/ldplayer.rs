@@ -111,7 +111,7 @@ impl LdPlayer {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(decode_console_output(&output.stdout))
     }
 
     pub fn instances(&self) -> Result<Vec<Instance>> {
@@ -302,6 +302,108 @@ fn expand_registry_path(value: &str) -> PathBuf {
     PathBuf::from(expanded)
 }
 
+/// Decode `ldconsole` console output.
+///
+/// `ldconsole.exe` writes through the Windows console code page, which is CP936
+/// on a Simplified-Chinese host, so instance names arrive as CP936 bytes instead
+/// of UTF-8 and `from_utf8_lossy` would turn them into U+FFFD mojibake. Bytes
+/// that are already valid UTF-8 always win, which keeps UTF-8 hosts, ASCII
+/// output, and every existing fixture untouched.
+///
+/// This is scoped to the ldconsole console stream only. ADB output, stderr and
+/// all JSON/TOML files stay strict UTF-8.
+fn decode_console_output(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    #[cfg(windows)]
+    {
+        // `ldconsole.exe` writes bytes in the host ANSI code page, which is
+        // CP936 on a Simplified-Chinese Windows. Order matters: the host code
+        // page is authoritative when it is a real ANSI page, and CP936 is the
+        // fallback for a UTF-8 host (ACP 65001), where the vendor tool may
+        // still emit its own code page. Attempting CP936 first on a non-Chinese
+        // host would turn correct host-encoded names into mojibake instead of
+        // letting the host page decode them.
+        let host_code_page = unsafe { GetACP() };
+        let mut code_pages = Vec::with_capacity(2);
+        if host_code_page != 65001 {
+            code_pages.push(host_code_page);
+        }
+        if host_code_page != 936 {
+            code_pages.push(936);
+        }
+        for code_page in code_pages {
+            if let Some(text) = decode_with_code_page(code_page, bytes) {
+                return text;
+            }
+        }
+    }
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+/// Decode with an explicit code page, rejecting the attempt when the bytes are
+/// not valid in it.
+///
+/// `MB_ERR_INVALID_CHARS` is essential: without it `MultiByteToWideChar`
+/// substitutes invalid sequences and returns success for almost any input, so
+/// the first attempted code page would always win and the fallback order would
+/// be meaningless.
+#[cfg(windows)]
+fn decode_with_code_page(code_page: u32, bytes: &[u8]) -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+    const MB_ERR_INVALID_CHARS: u32 = 0x0000_0008;
+    // SAFETY: `bytes` is a valid slice for the given length; the first call only
+    // measures, and the wide buffer is allocated from the exact returned count.
+    let len = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; len as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            len,
+        )
+    };
+    if written <= 0 {
+        return None;
+    }
+    wide.truncate(written as usize);
+    Some(
+        std::ffi::OsString::from_wide(&wide)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn MultiByteToWideChar(
+        code_page: u32,
+        flags: u32,
+        multi_byte_str: *const u8,
+        multi_byte_count: i32,
+        wide_char_str: *mut u16,
+        wide_char_count: i32,
+    ) -> i32;
+    fn GetACP() -> u32;
+}
+
 fn parse_instance(line: &str) -> Option<Instance> {
     let fields: Vec<_> = line.split(',').map(str::trim).collect();
     if fields.len() < 7 {
@@ -409,5 +511,60 @@ OtherPath          REG_SZ    C:\Other
             Some("127.0.0.1:5555")
         );
         assert!(LdPlayer::tcp_serial_for_index(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn console_output_keeps_valid_utf8_and_ascii_untouched() {
+        assert_eq!(
+            decode_console_output(b"0,instance,1,2,1,3,5420"),
+            "0,instance,1,2,1,3,5420"
+        );
+        let utf8 = "0,中文实例,1,2,1,3,5420".as_bytes();
+        assert_eq!(decode_console_output(utf8), "0,中文实例,1,2,1,3,5420");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn decode_with_code_page_rejects_invalid_bytes_and_accepts_valid_ones() {
+        // Without MB_ERR_INVALID_CHARS the API substitutes instead of failing,
+        // which would make the first attempted code page always win and the
+        // fallback order meaningless. 0xFF is not a valid CP936 lead byte.
+        assert!(decode_with_code_page(936, &[0xFF, 0xFE, 0xFD]).is_none());
+        assert_eq!(
+            decode_with_code_page(936, b"0,instance,1,2,1,3,5420").as_deref(),
+            Some("0,instance,1,2,1,3,5420")
+        );
+    }
+
+    /// CP936 bytes for `0,中文签到实例,1,2,1,3,5420`, i.e. what `ldconsole list2`
+    /// emits when the host console code page is 936.
+    #[cfg(windows)]
+    #[test]
+    fn console_output_decodes_cp936_instance_names_without_mojibake() {
+        const CP936: &[u8] = b"0,\xD6\xD0\xCE\xC4\xC7\xA9\xB5\xBD\xCA\xB5\xC0\xFD,1,2,1,3,5420";
+        // The fixture is deliberately not valid UTF-8: decoding it as UTF-8
+        // yields U+FFFD, which is exactly the mojibake this decoder avoids.
+        assert!(String::from_utf8_lossy(CP936).contains('\u{FFFD}'));
+        // CP936 decoding itself is host-independent and must always recover the
+        // real instance name.
+        assert_eq!(
+            decode_with_code_page(936, CP936).as_deref(),
+            Some("0,中文签到实例,1,2,1,3,5420")
+        );
+        // `decode_console_output` prefers the host ANSI page, so the CP936
+        // fallback is only reached on a host whose page cannot represent these
+        // bytes (a UTF-8 host) or is CP936 itself. Asserting the Chinese name
+        // unconditionally would fail on every other host, including the en-US
+        // CI runners: their ANSI page (1252) defines all of these bytes, so it
+        // succeeds with mojibake instead of falling through to CP936.
+        let host_code_page = unsafe { GetACP() };
+        if host_code_page == 936 || host_code_page == 65001 {
+            assert_eq!(decode_console_output(CP936), "0,中文签到实例,1,2,1,3,5420");
+            assert!(!decode_console_output(CP936).contains('\u{FFFD}'));
+        } else {
+            // Documented tradeoff: the host page wins and the name stays
+            // mojibake rather than being guessed as CP936.
+            assert!(!decode_console_output(CP936).is_empty());
+        }
     }
 }

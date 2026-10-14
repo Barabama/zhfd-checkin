@@ -4,7 +4,7 @@
 
 ## 三个独立维度
 
-- `PageRoute`: Login / Home / Services / Checkin / Unknown
+- `PageRoute`: Login / Home / Services / Checkin / Unknown / RouteCandidateUnconfirmed / RouteEvidenceConflict / StalePageRefreshFailed / StalePageRefreshUnconfirmed / AppLeftForeground
 - `CheckinMode`: Ordinary / FieldWork / Unsupported
 - `CheckinState`: Gray / Locating / Ready / SuccessToday / SuccessStale / SuccessDateUnknown / FieldWorkReady / Unknown
 
@@ -29,6 +29,19 @@ AND second Ready confirmation AND this run has not tapped
 外勤模式与普通签到分离；当前实现只在层级同时确认晚点名页、未签到状态及“外勤签到”入口/按钮证据时生成 `field_work_ready` dry-run 观察结果。外勤 Live 明确拒绝。Unsupported 或 hierarchy 证据不足时停止并给恢复建议。
 
 本工具不自动输入账号、密码、验证码，不自动点击一键登录，不伪造定位或设备身份。遇登录页，要求用户在模拟器手动登录。
+
+## 旧签到页刷新（stale page refresh）
+
+签到成功后程序不主动退出 App、不发送额外的 BACK，也不会把 App 拉回前台或重启（FR-013）。若某次运行启动时已停留在旧的签到页，程序只做一次受控的 BACK 刷新：
+
+- 仅在层级确认签到页且无外部窗口时发送 BACK；
+- BACK 后重新读取前台包名与页面层级；
+- 只有确认回到目标 App 的 Home/Services 页（前台仍是目标包且无遮挡）才继续导航；
+- 若返回后层级不可读或无法确认，记 `stale_page_refresh_unconfirmed` 并停止；
+- 若返回后可读但不是目录页，记 `stale_page_refresh_failed` 并停止；
+- 若返回后目标 App 已不在前台（例如退到了桌面/Launcher），记 `app_left_foreground`（机器码复用 FR-013 的 `target_app_not_foreground`）并停止，且不把该前台包记录为弹窗遮挡。
+
+以上任何一种情况都在任何 tap 之前停止（`clicked=false`），不尝试自动拉起或重新启动 App；恢复动作由用户手动完成。
 
 ## 成功判定
 

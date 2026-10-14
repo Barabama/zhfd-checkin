@@ -13,7 +13,9 @@ mod vision;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use config::ConfigStore;
-use domain::{CheckinMode, CheckinState, ConsecutiveUnknown, ExitCode, Mode, PageRoute, RunResult};
+use domain::{
+    CheckinMode, CheckinState, ConsecutiveUnknown, ExitCode, Mode, PageRoute, RunResult, RunStatus,
+};
 use logger::{RunLog, SyncGeometry, SyncLog, SyncResult};
 use std::{
     path::{Path, PathBuf},
@@ -21,19 +23,48 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[allow(dead_code)]
 const LDPLAYER_URL: &str = "https://www.ldmnq.com/";
-#[allow(dead_code)]
 const ZHFD_URL: &str = "https://app.fzu.edu.cn/fd-app/m/index.html";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const GIT_COMMIT: &str = match option_env!("ZHFD_GIT_COMMIT") {
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const GIT_COMMIT: &str = match option_env!("ZHFD_GIT_COMMIT") {
     Some(value) => value,
     None => "unknown",
 };
+/// `Some(true)` when the tree this binary was built from had uncommitted
+/// tracked changes, `Some(false)` when it was clean, `None` when the build
+/// could not determine it. `git_commit` on its own would otherwise claim a
+/// provenance the binary does not have (FR-014).
+fn git_dirty() -> Option<bool> {
+    match option_env!("ZHFD_GIT_DIRTY") {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+/// Human-readable provenance suffix: a dirty build is marked so nobody reads
+/// `build_id` as an exact commit reference.
+fn build_id() -> String {
+    build_id_for(VERSION, GIT_COMMIT, git_dirty())
+}
+
+fn build_id_for(version: &str, commit: &str, dirty: Option<bool>) -> String {
+    match dirty {
+        Some(true) => format!("{version}-{commit}+dirty"),
+        Some(false) => format!("{version}-{commit}"),
+        None => format!("{version}-{commit}+unknown"),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name="zhfd-checkin", version=VERSION, about="智汇福大 LDPlayer 自动签到控制器")]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "显式指定 config.toml;其父目录即为 data root"
+    )]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<CommandKind>,
 }
@@ -164,9 +195,15 @@ struct RunArgs {
     target: InstanceTargetArgs,
 }
 
-#[allow(dead_code)]
-fn main() {
-    let code = match run_cli() {
+/// CLI entry point. `pub` on purpose: the library target shares this file via
+/// `include!`, and a private `main` would make every CLI-only function look
+/// dead there -- which is what previously forced `#[allow(dead_code)]` blankets
+/// over production code paths.
+pub fn main() {
+    // Parse first so a malformed command line still produces a clap usage error
+    // instead of being flattened into the generic config failure path.
+    let cli = Cli::parse();
+    let code = match run_cli(cli) {
         Ok(code) => code as i32,
         Err(error) => {
             eprintln!("错误: {:#}", error);
@@ -176,27 +213,64 @@ fn main() {
     std::process::exit(code);
 }
 
-#[allow(dead_code)]
-fn run_cli() -> Result<ExitCode> {
-    let cli = Cli::parse();
-    let store = ConfigStore::load()?;
+fn run_cli(cli: Cli) -> Result<ExitCode> {
+    let config_path = cli.config;
     match cli.command.unwrap_or(CommandKind::Gui) {
         CommandKind::About => {
             print_about();
             Ok(ExitCode::Ok)
         }
-        CommandKind::Gui => launch_gui_companion(),
-        CommandKind::Instance { command } => instance_command(&store, command),
-        CommandKind::Task { command } => task_command(command),
-        CommandKind::Ui { command } => ui_command(&store, command),
-        CommandKind::Vision { image } => analyze_image(&image),
-        CommandKind::Config { command } => config_command(&store, command),
-        CommandKind::Profile { command } => profile_command(&store, command),
-        CommandKind::Diagnose { target } => diagnose(&store, &target),
-        CommandKind::Report => write_report(&store),
-        CommandKind::App { command } => app_command(&store, command),
-        CommandKind::Run(args) => run(&store, args),
+        // `gui` must never be blocked by a broken config: the GUI is the only
+        // Repair entry point, so it launches and shows the recovery page itself.
+        CommandKind::Gui => launch_gui_companion(config_path.as_deref()),
+        command => {
+            let store = load_store_for_cli(config_path.as_deref())?;
+            match command {
+                CommandKind::About | CommandKind::Gui => unreachable!(),
+                CommandKind::Instance { command } => instance_command(&store, command),
+                CommandKind::Task { command } => task_command(command, config_path.as_deref()),
+                CommandKind::Ui { command } => ui_command(&store, command),
+                CommandKind::Vision { image } => analyze_image(&image),
+                CommandKind::Config { command } => config_command(&store, command),
+                CommandKind::Profile { command } => profile_command(&store, command),
+                CommandKind::Diagnose { target } => diagnose(&store, &target),
+                CommandKind::Report => write_report(&store),
+                CommandKind::App { command } => app_command(&store, command),
+                CommandKind::Run(args) => run(&store, args),
+            }
+        }
     }
+}
+
+/// Load the config for a non-GUI command without ever repairing or overwriting
+/// it. A damaged or unreadable config is reported with its exact path and a
+/// pointer at the GUI Repair entry (frozen decision: no silent fallback, no
+/// reset, no overwrite). CLI deliberately does not grow a repair command in
+/// v0.3.0 -- see `V0.3.0_DECISIONS.md` D-01/D-03.
+fn load_store_for_cli(config_path: Option<&Path>) -> Result<ConfigStore> {
+    ConfigStore::load_with_config_path(config_path).map_err(|error| {
+        let path = describe_config_path(config_path);
+        anyhow::anyhow!(
+            "无法加载配置：{:#}\n配置文件：{path}\n\
+             该命令不会自动恢复默认配置，也不会覆盖现有文件。\n\
+             请运行 zhfd-checkin-gui.exe 进入 Setup/Repair 页面修复配置后重试。",
+            error
+        )
+    })
+}
+
+/// Best-effort display path for a config that failed to load: the explicit
+/// `--config` value when given, otherwise the portable candidate that
+/// `ConfigStore::load_with_config_path` prefers.
+fn describe_config_path(config_path: Option<&Path>) -> String {
+    if let Some(path) = config_path {
+        return path.display().to_string();
+    }
+    // Must match the path the loader actually tried, or the message would name
+    // a different file than the one that failed.
+    ConfigStore::default_config_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "config.toml (无法确定配置路径)".into())
 }
 
 #[derive(Debug, Clone)]
@@ -283,7 +357,49 @@ fn resolve_instance_target(
     })
 }
 
-#[allow(dead_code)]
+/// Validate a user-entered dependency selection before it is persisted.
+///
+/// The Setup page calls this so that "tools verified" is a distinct fact from
+/// "instances discovered" and from "ADB device online"; the returned summary
+/// reports each stage separately (requirements FR-002/FR-003). Nothing here
+/// taps the App or the check-in control.
+pub(crate) fn validate_dependency_selection(
+    store: &ConfigStore,
+    ldconsole_path: &str,
+    adb_path: &str,
+) -> Result<String> {
+    let ld = ldplayer::LdPlayer::discover(ldconsole_path, &store.root)
+        .map_err(|error| anyhow::anyhow!("LDPlayer 工具验证失败: {:#}", error))?;
+    let instances = ld
+        .instances()
+        .map_err(|error| anyhow::anyhow!("ldconsole list2 读取失败: {:#}", error))?;
+    if instances.is_empty() {
+        bail!("ldconsole list2 未发现任何实例;请确认 LDPlayer 已安装并至少创建一个实例");
+    }
+    let adb_path = adb::find_adb_for_ldplayer(adb_path, Some(&ld.executable), Some(&store.root))
+        .map_err(|error| anyhow::anyhow!("ADB 工具验证失败: {:#}", error))?;
+    let output = process::command(&adb_path)
+        .arg("version")
+        .output()
+        .with_context(|| format!("无法执行 ADB: {}", adb_path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "ADB version 失败: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(format!(
+        "工具已验证;LDPlayer:{} ({} 个实例);ADB:{};版本:{}",
+        ld.executable.display(),
+        instances.len(),
+        adb_path.display(),
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("unknown")
+    ))
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct InstanceSummary {
     pub index: u32,
@@ -370,16 +486,36 @@ fn instance_command(store: &ConfigStore, command: InstanceCommand) -> Result<Exi
     Ok(ExitCode::Ok)
 }
 
+/// GUI startup entry. A missing or damaged config must land the user in the
+/// Repair page rather than a startup error dialog, so a load failure is turned
+/// into a `ConfigStore::recovery` handle that keeps the broken file untouched.
 pub fn launch_gui() -> anyhow::Result<()> {
-    let store = ConfigStore::load()?;
-    launch_gui_with_store(store)
+    let mut args = std::env::args_os();
+    let _exe = args.next();
+    let mut config_path = None;
+    while let Some(arg) = args.next() {
+        if arg == "about" || arg == "--about" {
+            print_about();
+            return Ok(());
+        }
+        if arg == "--config" {
+            config_path = args.next().map(PathBuf::from);
+        }
+    }
+    let (store, startup_error) = match ConfigStore::load_with_config_path(config_path.as_deref()) {
+        Ok(store) => (store, None),
+        Err(error) => {
+            let message = format!("{error:#}");
+            (
+                ConfigStore::recovery(config_path.as_deref(), message.clone())?,
+                Some(message),
+            )
+        }
+    };
+    gui::launch(store, startup_error)
 }
 
-fn launch_gui_with_store(store: ConfigStore) -> anyhow::Result<()> {
-    gui::launch(store)
-}
-
-fn launch_gui_companion() -> Result<ExitCode> {
+fn launch_gui_companion(config_path: Option<&Path>) -> Result<ExitCode> {
     let cli_exe = std::env::current_exe().context("无法取得 CLI EXE 路径")?;
     let gui_exe = cli_exe
         .parent()
@@ -387,24 +523,29 @@ fn launch_gui_companion() -> Result<ExitCode> {
         .join("zhfd-checkin-gui.exe");
     if !gui_exe.is_file() {
         bail!(
-            "找不到独立 GUI 程序: {}；请运行 zhfd-checkin-gui.exe",
+            "找不到独立 GUI 程序：{}；请运行 zhfd-checkin-gui.exe",
             gui_exe.display()
         );
     }
-    process::detached_command(&gui_exe)
+    // The GUI is the Repair entry point, so an explicit config path must be
+    // forwarded verbatim; otherwise repairing a non-default config would show
+    // the portable candidate instead.
+    let mut command = process::detached_command(&gui_exe);
+    if let Some(path) = config_path {
+        command.arg("--config").arg(path);
+    }
+    command
         .spawn()
         .with_context(|| format!("无法启动 GUI: {}", gui_exe.display()))?;
     Ok(ExitCode::Ok)
 }
 
-#[allow(dead_code)]
 fn write_report(store: &ConfigStore) -> Result<ExitCode> {
     let path = logger::write_diagnostic_report(store)?;
     println!("诊断报告: {}", path.display());
     Ok(ExitCode::Ok)
 }
 
-#[allow(dead_code)]
 pub(crate) fn analyze_image_file(path: &std::path::Path) -> Result<vision::ButtonAnalysis> {
     let bytes = std::fs::read(path).with_context(|| format!("无法读取图片: {}", path.display()))?;
     let image = vision::decode(&bytes)?;
@@ -429,10 +570,17 @@ fn analyze_image(path: &std::path::Path) -> Result<ExitCode> {
     Ok(ExitCode::Ok)
 }
 
-#[allow(dead_code)]
 fn print_about() {
     println!("zhfd-checkin {}", VERSION);
     println!("Git commit: {}", GIT_COMMIT);
+    println!("Build id: {}", build_id());
+    // Provenance honesty (FR-014): a build from a tree with uncommitted tracked
+    // changes is not the commit it names, and must say so.
+    match git_dirty() {
+        Some(true) => println!("工作区状态: dirty（包含未提交的已跟踪改动，非纯提交构建）"),
+        Some(false) => println!("工作区状态: clean"),
+        None => println!("工作区状态: unknown（构建时无法运行 git status）"),
+    }
     println!("Rust Windows 便携式 CLI");
     println!("雷电模拟器官网: {}", LDPLAYER_URL);
     println!("智汇福大官网: {}", ZHFD_URL);
@@ -480,7 +628,6 @@ fn config_command(store: &ConfigStore, command: ConfigCommand) -> Result<ExitCod
     Ok(ExitCode::Ok)
 }
 
-#[allow(dead_code)]
 fn profile_command(store: &ConfigStore, command: ProfileCommand) -> Result<ExitCode> {
     match command {
         ProfileCommand::List => {
@@ -919,7 +1066,6 @@ pub(crate) fn installed_app_version(
     device.package_version(&store.config.app.package_name)
 }
 
-#[allow(dead_code)]
 fn app_command(store: &ConfigStore, command: AppCommand) -> Result<ExitCode> {
     match command {
         AppCommand::Install { apk, target } => {
@@ -937,8 +1083,15 @@ fn build_task_command_line(
     mode: &str,
     all_instances: bool,
     target: &InstanceTargetArgs,
+    config_path: Option<&Path>,
 ) -> String {
     let mut task_run = format!("\"{}\" {}", exe.display(), mode);
+    // The scheduled task launches a fresh process, so an explicit `--config`
+    // must be pinned into the command line; otherwise the task would silently
+    // run against whatever the portable/LocalAppData probe resolves to.
+    if let Some(path) = config_path {
+        task_run.push_str(&format!(" --config \"{}\"", path.display()));
+    }
     if all_instances {
         task_run.push_str(" --all-instances");
     } else if let Some(index) = target.instance_index {
@@ -968,7 +1121,7 @@ fn cli_executable_path(current_exe: &std::path::Path) -> std::path::PathBuf {
     current_exe.to_path_buf()
 }
 
-fn task_command(command: TaskCommand) -> Result<ExitCode> {
+fn task_command(command: TaskCommand, config_path: Option<&Path>) -> Result<ExitCode> {
     match command {
         TaskCommand::Create {
             name,
@@ -987,9 +1140,9 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
             } else {
                 "run --dry-run"
             };
-            let task_run = build_task_command_line(&exe, mode, all_instances, &target);
+            let task_run = build_task_command_line(&exe, mode, all_instances, &target, config_path);
             let task_run_arg = format!("\"{}\"", task_run);
-            let store = ConfigStore::load()?;
+            let store = load_store_for_cli(config_path)?;
             let start = store.config.window.start.clone();
             let output = process::command("schtasks.exe")
                 .args([
@@ -1041,7 +1194,6 @@ fn task_command(command: TaskCommand) -> Result<ExitCode> {
     Ok(ExitCode::Ok)
 }
 
-#[allow(dead_code)]
 pub(crate) fn dump_ui_hierarchy(
     store: &ConfigStore,
     target: &InstanceTargetArgs,
@@ -1057,34 +1209,23 @@ fn ui_command(store: &ConfigStore, command: UiCommand) -> Result<ExitCode> {
     Ok(ExitCode::Ok)
 }
 
-fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
-    let mode = if args.live {
-        Mode::Live
-    } else if args.dry_run {
-        Mode::DryRun
-    } else {
-        Mode::from_config(&store.config.runtime.mode)?
-    };
-    if args.all_instances {
-        return run_all_instances(store, args);
-    }
-    let log = RunLog::new(&store.root)?;
-    let mut result = RunResult {
+/// Build a fresh run result for one execution attempt.
+///
+/// `status` starts as `running` and is converged exactly once by
+/// [`finalize_run`]; `blocked` is the only status the batch layer sets itself.
+fn new_run_result(mode: Mode, log: &RunLog, target: &InstanceTargetArgs) -> RunResult {
+    RunResult {
         schema_version: 3,
-        run_id: log
-            .dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+        run_id: log_id(log),
         started_at: chrono::Local::now().to_rfc3339(),
         finished_at: None,
         mode: mode.as_str().into(),
-        status: Some("running".into()),
+        status: Some(RunStatus::Running.as_str().into()),
         blocked_by: None,
         error_code: None,
-        instance_index: args.target.instance_index,
+        instance_index: target.instance_index,
         instance_name: None,
-        serial: String::new(),
+        serial: target.serial.clone().unwrap_or_default(),
         profile_id: None,
         screen_width: None,
         screen_height: None,
@@ -1108,50 +1249,116 @@ fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
         button_state: None,
         location_state: None,
         foreground_package: None,
+        hierarchy_status: None,
+        overlay_package: None,
         app_version: Some(VERSION.into()),
         git_commit: Some(GIT_COMMIT.into()),
-        build_id: Some(format!("{}-{}", VERSION, GIT_COMMIT)),
+        git_dirty: git_dirty(),
+        build_id: Some(build_id()),
         error: None,
-    };
+    }
+}
+
+fn log_id(log: &RunLog) -> String {
+    log.dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn run_mode(store: &ConfigStore, args: &RunArgs) -> Result<Mode> {
+    if args.live {
+        Ok(Mode::Live)
+    } else if args.dry_run {
+        Ok(Mode::DryRun)
+    } else {
+        Mode::from_config(&store.config.runtime.mode)
+    }
+}
+
+fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
+    if args.all_instances {
+        return run_all_instances(store, args);
+    }
+    let (code, result) = run_single(store, &args)?;
+    println!("结果: {}", serde_json::to_string_pretty(&result)?);
+    Ok(code)
+}
+
+/// Execute one instance run and return both the exit code and the converged
+/// result, so the batch layer can reference the real per-instance `result.json`
+/// instead of re-deriving an identity for it.
+fn run_single(store: &ConfigStore, args: &RunArgs) -> Result<(ExitCode, RunResult)> {
+    let mode = run_mode(store, args)?;
+    let log = RunLog::new(&store.root)?;
+    let mut result = new_run_result(mode, &log, &args.target);
     seed_result_identity(store, &args.target, &mut result);
-    log.event("start", serde_json::json!({"mode":mode.as_str()}))?;
+    // Provenance travels with the run itself, not only with the final result, so
+    // a run can be attributed to the exact binary even when it never finishes
+    // (FR-014). `git_dirty` is emitted separately because a dirty build is not
+    // the commit it names.
+    log.event(
+        "start",
+        serde_json::json!({
+            "mode": mode.as_str(),
+            "app_version": VERSION,
+            "git_commit": GIT_COMMIT,
+            "git_dirty": git_dirty(),
+            "build_id": build_id(),
+        }),
+    )?;
     if mode == Mode::Live && !args.confirm {
         set_run_failure(
             &mut result,
             "live_confirmation_required",
             "click_authorization",
-            "正式模式需要显式 --confirm；未执行签到点击。",
+            "正式模式需要显式 --confirm;未执行签到点击。",
         );
         finalize_run(&log, &mut result)?;
-        println!("结果: {}", serde_json::to_string_pretty(&result)?);
-        return Ok(ExitCode::BusinessFailure);
+        return Ok((ExitCode::BusinessFailure, result));
     }
 
-    let execution = run_inner(store, &args, mode, &log, &mut result);
+    let execution = run_inner(store, args, mode, &log, &mut result);
     let code = match execution {
         Ok(code) => code,
         Err(error) => {
-            if result.error.is_none() {
-                result.error = Some(format!("{:#}", error));
-            }
-            if result.error_stage.is_none() {
-                result.error_stage = Some("runtime".into());
-            }
-            if result.recovery_action.is_none() {
-                result.recovery_action = Some("请查看诊断报告和最新运行截图后重试。".into());
-            }
+            // Propagated I/O errors still converge through the single failure
+            // entry, keeping the most specific stage already recorded and
+            // deriving a stable machine code from it.
+            let stage = result
+                .error_stage
+                .clone()
+                .unwrap_or_else(|| "runtime".to_string());
+            let (code_label, recovery) = propagated_failure(&stage);
+            set_run_failure(&mut result, code_label, &stage, recovery);
+            result.error = Some(format!("{:#}", error));
             eprintln!("运行失败: {:#}", error);
             ExitCode::DeviceFailure
         }
     };
 
     finalize_run(&log, &mut result)?;
-    println!("结果: {}", serde_json::to_string_pretty(&result)?);
-    Ok(code)
+    Ok((code, result))
 }
 
+/// Single convergence point for a run result.
+///
+/// Every terminal status is derived here from the accumulated evidence, so a
+/// run can never be persisted while still claiming `running`, and stable
+/// machine errors always reach `error_code` (frozen decisions D-05/D-07).
 fn finalize_run(log: &RunLog, result: &mut RunResult) -> Result<()> {
     result.finished_at = Some(chrono::Local::now().to_rfc3339());
+    if result.status.as_deref() != Some(RunStatus::Blocked.as_str()) {
+        let status = if result.success || result.dry_run_ready || result.field_work_ready {
+            RunStatus::Success
+        } else {
+            RunStatus::Failed
+        };
+        result.status = Some(status.as_str().into());
+    }
+    if result.error_code.is_none() {
+        result.error_code = result.error.clone();
+    }
     result.artifact_paths = [
         log.dir.join("result.json"),
         log.dir.join("events.jsonl"),
@@ -1165,6 +1372,14 @@ fn finalize_run(log: &RunLog, result: &mut RunResult) -> Result<()> {
     Ok(())
 }
 
+/// Two-phase batch orchestration (frozen decisions D-05/D-07, requirement
+/// FR-015).
+///
+/// Phase 1 runs a shared dependency preflight. If it fails, no device is
+/// started: every planned instance is written as an individual `blocked`
+/// result and a run-level `summary.json` records the shared blocker. Phase 2
+/// runs each instance independently, continues past instance-specific
+/// failures, and writes the aggregate summary.
 fn run_all_instances(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
     if args.target.instance_index.is_some() || args.target.serial.is_some() {
         bail!("--all-instances 不能与 --instance-index 或 --serial 同时使用");
@@ -1173,8 +1388,48 @@ fn run_all_instances(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
     if configured.is_empty() {
         bail!("没有启用的 LDPlayer 实例");
     }
+    let mode = run_mode(store, &args)?;
+    // The batch identity owns the summary directory; every per-instance result
+    // stays in its own log directory and is referenced from the summary.
+    let batch_id = logger::new_batch_id();
+    let mut entries = Vec::new();
+
+    if let Err(error) = shared_preflight(store) {
+        let error_text = format!("{error:#}");
+        println!("公共依赖 preflight 失败: {error_text}");
+        // No device is started: each planned instance gets its own blocked
+        // result so the instance identity is never lost to the shared blocker.
+        for instance in &configured {
+            let log = RunLog::new(&store.root)?;
+            let mut result = blocked_instance_result(mode, &log, instance, &error_text);
+            log.event(
+                "blocked",
+                serde_json::json!({"blocked_by":"shared_preflight","error":error_text}),
+            )?;
+            finalize_run(&log, &mut result)?;
+            entries.push(instance_summary_entry(&result, RunStatus::Blocked, None));
+        }
+        let summary = serde_json::json!({
+            "schema_version": 3,
+            "app_version": VERSION,
+            "git_commit": GIT_COMMIT,
+            "git_dirty": git_dirty(),
+            "build_id": build_id(),
+            "run_id": batch_id,
+            "mode": mode.as_str(),
+            "status": RunStatus::Blocked.as_str(),
+            "blocked_by": "shared_preflight",
+            "error_code": "shared_preflight_failed",
+            "error": error_text,
+            "instances": entries,
+        });
+        let path = logger::write_batch_summary(&store.root, &batch_id, &summary)?;
+        println!("批量运行被公共依赖阻断，摘要:{}", path.display());
+        return Ok(ExitCode::DeviceFailure);
+    }
+
     let mut overall = ExitCode::Ok;
-    for configured_instance in configured {
+    for configured_instance in &configured {
         let mut per_instance = args.clone();
         per_instance.all_instances = false;
         per_instance.target = InstanceTargetArgs {
@@ -1185,23 +1440,171 @@ fn run_all_instances(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
         println!(
             "=== 运行实例 {} ({}) serial={} ===",
             configured_instance.instance_index,
-            if configured_instance.name.trim().is_empty() {
-                "未命名"
-            } else {
-                configured_instance.name.as_str()
-            },
+            display_instance_name(configured_instance),
             per_instance
                 .target
                 .serial
                 .as_deref()
                 .unwrap_or("按 index 推导")
         );
-        let code = run(store, per_instance)?;
-        if code as i32 > overall as i32 {
-            overall = code;
+        // An instance-specific failure is isolated: the batch continues with the
+        // remaining instances and the aggregate exit code stays non-zero. Even a
+        // failure to *write* one instance's result must not abort the batch, or
+        // the remaining instances would never run and no summary would exist.
+        match run_single(store, &per_instance) {
+            Ok((code, result)) => {
+                println!("结果: {}", serde_json::to_string_pretty(&result)?);
+                if code as i32 > overall as i32 {
+                    overall = code;
+                }
+                let status = if code == ExitCode::Ok {
+                    RunStatus::Success
+                } else {
+                    RunStatus::Failed
+                };
+                entries.push(instance_summary_entry(&result, status, Some(code as i32)));
+            }
+            Err(error) => {
+                let error_text = format!("{error:#}");
+                eprintln!(
+                    "实例 {} 结果写入失败: {error_text}",
+                    configured_instance.instance_index
+                );
+                if overall == ExitCode::Ok {
+                    overall = ExitCode::DeviceFailure;
+                }
+                entries.push(serde_json::json!({
+                    "index": configured_instance.instance_index,
+                    "name": display_instance_name(configured_instance),
+                    "serial": resolved_serial_for(configured_instance),
+                    "status": RunStatus::Failed.as_str(),
+                    "blocked_by": serde_json::Value::Null,
+                    "error_code": "result_write_failed",
+                    "run_id": serde_json::Value::Null,
+                    "result_path": serde_json::Value::Null,
+                    "exit_code": ExitCode::DeviceFailure as i32,
+                    "error": error_text,
+                }));
+            }
         }
     }
+    let summary = serde_json::json!({
+        "schema_version": 3,
+        "app_version": VERSION,
+        "git_commit": GIT_COMMIT,
+        "git_dirty": git_dirty(),
+        "build_id": build_id(),
+        "run_id": batch_id,
+        "mode": mode.as_str(),
+        "status": if overall == ExitCode::Ok {
+            RunStatus::Success.as_str()
+        } else {
+            RunStatus::Failed.as_str()
+        },
+        "blocked_by": serde_json::Value::Null,
+        "error_code": serde_json::Value::Null,
+        "instances": entries,
+    });
+    let path = logger::write_batch_summary(&store.root, &batch_id, &summary)?;
+    println!("批量运行摘要:{}", path.display());
     Ok(overall)
+}
+
+/// Result written for an instance that was planned but never started because a
+/// shared dependency preflight failed (frozen decision D-05).
+///
+/// The instance identity is preserved in full: a shared blocker must not erase
+/// which instances the batch intended to run.
+fn blocked_instance_result(
+    mode: Mode,
+    log: &RunLog,
+    instance: &config::EmulatorInstanceConfig,
+    error_text: &str,
+) -> RunResult {
+    let target = InstanceTargetArgs {
+        instance_index: Some(instance.instance_index),
+        serial: (!instance.serial.trim().is_empty()).then_some(instance.serial.clone()),
+    };
+    let mut result = new_run_result(mode, log, &target);
+    result.instance_index = Some(instance.instance_index);
+    result.instance_name = Some(display_instance_name(instance));
+    result.serial = resolved_serial_for(instance);
+    result.status = Some(RunStatus::Blocked.as_str().into());
+    result.blocked_by = Some("shared_preflight".into());
+    result.error_code = Some("shared_preflight_failed".into());
+    result.error = Some(error_text.to_string());
+    result.error_stage = Some("shared_preflight".into());
+    result.recovery_action = Some(
+        "公共依赖(ldconsole.exe / adb.exe)不可用；请修复依赖后重新运行，本次没有启动任何设备。"
+            .into(),
+    );
+    result
+}
+
+/// Dependencies shared by every planned instance. A failure here is not a
+/// per-device fault and must not be reported as N independent device errors.
+fn shared_preflight(store: &ConfigStore) -> Result<()> {
+    let ld = ldplayer::LdPlayer::discover(
+        &configured_path(store, &store.config.emulator.ldconsole_path),
+        &store.root,
+    )?;
+    let instances = ld.instances()?;
+    if instances.is_empty() {
+        bail!("ldconsole list2 未发现任何实例");
+    }
+    let adb_path = adb::find_adb_for_ldplayer(
+        &store.config.emulator.adb_path,
+        Some(&ld.executable),
+        Some(&store.root),
+    )?;
+    let output = process::command(&adb_path)
+        .arg("version")
+        .output()
+        .with_context(|| format!("无法执行 ADB: {}", adb_path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "ADB version 失败: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn display_instance_name(instance: &config::EmulatorInstanceConfig) -> String {
+    if instance.name.trim().is_empty() {
+        format!("实例 {}", instance.instance_index)
+    } else {
+        instance.name.clone()
+    }
+}
+
+fn resolved_serial_for(instance: &config::EmulatorInstanceConfig) -> String {
+    if instance.serial.trim().is_empty() {
+        ldplayer::LdPlayer::tcp_serial_for_index(instance.instance_index).unwrap_or_default()
+    } else {
+        instance.serial.clone()
+    }
+}
+
+/// One machine-readable entry per planned instance in the batch summary. The
+/// instance identity (`index`/`name`/`serial`) survives even when the run is
+/// blocked, so a shared blocker never erases which instances were planned.
+fn instance_summary_entry(
+    result: &RunResult,
+    status: RunStatus,
+    exit_code: Option<i32>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "index": result.instance_index,
+        "name": result.instance_name,
+        "serial": result.serial,
+        "status": status.as_str(),
+        "blocked_by": result.blocked_by,
+        "error_code": result.error_code,
+        "run_id": result.run_id,
+        "result_path": result.artifact_paths.first(),
+        "exit_code": exit_code,
+    })
 }
 
 fn run_inner(
@@ -1278,10 +1681,124 @@ fn seed_result_identity(store: &ConfigStore, target: &InstanceTargetArgs, result
     });
 }
 
+/// Keep the typed `page_route` and the machine `route` string in lockstep.
+///
+/// Both fields are part of the v0.3 result contract; letting them drift is what
+/// previously left `route` permanently `null` while `page_route` carried the
+/// real decision.
+fn set_page_route(result: &mut RunResult, route: PageRoute) {
+    result.page_route = Some(route);
+    result.route = Some(route.as_str().to_string());
+}
+
+fn set_checkin_mode(result: &mut RunResult, mode: CheckinMode) {
+    result.checkin_mode = Some(mode);
+}
+
+/// Stable machine code and recovery advice for an error that propagated out of
+/// `run_inner`, derived from the stage that was current when it happened.
+///
+/// Without this the whole class of I/O failures collapsed into one
+/// `runtime_error` code and lost the stage that produced it.
+fn propagated_failure(stage: &str) -> (&'static str, &'static str) {
+    match stage {
+        "device_setup" => (
+            "device_setup_failed",
+            "无法准备设备(模拟器/ADB)；请检查实例是否可启动、serial 是否正确，然后重试。",
+        ),
+        "app_launch" | "app_foreground" => (
+            "app_start_failed",
+            "目标 App 未能进入前台；请在模拟器中手动打开并登录后重试。",
+        ),
+        "visual_observation" | "page_observation" => (
+            "observation_failed",
+            "截图或页面层级读取失败；请检查设备状态后重试。",
+        ),
+        _ => ("runtime_error", "请查看诊断报告和最新运行截图后重试。"),
+    }
+}
+
+/// Hard upper bound for the locating wait, in seconds.
+///
+/// Frozen decision D-09 fixes the cap at 120 s; the configuration may only make
+/// the wait shorter, never longer, so a mistyped `location_timeout_seconds`
+/// cannot turn the bounded wait into an unbounded one.
+fn location_wait_limit(store: &ConfigStore) -> u64 {
+    const HARD_CAP_SECONDS: u64 = 120;
+    store
+        .config
+        .runtime
+        .location_timeout_seconds
+        .clamp(1, HARD_CAP_SECONDS)
+}
+
+/// The single failure entry point.
+///
+/// Every terminal failure goes through here so that the stable machine code,
+/// the user-readable error, the failure stage and the recovery suggestion can
+/// never drift apart (`status` is then converged by [`finalize_run`]).
 fn set_run_failure(result: &mut RunResult, code: &str, stage: &str, recovery_action: &str) {
     result.error = Some(code.into());
+    result.error_code = Some(code.into());
     result.error_stage = Some(stage.into());
     result.recovery_action = Some(recovery_action.into());
+}
+
+/// Map the visual button state onto the machine `button_state` field. This is
+/// deliberately separate from `checkin_state`: "the button is not ready" is not
+/// the same fact as "the page is unknown" (requirement FR-016).
+fn button_state_label(state: vision::ButtonState) -> &'static str {
+    match state {
+        vision::ButtonState::Gray => "gray",
+        vision::ButtonState::Locating => "locating",
+        vision::ButtonState::Ready => "ready",
+        vision::ButtonState::Success => "success",
+        vision::ButtonState::Unknown => "unknown",
+    }
+}
+
+/// Map the visual button state onto the machine `location_state` field.
+fn location_state_label(state: vision::ButtonState) -> &'static str {
+    match state {
+        vision::ButtonState::Locating => "locating",
+        vision::ButtonState::Ready => "ready",
+        vision::ButtonState::Success => "success",
+        vision::ButtonState::Gray => "unknown",
+        vision::ButtonState::Unknown => "unknown",
+    }
+}
+
+fn describe_route_failure(route: PageRoute) -> (&'static str, &'static str) {
+    match route {
+        PageRoute::Login => (
+            "login_required",
+            "请在模拟器中手动完成登录；本程序不会输入账号、密码、验证码或点击一键登录。",
+        ),
+        PageRoute::RouteCandidateUnconfirmed => (
+            "route_candidate_unconfirmed",
+            "页面候选缺少可验证的层级证据；请手动确认页面后重试。",
+        ),
+        PageRoute::RouteEvidenceConflict => (
+            "route_evidence_conflict",
+            "页面截图和层级证据不一致；请手动确认页面后重试。",
+        ),
+        PageRoute::StalePageRefreshFailed => (
+            "stale_page_refresh_failed",
+            "启动时停留在旧的签到页，返回后未回到服务页；请手动返回首页后重新运行。",
+        ),
+        PageRoute::StalePageRefreshUnconfirmed => (
+            "stale_page_refresh_unconfirmed",
+            "启动时停留在旧的签到页，返回后页面层级无法读取；请手动返回首页后重新运行。",
+        ),
+        PageRoute::AppLeftForeground => (
+            "target_app_not_foreground",
+            "启动时停留在旧的签到页，返回后目标 App 已离开前台（可能退到了桌面）；程序未执行点击。请手动把 App 的普通签到页切回前台后重新运行。",
+        ),
+        _ => (
+            route.error_code().unwrap_or("navigation_not_confirmed"),
+            "请手动进入“晚点名签到”页面后重新运行;未执行签到点击。",
+        ),
+    }
 }
 
 fn checkin_state_from_visual(state: vision::ButtonState) -> CheckinState {
@@ -1435,11 +1952,20 @@ where
         return Ok(ExitCode::Timeout);
     }
     thread::sleep(Duration::from_millis(800));
+    log_foreground_snapshot(&device, log, "after_wait_for_package", result)?;
 
     result.error_stage = Some("navigation".into());
-    let navigation = locate_or_navigate(&device, profile, log)?;
-    result.page_route = Some(navigation.route);
-    result.checkin_mode = Some(navigation.checkin_mode);
+    let navigation = locate_or_navigate(
+        &device,
+        profile,
+        log,
+        result,
+        &store.config.app.package_name,
+    )?;
+    result.overlay_package = navigation.overlay_package.clone();
+    set_page_route(result, navigation.route);
+    set_checkin_mode(result, navigation.checkin_mode);
+    result.hierarchy_status = navigation.hierarchy_status.map(str::to_string);
     result.page_refresh_attempted = Some(navigation.page_refresh_attempted);
     result.page_refresh_confirmed = Some(navigation.page_refresh_confirmed);
     log.event(
@@ -1451,37 +1977,17 @@ where
     )?;
     if navigation.route != PageRoute::Checkin {
         let (code, recovery) = match navigation.route {
-            PageRoute::Login => (
-                "login_required",
-                "请在模拟器中手动完成登录；本程序不会输入账号、密码、验证码或点击一键登录。",
-            ),
-            PageRoute::RouteCandidateUnconfirmed => (
-                "route_candidate_unconfirmed",
-                "页面候选缺少可验证的层级证据；请手动确认页面后重试。",
-            ),
-            PageRoute::RouteEvidenceConflict => (
-                "route_evidence_conflict",
-                "页面截图和层级证据不一致；请手动确认页面后重试。",
-            ),
-            _ => (
-                "navigation_not_confirmed",
-                "请手动进入“晚点名签到”页面后重新运行；未执行签到点击。",
-            ),
+            PageRoute::RouteCandidateUnconfirmed => {
+                unconfirmed_page_failure(navigation.overlay_package.as_deref())
+            }
+            route => {
+                let (code, recovery) = describe_route_failure(route);
+                (code, recovery.to_string())
+            }
         };
-        set_run_failure(result, code, "navigation", recovery);
+        set_run_failure(result, code, "navigation", &recovery);
         return Ok(ExitCode::VisionFailure);
     }
-    if navigation.checkin_mode == CheckinMode::Unsupported {
-        result.checkin_state = Some(CheckinState::Unknown);
-        set_run_failure(
-            result,
-            "unsupported_checkin_mode",
-            "checkin_classification",
-            "当前签到按钮文案/业务模式未识别；请人工确认页面并提供脱敏 hierarchy 证据。",
-        );
-        return Ok(ExitCode::BusinessFailure);
-    }
-
     if navigation.checkin_mode == CheckinMode::FieldWork {
         result.error_stage = Some("field_work_observation".into());
         log.event(
@@ -1556,44 +2062,115 @@ where
                 );
                 break;
             }
-            if started.elapsed()
-                >= Duration::from_secs(store.config.runtime.location_timeout_seconds)
+            if started.elapsed() >= Duration::from_secs(location_wait_limit(store)) {
+                // Frozen decision D-09: the bounded locating wait has a stable
+                // machine code and keeps its last evidence.
+                set_run_failure(
+                    result,
+                    "location_wait_timeout",
+                    "checkin_wait",
+                    "定位等待达到 120 秒上限；已保留最后一轮证据并安全停止，未执行点击。",
+                );
+                break;
+            }
+            // D-09 also stops when the configured window has less than five
+            // seconds left: there is no longer a safe window to click in.
+            if let Some(remaining) = domain::seconds_until_configured_window_end(
+                &store.config.window.start,
+                &store.config.window.end,
+                &store.config.window.timezone,
+            )? && remaining < 5
             {
                 set_run_failure(
                     result,
-                    "location_timeout",
+                    "location_wait_timeout",
                     "checkin_wait",
-                    "请检查网络/定位权限和页面状态，之后重新运行。",
+                    "签到窗口剩余不足 5 秒，已停止等待并保留最后一轮证据，未执行点击。",
                 );
                 break;
             }
         }
 
+        // Every round records the foreground package and a hierarchy
+        // observation with its own id, so a route decision can always be tied
+        // back to the same foreground read, dump status and screenshot
+        // (requirements FR-011/FR-012/FR-013).
         result.error_stage = Some("page_observation".into());
-        let hierarchy = match device.dump_hierarchy() {
-            Ok(hierarchy) => hierarchy,
-            Err(_) => {
+        let observation_id = log.next_observation_id();
+        if !require_target_foreground(
+            &device,
+            log,
+            "state_poll",
+            result,
+            &store.config.app.package_name,
+        )? {
+            break;
+        }
+        let page = observe_page_route(
+            &device,
+            log,
+            "state_poll",
+            observation_id,
+            &store.config.app.package_name,
+        )?;
+        let current_route = page.route;
+        let current_mode = page.checkin_mode;
+        result.overlay_package = page.foreign_package.clone();
+        result.hierarchy_status = Some(page.status.into());
+        set_page_route(result, current_route);
+        set_checkin_mode(result, current_mode);
+        // `page_loading` is its own dimension and must not be inferred from an
+        // unreadable hierarchy. It stays unknown here and is only set once the
+        // button observation for this round provides evidence.
+        result.page_loading = None;
+        if let Some(package) = page.foreign_package.as_deref() {
+            let (code, recovery) = unconfirmed_page_failure(Some(package));
+            set_run_failure(result, code, "page_observation", &recovery);
+            break;
+        }
+        match current_route {
+            // A dump that failed or returned no usable page identity is its own
+            // diagnosis, not "the page changed".
+            PageRoute::RouteCandidateUnconfirmed => {
+                let (code, recovery) = unconfirmed_page_failure(page.foreign_package.as_deref());
+                set_run_failure(result, code, "page_observation", &recovery);
+                break;
+            }
+            PageRoute::RouteEvidenceConflict => {
                 set_run_failure(
                     result,
-                    "hierarchy_unavailable",
+                    "route_evidence_conflict",
                     "page_observation",
-                    "请保持目标签到页在前台并重新运行诊断；页面无法确认时不会点击。",
+                    "页面截图和层级证据不一致；请人工确认页面后重试。未执行签到点击。",
                 );
                 break;
             }
-        };
-        let current_route = detect_page_route(&hierarchy);
-        let current_mode = detect_checkin_mode(&hierarchy);
-        result.page_route = Some(current_route);
-        result.checkin_mode = Some(current_mode);
-        if current_route != PageRoute::Checkin || current_mode != CheckinMode::Ordinary {
-            set_run_failure(
-                result,
-                "page_context_changed",
-                "page_observation",
-                "请返回普通晚点名签到页面并重新运行；程序已停止自动点击。",
-            );
-            break;
+            PageRoute::Checkin if current_mode == CheckinMode::Ordinary => {}
+            PageRoute::Checkin => {
+                // Defensive fallback: observe_page_route normally classifies a
+                // confirmed check-in page as Ordinary or FieldWork. If a future
+                // classifier adds another mode, this remains fail-closed.
+                result.checkin_state = Some(CheckinState::Unknown);
+                set_run_failure(
+                    result,
+                    "unsupported_checkin_mode",
+                    "checkin_classification",
+                    "当前签到模式不是普通晚点名签到；程序已停止自动点击。",
+                );
+                break;
+            }
+            other => {
+                // Home/Services/Login on a poll round: the page is readable but
+                // is no longer the ordinary check-in page.
+                let code = other.error_code().unwrap_or("page_context_changed");
+                set_run_failure(
+                    result,
+                    code,
+                    "page_observation",
+                    "请返回普通晚点名签到页面并重新运行；程序已停止自动点击。",
+                );
+                break;
+            }
         }
 
         result.error_stage = Some("visual_observation".into());
@@ -1608,14 +2185,50 @@ where
         let analysis = vision::classify_button(&image, button);
         let state = format!("{:?}", analysis.state).to_lowercase();
         result.state_history.push(state.clone());
+        result.button_state = Some(button_state_label(analysis.state).into());
+        result.location_state = Some(location_state_label(analysis.state).into());
         result.checkin_state = Some(checkin_state_from_visual(analysis.state));
+        // The page is observably settled once the control itself can be read.
+        // While it cannot, the loading dimension stays unknown rather than
+        // being asserted as "still loading".
+        result.page_loading = Some(analysis.state == vision::ButtonState::Unknown);
         log.event("state", &analysis)?;
 
         if analysis.state == vision::ButtonState::Success {
             result.error_stage = Some("success_confirmation".into());
+            // Re-read the hierarchy for the success round instead of reusing
+            // the earlier round's copy; a failed read downgrades the route
+            // rather than being silently treated as "no success text".
+            let success_round = log.next_observation_id();
+            let success_page = observe_page_route(
+                &device,
+                log,
+                "success_confirmation",
+                success_round,
+                &store.config.app.package_name,
+            )?;
+            let success_route = success_page.route;
+            let success_xml = &success_page.view.scoped_text;
+            result.overlay_package = success_page.foreign_package.clone();
+            result.hierarchy_status = Some(success_page.status.into());
+            if success_route != PageRoute::Checkin {
+                set_page_route(result, success_route);
+                let (code, recovery) = describe_route_failure(success_route);
+                set_run_failure(result, code, "success_confirmation", recovery);
+                log.event(
+                    "checkin_semantic_state",
+                    serde_json::json!({
+                        "route": success_route.as_str(),
+                        "mode": current_mode.as_str(),
+                        "state": CheckinState::Unknown.as_str(),
+                        "reason": "success_round_route_unconfirmed",
+                    }),
+                )?;
+                break;
+            }
             if !["签到成功", "已签到"]
                 .iter()
-                .any(|marker| hierarchy.contains(marker))
+                .any(|marker| success_xml.contains(marker))
             {
                 result.checkin_state = Some(CheckinState::Unknown);
                 log.event(
@@ -1639,7 +2252,7 @@ where
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
-            match extract_hierarchy_date(&hierarchy) {
+            match extract_hierarchy_date(success_xml) {
                 Some(detected_date) => {
                     let today = domain::configured_date(&store.config.window.timezone)?;
                     result.success_date = Some(detected_date.to_string());
@@ -1709,9 +2322,27 @@ where
             vision::ButtonState::Gray | vision::ButtonState::Locating => {
                 ready_frames = 0;
                 unknowns.reset();
-                thread::sleep(Duration::from_secs(
-                    store.config.runtime.locating_poll_seconds,
-                ));
+                if analysis.state == vision::ButtonState::Locating {
+                    log.event(
+                        "locating_wait",
+                        serde_json::json!({
+                            "elapsed_seconds": started.elapsed().as_secs(),
+                            "poll_seconds": store.config.runtime.locating_poll_seconds,
+                            "limit_seconds": store.config.runtime.location_timeout_seconds,
+                            "stop_conditions": [
+                                "ready",
+                                "success_or_failure",
+                                "foreground_lost",
+                                "window_remaining_below_5s",
+                                "limit_reached",
+                            ],
+                            "clicked": false,
+                        }),
+                    )?;
+                }
+                // Bounded by the locating budget and the window end, so a
+                // 2-second poll can never overshoot either deadline.
+                sleep_for_next_poll(store, started)?;
             }
             vision::ButtonState::Ready => {
                 let within_window = domain::in_configured_window(
@@ -1740,34 +2371,55 @@ where
                     break;
                 }
 
+                // Live gate: re-read the page and the foreground package
+                // immediately before the tap. `navigated=true` is never treated
+                // as evidence that the check-in page is still on screen.
                 result.error_stage = Some("click_authorization".into());
-                let confirmation_hierarchy = device.dump_hierarchy()?;
-                let confirmed_route = detect_page_route(&confirmation_hierarchy);
-                let confirmed_mode = detect_checkin_mode(&confirmation_hierarchy);
-                if confirmed_route != PageRoute::Checkin || confirmed_mode != CheckinMode::Ordinary
-                {
+                let tap_round = log.next_observation_id();
+                let tap_page = observe_page_route(
+                    &device,
+                    log,
+                    "before_live_tap",
+                    tap_round,
+                    &store.config.app.package_name,
+                )?;
+                let confirmed_route = tap_page.route;
+                let confirmed_mode = tap_page.checkin_mode;
+                result.overlay_package = tap_page.foreign_package.clone();
+                result.hierarchy_status = Some(tap_page.status.into());
+                if confirmed_route != PageRoute::Checkin {
+                    let (code, recovery) = describe_route_failure(confirmed_route);
+                    set_run_failure(result, code, "click_authorization", recovery);
+                    break;
+                }
+                if confirmed_mode != CheckinMode::Ordinary {
+                    // Still the check-in page, but no longer the ordinary mode:
+                    // the tap is not authorized for field work or unknown modes.
                     set_run_failure(
                         result,
                         "page_context_changed",
                         "click_authorization",
-                        "请确认普通签到页仍处于前台；程序未执行点击。",
+                        "签到模式已不是普通晚点名签到；程序未执行点击，请确认页面后重试。",
                     );
                     break;
                 }
-                let foreground_matches =
-                    device.current_package().unwrap_or_default() == store.config.app.package_name;
+                let foreground_matches = require_target_foreground(
+                    &device,
+                    log,
+                    "before_live_tap",
+                    result,
+                    &store.config.app.package_name,
+                )?;
                 if !foreground_matches {
-                    set_run_failure(
-                        result,
-                        "foreground_package_changed",
-                        "click_authorization",
-                        "请将目标 App 的普通签到页置于前台后重新运行；程序未执行点击。",
-                    );
                     break;
                 }
                 let confirm_bytes = device.screenshot()?;
                 let confirm_image = vision::decode(&confirm_bytes)?;
-                let confirm_button = vision::find_colored_button(&confirm_image).unwrap_or(button);
+                // The tap coordinate must come from THIS screenshot. Reusing the
+                // earlier round's box would tap a stale position; when nothing is
+                // detected, fall back to this image's profile geometry.
+                let confirm_button = vision::find_colored_button(&confirm_image)
+                    .unwrap_or_else(|| vision::fallback_button(&confirm_image, profile));
                 let confirm = vision::classify_button(&confirm_image, confirm_button);
                 if confirm.state != vision::ButtonState::Ready {
                     set_run_failure(
@@ -1864,7 +2516,7 @@ where
         ExitCode::Ok
     } else if matches!(
         result.error.as_deref(),
-        Some("location_timeout" | "success_timeout")
+        Some("location_wait_timeout" | "location_timeout" | "success_timeout")
     ) {
         ExitCode::Timeout
     } else {
@@ -1916,15 +2568,11 @@ fn guarded_tap<D: TapDevice>(device: &D, request: TapRequest) -> Result<bool> {
     Ok(true)
 }
 
-#[expect(dead_code, reason = "reserved for bounded scheduled waiting")]
+/// Sleep until the next locating poll, bounded by both the remaining locating
+/// budget and the remaining configured window (frozen decision D-09).
 fn sleep_for_next_poll(store: &ConfigStore, started: Instant) -> Result<()> {
-    let location_remaining = Duration::from_secs(
-        store
-            .config
-            .runtime
-            .location_timeout_seconds
-            .saturating_sub(started.elapsed().as_secs()),
-    );
+    let location_remaining =
+        Duration::from_secs(location_wait_limit(store).saturating_sub(started.elapsed().as_secs()));
     let mut sleep_for = Duration::from_secs(store.config.runtime.locating_poll_seconds);
     sleep_for = sleep_for.min(location_remaining);
     if let Some(window_remaining) = domain::seconds_until_configured_window_end(
@@ -2037,9 +2685,192 @@ struct NavigationResult {
     field_work_ready: bool,
     page_refresh_attempted: bool,
     page_refresh_confirmed: bool,
+    /// Machine result of the hierarchy read that produced `route`
+    /// (`dump_succeeded`, `dump_failed`, `dump_empty_or_truncated`,
+    /// `route_markers_missing`). `None` when no observation was needed.
+    hierarchy_status: Option<&'static str>,
+    /// Package of a window that was on screen but does not belong to the
+    /// target app, when one was seen. This is the direct evidence of a blocking
+    /// popup or advertisement.
+    overlay_package: Option<String>,
 }
 
-fn detect_checkin_mode(xml: &str) -> CheckinMode {
+/// Accessibility view of one hierarchy dump, scoped to the target app.
+///
+/// Page identity must be decided from the *target app's* nodes only. A popup or
+/// advertisement rendered by another process can carry the same words and would
+/// otherwise be mistaken for the check-in page, which is exactly how a blocking
+/// overlay could steer the route decision.
+#[derive(Debug, Clone)]
+struct PageView {
+    target_package: String,
+    nodes: Vec<PageNode>,
+    /// Distinct `package` attributes in document order.
+    packages: Vec<String>,
+    /// `text`/`content-desc` of in-scope nodes, joined for marker matching.
+    scoped_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct PageNode {
+    /// `package` attribute; `None` when the dump omits it.
+    package: Option<String>,
+    /// `text` and `content-desc`, newline-joined so a marker cannot be formed
+    /// by two adjacent attribute values.
+    labels: String,
+    clickable: bool,
+    center: (u32, u32),
+}
+
+impl PageView {
+    fn parse(xml: &str, target_package: &str) -> Self {
+        let mut nodes = Vec::new();
+        let mut packages: Vec<String> = Vec::new();
+        let mut scoped_text = String::new();
+        // Splitting on `<node` is also the recovery path for a malformed
+        // attribute that swallows the start of the next node: the split lands on
+        // the nested node, so the rest of the dump is not lost.
+        for chunk in xml.split("<node").skip(1) {
+            let Some(tag_end) = tag_body_end(chunk, 0) else {
+                continue;
+            };
+            let body = &chunk[..tag_end];
+            let package = attribute_value(body, "package")
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if let Some(package) = &package
+                && !packages.iter().any(|existing| existing == package)
+            {
+                packages.push(package.clone());
+            }
+            // A node belongs to the page when it declares the target package.
+            // Nodes without a `package` attribute (hand-written fixtures and
+            // partial dumps) are kept, so scoping can only ever *remove*
+            // foreign evidence, never the app's own.
+            let in_scope = package
+                .as_deref()
+                .is_none_or(|package| package == target_package);
+            let labels = ["content-desc", "text"]
+                .iter()
+                .filter_map(|name| attribute_value(body, name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Page identity is decided from text alone, so a node without
+            // parsable bounds still contributes its markers.
+            if in_scope && !labels.is_empty() {
+                scoped_text.push_str(&labels);
+                scoped_text.push('\n');
+            }
+            // Only a node with bounds can be a tap target.
+            let Some(center) = attribute_value(body, "bounds").and_then(bounds_center) else {
+                continue;
+            };
+            nodes.push(PageNode {
+                package,
+                labels,
+                clickable: attribute_value(body, "clickable") == Some("true"),
+                center,
+            });
+        }
+        Self {
+            target_package: target_package.to_string(),
+            nodes,
+            packages,
+            scoped_text,
+        }
+    }
+
+    /// A package on the hierarchy root is a window-level owner. Foreign
+    /// descendant nodes (for example a system-owned child) are not enough to
+    /// prove that a popup is blocking the target app; the focused window is
+    /// checked separately by `observe_page_route`.
+    fn root_foreign_package(&self) -> Option<&str> {
+        self.packages
+            .first()
+            .map(String::as_str)
+            .filter(|package| *package != self.target_package)
+    }
+
+    #[cfg(test)]
+    fn foreign_package(&self) -> Option<&str> {
+        self.root_foreign_package()
+    }
+
+    fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn find_labeled(
+        &self,
+        label: &str,
+        min_center_y: u32,
+        clickable_only: bool,
+    ) -> Option<(u32, u32)> {
+        self.nodes
+            .iter()
+            .filter(|node| {
+                node.package
+                    .as_deref()
+                    .is_none_or(|package| package == self.target_package)
+            })
+            .filter(|node| !clickable_only || node.clickable)
+            .filter(|node| node.labels.contains(label) && node.center.1 >= min_center_y)
+            .map(|node| node.center)
+            .next()
+    }
+}
+
+/// End of a `<node ...>` tag body: the first `>` outside a quoted value.
+fn tag_body_end(xml: &str, from: usize) -> Option<usize> {
+    let mut in_quote = false;
+    for (offset, ch) in xml.get(from..)?.char_indices() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            '>' if !in_quote => return Some(from + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Value of `name="..."` inside a tag body.
+///
+/// The preceding character must be whitespace (or the body start) so an
+/// attribute name cannot be matched inside another attribute's value.
+fn attribute_value<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=\"");
+    let mut cursor = 0usize;
+    while let Some(relative) = body[cursor..].find(&prefix) {
+        let start = cursor + relative;
+        let at_boundary = start == 0
+            || body[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        let value_start = start + prefix.len();
+        let length = body[value_start..].find('"')?;
+        if at_boundary {
+            return Some(&body[value_start..value_start + length]);
+        }
+        cursor = value_start + length;
+    }
+    None
+}
+
+/// Center point of a `bounds="[x1,y1][x2,y2]"` value.
+fn bounds_center(value: &str) -> Option<(u32, u32)> {
+    let numbers: Vec<u32> = value
+        .split(['[', ']', ','])
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    match numbers.as_slice() {
+        [x1, y1, x2, y2, ..] => Some(((x1 + x2) / 2, (y1 + y2) / 2)),
+        _ => None,
+    }
+}
+
+fn detect_checkin_mode(view: &PageView) -> CheckinMode {
+    let xml = &view.scoped_text;
     if xml.contains("外勤签到") {
         return CheckinMode::FieldWork;
     }
@@ -2059,7 +2890,8 @@ fn detect_checkin_mode(xml: &str) -> CheckinMode {
     CheckinMode::Unsupported
 }
 
-fn detect_page_route(xml: &str) -> PageRoute {
+fn detect_page_route(view: &PageView) -> PageRoute {
+    let xml = &view.scoped_text;
     if xml.contains("一键登录") || xml.contains("其他账户登录") {
         return PageRoute::Login;
     }
@@ -2076,7 +2908,11 @@ fn detect_page_route(xml: &str) -> PageRoute {
     // A status/action word alone is not sufficient page identity: the same
     // text can occur on summaries, overlays, and unrelated pages. The observed
     // check-in hierarchy exposes its page title, so require that context.
-    let has_checkin_title = xml.contains("晚点名签到");
+    //
+    // Note the same label is also the home page's entry card. Requiring it
+    // together with a status/action word is what keeps the entry card (which
+    // carries no status word) from being read as the check-in page.
+    let has_checkin_title = xml.contains(CHECKIN_ENTRY_LABEL);
     let ordinary_checkin_markers = [
         "无法签到",
         "未到签到时间",
@@ -2102,81 +2938,498 @@ fn detect_page_route(xml: &str) -> PageRoute {
     PageRoute::Unknown
 }
 
+/// Record the foreground package and keep the last trustworthy value in the
+/// result. A failed query is a distinct fact from "another package is in the
+/// foreground" and must not silently clear the last known package (FR-013).
+fn log_foreground_snapshot(
+    device: &adb::AdbDevice,
+    log: &RunLog,
+    stage: &str,
+    result: &mut RunResult,
+) -> Result<Option<String>> {
+    match device.current_package() {
+        Ok(package) => {
+            result.foreground_package = Some(package.clone());
+            log.event(
+                "foreground_snapshot",
+                serde_json::json!({"stage": stage, "package": package}),
+            )?;
+            Ok(Some(package))
+        }
+        Err(error) => {
+            // A failed query is recorded as such and is *not* treated as "the
+            // App is still in the foreground" (requirement FR-013).
+            log.event(
+                "foreground_snapshot",
+                serde_json::json!({"stage": stage, "error": format!("{error:#}")}),
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+/// Classify a foreground snapshot against the expected package.
+///
+/// `None` means the App is confirmed to be in the foreground; otherwise this
+/// returns the stable code plus the recovery text. A failed query and a
+/// different package are deliberately different outcomes (requirement FR-013).
+fn foreground_check(
+    snapshot: Option<&str>,
+    package_name: &str,
+) -> Option<(&'static str, &'static str)> {
+    match snapshot {
+        Some(package) if package == package_name => None,
+        Some(_) => Some((
+            "target_app_not_foreground",
+            "目标 App 已离开前台；请将其普通签到页置于前台后重新运行，程序未执行点击。",
+        )),
+        None => Some((
+            "foreground_query_failed",
+            "无法读取前台应用；出于安全考虑已停止，程序未执行点击。",
+        )),
+    }
+}
+
+/// Fail the run when the target App is not (or can no longer be confirmed as)
+/// the foreground package, keeping the two causes distinguishable.
+fn require_target_foreground(
+    device: &adb::AdbDevice,
+    log: &RunLog,
+    stage: &str,
+    result: &mut RunResult,
+    package_name: &str,
+) -> Result<bool> {
+    let snapshot = log_foreground_snapshot(device, log, stage, result)?;
+    match foreground_check(snapshot.as_deref(), package_name) {
+        None => Ok(true),
+        Some((code, recovery)) => {
+            set_run_failure(result, code, stage, recovery);
+            Ok(false)
+        }
+    }
+}
+
+/// Read the page hierarchy once and classify it, emitting a structured
+/// `hierarchy_observation` event carrying the dump status, byte count, UTF-8
+/// validity and marker hit summary for this round (FR-011).
+///
+/// A dump that fails or comes back empty/truncated is reported as
+/// `route_candidate_unconfirmed` rather than being folded into a generic
+/// failure or an empty string.
+/// One hierarchy read, already classified.
+///
+/// The raw XML and its parsed `PageView` travel together so a caller can make a
+/// navigation decision and then reuse the same round's evidence, instead of
+/// re-parsing or, worse, mixing rounds.
+#[derive(Debug, Clone)]
+struct PageObservation {
+    view: PageView,
+    route: PageRoute,
+    checkin_mode: CheckinMode,
+    /// `dump_succeeded`, `dump_failed`, `dump_empty_or_truncated` or
+    /// `route_markers_missing`.
+    status: &'static str,
+    /// Package that owns a visible window but is not the target app.
+    foreign_package: Option<String>,
+}
+
+impl PageObservation {
+    fn unreadable(status: &'static str, target_package: &str) -> Self {
+        Self {
+            view: PageView::parse("", target_package),
+            route: PageRoute::RouteCandidateUnconfirmed,
+            checkin_mode: CheckinMode::Unsupported,
+            status,
+            foreign_package: None,
+        }
+    }
+}
+
+fn observe_page_route(
+    device: &adb::AdbDevice,
+    log: &RunLog,
+    stage: &str,
+    observation_id: usize,
+    target_package: &str,
+) -> Result<PageObservation> {
+    let observation = device.dump_hierarchy_observation(stage)?;
+    let focused_window = device.focused_window().ok();
+    let focused_package = focused_window
+        .as_deref()
+        .and_then(adb::package_from_focused_window);
+    log.event(
+        "hierarchy_observation",
+        serde_json::json!({
+            "observation_id": observation_id,
+            "stage": observation.stage,
+            "status": observation.status,
+            "bytes": observation.bytes,
+            "utf8_valid": observation.utf8_valid,
+            "elapsed_ms": observation.elapsed_ms,
+            "exit_code": observation.exit_code,
+            "stderr_summary": observation.stderr_summary,
+            "marker_summary": observation.marker_summary,
+            "packages": observation.packages,
+            "root_package": observation.root_package,
+            "node_count": observation.node_count,
+            "focused_window": focused_window,
+            "focused_package": focused_package,
+        }),
+    )?;
+    if observation.status != adb::HierarchyStatus::DumpSucceeded {
+        let reason = observation.status.as_str();
+        log.event(
+            "hierarchy_unavailable",
+            serde_json::json!({
+                "observation_id": observation_id,
+                "stage": stage,
+                "status": observation.status,
+                "reason": reason,
+                "bytes": observation.bytes,
+                "exit_code": observation.exit_code,
+            }),
+        )?;
+        return Ok(PageObservation::unreadable(reason, target_package));
+    }
+
+    let xml = observation.xml.unwrap_or_default();
+    let view = PageView::parse(&xml, target_package);
+    let foreign_package = view
+        .root_foreign_package()
+        .filter(|package| {
+            focused_package
+                .as_deref()
+                .is_none_or(|focused| focused == *package)
+        })
+        .map(str::to_string);
+    if let Some(package) = &foreign_package {
+        // The root package identifies the window owner; nested system-owned
+        // nodes alone are not evidence that another window obscures the
+        // target. Preserve the focused window in the hierarchy event too.
+        log.event(
+            "foreign_window",
+            serde_json::json!({
+                "observation_id": observation_id,
+                "stage": stage,
+                "package": package,
+                "packages": view.packages,
+                "root_package": observation.root_package,
+                "node_count": view.node_count(),
+                "focused_window": focused_window,
+                "focused_package": focused_package,
+            }),
+        )?;
+    }
+
+    let route = detect_page_route(&view);
+    // Valid XML with no usable page identity is its own state: the page could
+    // not be identified, so it stays an unconfirmed candidate and is reported
+    // as `route_markers_missing` rather than as a generic unknown page.
+    if route == PageRoute::Unknown {
+        log.event(
+            "route_markers_missing",
+            serde_json::json!({
+                "observation_id": observation_id,
+                "stage": stage,
+                "marker_summary": observation.marker_summary,
+                "packages": view.packages,
+                "root_package": observation.root_package,
+                "node_count": view.node_count(),
+            }),
+        )?;
+        return Ok(PageObservation {
+            view,
+            route: PageRoute::RouteCandidateUnconfirmed,
+            checkin_mode: CheckinMode::Unsupported,
+            status: "route_markers_missing",
+            foreign_package,
+        });
+    }
+    let checkin_mode = if route == PageRoute::Checkin {
+        detect_checkin_mode(&view)
+    } else {
+        CheckinMode::Unsupported
+    };
+    Ok(PageObservation {
+        view,
+        route,
+        checkin_mode,
+        status: adb::HierarchyStatus::DumpSucceeded.as_str(),
+        foreign_package,
+    })
+}
+
+/// Machine code and recovery advice for a page that could not be identified.
+///
+/// A foreign window on screen and a page that simply carries no identity
+/// markers need different user actions, so they get different codes.
+fn unconfirmed_page_failure(overlay: Option<&str>) -> (&'static str, String) {
+    match overlay {
+        Some(package) => (
+            "overlay_present",
+            format!(
+                "检测到非目标应用的窗口（{package}）遮挡了页面；请手动关闭该弹窗/广告后重新运行。程序未执行任何点击。"
+            ),
+        ),
+        None => (
+            "route_candidate_unconfirmed",
+            "页面层级可读，但没有页面身份标记（可能被弹窗遮挡，或页面尚未渲染完成）；请手动确认页面后重试。"
+                .to_string(),
+        ),
+    }
+}
+
 fn is_navigable_catalog_route(route: PageRoute) -> bool {
     matches!(route, PageRoute::Home | PageRoute::Services)
 }
+/// Visual evidence for the check-in control, kept separate from the page
+/// identity decided by the hierarchy.
+///
+/// Only `Detected` may participate in an *evidence conflict*: a saturated
+/// control really found in the screenshot disagreeing with the hierarchy is a
+/// conflict. A profile-geometry fallback box that merely happens to contain
+/// colour is a weak candidate and must never be reported as a conflict
+/// (frozen decision D-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisualCandidate {
+    Detected(vision::ButtonState),
+    GeometryOnly(vision::ButtonState),
+    None,
+}
+
+impl VisualCandidate {
+    fn state(self) -> vision::ButtonState {
+        match self {
+            Self::Detected(state) | Self::GeometryOnly(state) => state,
+            Self::None => vision::ButtonState::Unknown,
+        }
+    }
+}
+
+fn visual_candidate(image: &image::DynamicImage, profile: &profile::Profile) -> VisualCandidate {
+    match vision::find_colored_button(image) {
+        Some(button) => VisualCandidate::Detected(vision::classify_button(image, button).state),
+        None => {
+            let fallback = vision::fallback_button(image, profile);
+            let state = vision::classify_button(image, fallback).state;
+            if state == vision::ButtonState::Unknown {
+                VisualCandidate::None
+            } else {
+                VisualCandidate::GeometryOnly(state)
+            }
+        }
+    }
+}
+
+/// How many times an unidentifiable page is re-observed before giving up.
+///
+/// A single unlucky dump — an overlay that dismisses itself, or a WebView that
+/// has not finished rendering — used to end the whole run. Re-reading the page
+/// is free of any tap, so it is retried a bounded number of times first.
+const UNCONFIRMED_REOBSERVE_ATTEMPTS: u32 = 3;
+const UNCONFIRMED_REOBSERVE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Whether an unidentifiable page should be read again before giving up.
+///
+/// Pure so the bound is testable without a device: the loop must terminate, and
+/// it must only ever be reached for an unconfirmed page.
+fn should_reobserve(route: PageRoute, attempts: u32) -> bool {
+    route == PageRoute::RouteCandidateUnconfirmed && attempts < UNCONFIRMED_REOBSERVE_ATTEMPTS
+}
+
 fn locate_or_navigate(
     device: &adb::AdbDevice,
     profile: &profile::Profile,
     log: &RunLog,
+    result: &mut RunResult,
+    target_package: &str,
 ) -> Result<NavigationResult> {
     let mut bytes = device.screenshot()?;
     let mut image = vision::decode(&bytes)?;
-    let mut xml = device.dump_hierarchy()?;
-    let initial_route = detect_page_route(&xml);
+    // The most recent observation of the page, reused by later decisions
+    // instead of re-parsing a string that may belong to an earlier round.
+    let mut current: Option<PageObservation> = None;
+    let mut last_status: Option<&'static str> = None;
+    let mut observe = |stage: &str| -> Result<PageObservation> {
+        let observation_id = log.next_observation_id();
+        let observed = observe_page_route(device, log, stage, observation_id, target_package)?;
+        last_status = Some(observed.status);
+        Ok(observed)
+    };
+
+    log_foreground_snapshot(device, log, "navigation_start", result)?;
+    let mut observation = observe("navigation_start")?;
+    let mut attempts = 1u32;
+    while should_reobserve(observation.route, attempts) {
+        // Observing only: no tap, no swipe, no navigation while the page is
+        // unconfirmed. An overlay that dismisses itself, or a slow first paint,
+        // recovers here instead of failing the run.
+        log.event(
+            "reobserve",
+            serde_json::json!({
+                "stage": "navigation_start",
+                "attempt": attempts + 1,
+                "status": observation.status,
+                "overlay_package": observation.foreign_package,
+                "clicked": false,
+            }),
+        )?;
+        thread::sleep(UNCONFIRMED_REOBSERVE_INTERVAL);
+        log_foreground_snapshot(device, log, "navigation_reobserve", result)?;
+        bytes = device.screenshot()?;
+        image = vision::decode(&bytes)?;
+        observation = observe("navigation_reobserve")?;
+        attempts += 1;
+    }
+
     let mut page_refresh_attempted = false;
     let mut page_refresh_confirmed = false;
-    if initial_route == PageRoute::Login {
+
+    // A page that still cannot be identified is a *candidate*, never a
+    // confirmed route: no navigation action and no tap may follow from it.
+    if observation.route == PageRoute::RouteCandidateUnconfirmed {
         log.save_bytes("navigation_result.png", &bytes)?;
         return Ok(NavigationResult {
-            route: initial_route,
+            route: observation.route,
             checkin_mode: CheckinMode::Unsupported,
             field_work_ready: false,
             page_refresh_attempted,
             page_refresh_confirmed,
+            hierarchy_status: last_status,
+            overlay_package: observation.foreign_package,
         });
     }
-    if matches!(
-        initial_route,
-        PageRoute::Checkin | PageRoute::UnsupportedCheckin
-    ) {
+    if observation.route == PageRoute::Login {
+        log.save_bytes("navigation_result.png", &bytes)?;
+        return Ok(NavigationResult {
+            route: observation.route,
+            checkin_mode: CheckinMode::Unsupported,
+            field_work_ready: false,
+            page_refresh_attempted,
+            page_refresh_confirmed,
+            hierarchy_status: last_status,
+            overlay_package: observation.foreign_package,
+        });
+    }
+
+    // Any foreign root window is a blocking condition, regardless of whether
+    // the target app's own nodes still expose a catalogue or check-in marker.
+    // Stop before BACK, swipe, or tap: the OS may deliver those actions to the
+    // foreign window rather than to the target app.
+    if let Some(package) = observation.foreign_package.clone() {
+        log.event(
+            "navigation_blocked",
+            serde_json::json!({
+                "reason": "overlay_present",
+                "overlay_package": package,
+                "clicked": false,
+            }),
+        )?;
+        log.save_bytes("navigation_result.png", &bytes)?;
+        return Ok(NavigationResult {
+            route: PageRoute::RouteCandidateUnconfirmed,
+            checkin_mode: CheckinMode::Unsupported,
+            field_work_ready: false,
+            page_refresh_attempted,
+            page_refresh_confirmed,
+            hierarchy_status: last_status,
+            overlay_package: Some(package),
+        });
+    }
+
+    // Starting already on a check-in page means a previous run left the App
+    // there; go back to the catalogue so the normal navigation path is
+    // exercised and the page state is observed fresh.
+    //
+    // The BACK keyevent is only issued while the check-in page is confirmed
+    // *from the target app's own nodes* and no other window is on screen: with
+    // a popup present there is no way to tell which window BACK would act on.
+    let on_checkin_page = observation.route == PageRoute::Checkin;
+    if on_checkin_page {
         page_refresh_attempted = true;
-        log.event("page_refresh", serde_json::json!({"reason":"checkin_page_at_start","before_route":initial_route.as_str(),"action":"back"}))?;
+        let before_route = observation.route;
+        log.event(
+            "page_refresh",
+            serde_json::json!({"reason":"checkin_page_at_start","before_route":before_route.as_str(),"action":"back"}),
+        )?;
         device.back()?;
         thread::sleep(Duration::from_millis(800));
-        let fresh_xml = device.dump_hierarchy()?;
-        let fresh_route = detect_page_route(&fresh_xml);
-        page_refresh_confirmed = matches!(fresh_route, PageRoute::Home | PageRoute::Services);
-        log.event("page_refresh", serde_json::json!({"reason":"checkin_page_at_start","before_route":initial_route.as_str(),"after_route":fresh_route.as_str(),"confirmed":page_refresh_confirmed}))?;
+        // The post-BACK foreground snapshot is load-bearing: BACK can drop the
+        // target App out of the foreground entirely (e.g. to the Launcher), and
+        // that must be diagnosed as such instead of as a stale in-app page.
+        let after_back = log_foreground_snapshot(device, log, "page_refresh_after_back", result)?;
+        let fresh = observe("page_refresh_after_back")?;
+        let app_foreground = after_back.as_deref() == Some(target_package);
+        page_refresh_confirmed = matches!(fresh.route, PageRoute::Home | PageRoute::Services)
+            && fresh.foreign_package.is_none()
+            && app_foreground;
+        log.event(
+            "page_refresh",
+            serde_json::json!({"reason":"checkin_page_at_start","before_route":before_route.as_str(),"after_route":fresh.route.as_str(),"after_foreground":after_back,"confirmed":page_refresh_confirmed}),
+        )?;
         if !page_refresh_confirmed {
-            let route = if fresh_route == PageRoute::Unknown {
-                PageRoute::RouteCandidateUnconfirmed
-            } else {
-                PageRoute::RouteEvidenceConflict
-            };
             log.save_bytes("navigation_result.png", &bytes)?;
+            let route = stale_refresh_route(fresh.route, after_back.as_deref(), target_package);
+            // The App having left the foreground is not a popup overlay: never
+            // record the Launcher (or any non-target package) as an overlay.
+            let overlay = if route == PageRoute::AppLeftForeground {
+                None
+            } else {
+                fresh.foreign_package.clone()
+            };
+            if route == PageRoute::AppLeftForeground {
+                log.event(
+                    "navigation_blocked",
+                    serde_json::json!({
+                        "reason": "app_left_foreground",
+                        "after_foreground": after_back,
+                        "route": route.as_str(),
+                        "clicked": false,
+                    }),
+                )?;
+            }
             return Ok(NavigationResult {
                 route,
                 checkin_mode: CheckinMode::Unsupported,
                 field_work_ready: false,
                 page_refresh_attempted,
                 page_refresh_confirmed,
+                hierarchy_status: last_status,
+                overlay_package: overlay,
             });
         }
-        xml = fresh_xml;
+        observation = fresh;
         bytes = device.screenshot()?;
         image = vision::decode(&bytes)?;
     }
 
+    let initial_route = observation.route;
     let min_entry_y = image.height() / 8;
     let mut navigated = false;
 
-    // First use a hierarchy-confirmed entry only on a known home/services page.
+    // 1. Use a hierarchy-confirmed entry only on a known home/services page.
     if matches!(initial_route, PageRoute::Home | PageRoute::Services)
-        && let Some((x, y)) = find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y)
+        && let Some((x, y)) = find_checkin_entry_bounds(&observation.view, min_entry_y)
     {
+        log.event(
+            "navigation_action",
+            serde_json::json!({"action":"entry_tap","label":"晚点名签到","x":x,"y":y,"before_route":initial_route.as_str()}),
+        )?;
         device.tap(x, y)?;
         thread::sleep(Duration::from_secs(3));
         navigated = true;
-        xml = device.dump_hierarchy()?;
+        observation = observe("navigation_after_entry_tap")?;
     }
 
-    // Some home layouts put the entry below the fold. Scroll only while the
-    // hierarchy still identifies a known home/services page; never blind-tap a
-    // service-icon coordinate as a fallback.
+    // 2. Some home layouts put the entry below the fold. Scroll only while the
+    //    hierarchy still identifies a known home/services page; never blind-tap
+    //    a service-icon coordinate as a fallback.
     if !navigated && matches!(initial_route, PageRoute::Home | PageRoute::Services) {
         for attempt in 0..4 {
-            log.event("home_scroll", serde_json::json!({"attempt": attempt + 1}))?;
+            log.event(
+                "navigation_action",
+                serde_json::json!({"action":"swipe","stage":"home_scroll","attempt":attempt + 1}),
+            )?;
             device.swipe(
                 image.width() / 2,
                 image.height() * 3 / 4,
@@ -2185,90 +3438,91 @@ fn locate_or_navigate(
                 500,
             )?;
             thread::sleep(Duration::from_secs(1));
-            xml = device.dump_hierarchy()?;
-            let route = detect_page_route(&xml);
-            if !is_navigable_catalog_route(route) {
+            observation = observe(&format!("home_scroll_{}", attempt + 1))?;
+            current = Some(observation.clone());
+            if observation.foreign_package.is_some() {
                 break;
             }
-            let route_after_scroll = detect_page_route(&xml);
-            if matches!(
-                route_after_scroll,
-                PageRoute::Checkin | PageRoute::UnsupportedCheckin
-            ) {
-                let current_bytes = device.screenshot()?;
-                log.save_bytes("navigation_result.png", &current_bytes)?;
-                return Ok(NavigationResult {
-                    route: route_after_scroll,
-                    checkin_mode: if route_after_scroll == PageRoute::Checkin {
-                        detect_checkin_mode(&xml)
-                    } else {
-                        CheckinMode::Unsupported
-                    },
-                    field_work_ready: false,
-                    page_refresh_attempted,
-                    page_refresh_confirmed,
-                });
+            if !is_navigable_catalog_route(observation.route) {
+                if observation.route == PageRoute::Checkin {
+                    let current_bytes = device.screenshot()?;
+                    return finish_navigation(
+                        &current_bytes,
+                        observation,
+                        log,
+                        page_refresh_attempted,
+                        page_refresh_confirmed,
+                        last_status,
+                    );
+                }
+                break;
             }
-            if let Some((x, y)) = find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y)
-            {
+            if let Some((x, y)) = find_checkin_entry_bounds(&observation.view, min_entry_y) {
+                log.event(
+                    "navigation_action",
+                    serde_json::json!({"action":"entry_tap","label":"晚点名签到","x":x,"y":y,"after":"home_scroll"}),
+                )?;
                 device.tap(x, y)?;
                 thread::sleep(Duration::from_secs(3));
                 navigated = true;
-                xml = device.dump_hierarchy()?;
+                observation = observe("navigation_after_entry_tap")?;
                 break;
             }
         }
     }
 
-    // Landscape service catalogues can expose the entry only after opening the
-    // explicitly labelled "业务" tab. Each navigation action is followed by a
-    // fresh hierarchy read before any next action.
+    // 3. Landscape service catalogues can expose the entry only after opening
+    //    the explicitly labelled "业务" tab. Each navigation action is followed
+    //    by a fresh observation before any next action.
     if !navigated
-        && matches!(
-            detect_page_route(&xml),
-            PageRoute::Home | PageRoute::Services
-        )
-        && let Some((x, y)) = find_clickable_labeled_bounds(&xml, "业务", 0)
+        && matches!(observation.route, PageRoute::Home | PageRoute::Services)
+        && observation.foreign_package.is_none()
+        && let Some((x, y)) = find_clickable_labeled_bounds(&observation.view, "业务", 0)
     {
+        log.event(
+            "navigation_action",
+            serde_json::json!({"action":"tab_tap","label":"业务","x":x,"y":y,"before_route":observation.route.as_str()}),
+        )?;
         device.tap(x, y)?;
         thread::sleep(Duration::from_secs(2));
-        xml = device.dump_hierarchy()?;
         for attempt in 0..6 {
-            if !is_navigable_catalog_route(detect_page_route(&xml)) {
+            observation = observe(&format!("services_scan_{}", attempt + 1))?;
+            current = Some(observation.clone());
+            if observation.foreign_package.is_some() {
                 break;
             }
-            let route_after_services_scan = detect_page_route(&xml);
-            if matches!(
-                route_after_services_scan,
-                PageRoute::Checkin | PageRoute::UnsupportedCheckin
-            ) {
-                let current_bytes = device.screenshot()?;
-                log.save_bytes("navigation_result.png", &current_bytes)?;
-                return Ok(NavigationResult {
-                    route: route_after_services_scan,
-                    checkin_mode: if route_after_services_scan == PageRoute::Checkin {
-                        detect_checkin_mode(&xml)
-                    } else {
-                        CheckinMode::Unsupported
-                    },
-                    field_work_ready: false,
-                    page_refresh_attempted,
-                    page_refresh_confirmed,
-                });
+            if !is_navigable_catalog_route(observation.route) {
+                if observation.route == PageRoute::Checkin {
+                    let current_bytes = device.screenshot()?;
+                    return finish_navigation(
+                        &current_bytes,
+                        observation,
+                        log,
+                        page_refresh_attempted,
+                        page_refresh_confirmed,
+                        last_status,
+                    );
+                }
+                break;
             }
             if let Some((entry_x, entry_y)) =
-                find_clickable_labeled_bounds(&xml, "晚点名签到", min_entry_y)
+                find_checkin_entry_bounds(&observation.view, min_entry_y)
             {
+                log.event(
+                    "navigation_action",
+                    serde_json::json!({"action":"entry_tap","label":"晚点名签到","x":entry_x,"y":entry_y,"after":"services_scan"}),
+                )?;
                 device.tap(entry_x, entry_y)?;
                 thread::sleep(Duration::from_secs(3));
-                xml = device.dump_hierarchy()?;
+                navigated = true;
+                observation = observe("navigation_after_entry_tap")?;
                 break;
             }
             if attempt < 5 {
-                let current_route = detect_page_route(&xml);
-                if !matches!(current_route, PageRoute::Home | PageRoute::Services) {
-                    break;
-                }
+                log.event(
+                    "navigation_action",
+                    serde_json::json!({"action":"swipe","stage":"services_scan","attempt":attempt + 1}),
+                )?;
                 device.swipe(
                     image.width() / 2,
                     image.height() * 3 / 4,
@@ -2277,31 +3531,54 @@ fn locate_or_navigate(
                     500,
                 )?;
                 thread::sleep(Duration::from_secs(1));
-                xml = device.dump_hierarchy()?;
             }
         }
     }
 
+    // No accessibility-confirmed navigation target means no navigation action.
+    // Do not fall back to a profile coordinate on an unknown page. The last
+    // *observed* page identity is reported instead of a bare Unknown, so the
+    // diagnosis says "still on the home page" rather than losing that fact.
+    if !navigated {
+        log.save_bytes("navigation_result.png", &bytes)?;
+        let last = current.unwrap_or_else(|| observation.clone());
+        return Ok(NavigationResult {
+            route: last.route,
+            checkin_mode: CheckinMode::Unsupported,
+            field_work_ready: false,
+            page_refresh_attempted,
+            page_refresh_confirmed,
+            hierarchy_status: last_status,
+            overlay_package: last.foreign_package,
+        });
+    }
+
+    log_foreground_snapshot(device, log, "navigation_after_action", result)?;
+    observation = observe("navigation_after_action")?;
+    // The route decision below is compared against THIS screenshot, taken in
+    // the same round as the observation above; a conflict claim must never be
+    // derived from a screenshot that predates the hierarchy read.
     bytes = device.screenshot()?;
     image = vision::decode(&bytes)?;
-    let mut route = detect_page_route(&xml);
-    let mut checkin_mode = if route == PageRoute::Checkin {
-        detect_checkin_mode(&xml)
-    } else {
-        CheckinMode::Unsupported
-    };
-    if route == PageRoute::Checkin && checkin_mode == CheckinMode::Ordinary {
-        // Confirm that the actual sign-in control is visible before allowing the
-        // run loop to interpret state. When route identity conflicts with a
-        // visible button-like control, preserve that conflict for diagnostics.
-        let mut visible_state = vision::ButtonState::Unknown;
+
+    if observation.route == PageRoute::Checkin && observation.checkin_mode == CheckinMode::Ordinary
+    {
+        // The sign-in control must be visibly present before the run loop may
+        // interpret its state. Some landscape WebView layouts render the
+        // circle below the first viewport, so a bounded re-scroll is allowed;
+        // each attempt re-observes the page before continuing.
+        let mut visible = visual_candidate(&image, profile).state();
         for attempt in 0..4 {
-            let button = vision::find_colored_button(&image)
-                .unwrap_or_else(|| vision::fallback_button(&image, profile));
-            visible_state = vision::classify_button(&image, button).state;
-            if visible_state != vision::ButtonState::Unknown || attempt == 3 {
+            if visible != vision::ButtonState::Unknown {
                 break;
             }
+            if attempt == 3 {
+                break;
+            }
+            log.event(
+                "navigation_action",
+                serde_json::json!({"action":"swipe","stage":"checkin_scroll","attempt":attempt + 1}),
+            )?;
             device.swipe(
                 image.width() / 2,
                 image.height() * 3 / 4,
@@ -2312,105 +3589,156 @@ fn locate_or_navigate(
             thread::sleep(Duration::from_secs(1));
             bytes = device.screenshot()?;
             image = vision::decode(&bytes)?;
-            xml = device.dump_hierarchy()?;
-            route = detect_page_route(&xml);
-            checkin_mode = if route == PageRoute::Checkin {
-                detect_checkin_mode(&xml)
-            } else {
-                CheckinMode::Unsupported
-            };
-            if route != PageRoute::Checkin || checkin_mode != CheckinMode::Ordinary {
+            observation = observe(&format!("checkin_scroll_{}", attempt + 1))?;
+            if observation.route != PageRoute::Checkin
+                || observation.checkin_mode != CheckinMode::Ordinary
+            {
                 break;
             }
+            visible = visual_candidate(&image, profile).state();
         }
-        if visible_state == vision::ButtonState::Unknown {
-            route = PageRoute::Unknown;
+        // A confirmed check-in page whose control cannot be seen at all stays
+        // an unconfirmed candidate: it never authorizes a tap, and the failure
+        // is reported as missing evidence rather than as a page change.
+        if observation.route == PageRoute::Checkin && visible == vision::ButtonState::Unknown {
+            observation.route = PageRoute::RouteCandidateUnconfirmed;
+            observation.checkin_mode = CheckinMode::Unsupported;
         }
-    } else if route != PageRoute::Checkin {
-        let button = vision::find_colored_button(&image)
-            .unwrap_or_else(|| vision::fallback_button(&image, profile));
-        if vision::classify_button(&image, button).state != vision::ButtonState::Unknown {
-            route = PageRoute::RouteEvidenceConflict;
-        }
+    } else if observation.route != PageRoute::Checkin {
+        observation.route = unconfirmed_route_for(&image, profile, observation.route);
     }
-    log.save_bytes("navigation_result.png", &bytes)?;
-    Ok(NavigationResult {
-        route,
-        checkin_mode,
-        field_work_ready: checkin_mode == CheckinMode::FieldWork
-            && xml.contains("未签到")
-            && xml.contains("外勤签到"),
+
+    finish_navigation(
+        &bytes,
+        observation,
+        log,
         page_refresh_attempted,
         page_refresh_confirmed,
+        last_status,
+    )
+}
+
+/// Classify a non-check-in page against the visual evidence (frozen decision
+/// D-08).
+///
+/// A *detected* control on a page the hierarchy positively identifies as
+/// something else is a genuine evidence conflict. Two cases must NOT become a
+/// conflict:
+/// - the hierarchy could not be read at all, so there is no hierarchy evidence
+///   for the screenshot to contradict (`route_candidate_unconfirmed`);
+/// - the colour came only from the profile geometry fallback box rather than a
+///   detected control, which is weak evidence, not a contradiction.
+fn unconfirmed_route_for(
+    image: &image::DynamicImage,
+    profile: &profile::Profile,
+    route: PageRoute,
+) -> PageRoute {
+    // Nothing to conflict with: an unreadable page stays an unconfirmed
+    // candidate no matter what the screenshot shows.
+    if route == PageRoute::RouteCandidateUnconfirmed {
+        return route;
+    }
+    match visual_candidate(image, profile) {
+        VisualCandidate::Detected(state) if state != vision::ButtonState::Unknown => {
+            PageRoute::RouteEvidenceConflict
+        }
+        VisualCandidate::GeometryOnly(state) if state != vision::ButtonState::Unknown => {
+            if route == PageRoute::Unknown {
+                PageRoute::RouteCandidateUnconfirmed
+            } else {
+                route
+            }
+        }
+        _ => route,
+    }
+}
+
+/// Map a failed stale-page refresh onto the reason it failed, keeping the
+/// "could not observe the result", "observed an unexpected in-app page" and
+/// "the App left the foreground" cases distinguishable. None of them is a
+/// visual/hierarchy evidence conflict: no screenshot evidence participates in
+/// this decision.
+///
+/// `after_back_foreground` is the post-BACK foreground snapshot: `None` means
+/// the query itself failed (unobservable, never "the App is still here"), and a
+/// package other than `target_package` means BACK dropped the App out of the
+/// foreground. The foreground mismatch is checked first so a Launcher page can
+/// never be reported as a stale in-app route.
+fn stale_refresh_route(
+    fresh_route: PageRoute,
+    after_back_foreground: Option<&str>,
+    target_package: &str,
+) -> PageRoute {
+    match after_back_foreground {
+        Some(package) if package != target_package => PageRoute::AppLeftForeground,
+        // A failed foreground query cannot support "the App is still here", but
+        // it also is not evidence that it left; fail closed as unobservable
+        // rather than inventing a navigation result.
+        None => PageRoute::StalePageRefreshUnconfirmed,
+        Some(_) => {
+            if fresh_route == PageRoute::RouteCandidateUnconfirmed {
+                PageRoute::StalePageRefreshUnconfirmed
+            } else {
+                PageRoute::StalePageRefreshFailed
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_navigation(
+    bytes: &[u8],
+    observation: PageObservation,
+    log: &RunLog,
+    page_refresh_attempted: bool,
+    page_refresh_confirmed: bool,
+    hierarchy_status: Option<&'static str>,
+) -> Result<NavigationResult> {
+    let field_work_ready = observation.checkin_mode == CheckinMode::FieldWork
+        && observation.view.scoped_text.contains("未签到")
+        && observation.view.scoped_text.contains("外勤签到");
+    log.save_bytes("navigation_result.png", bytes)?;
+    Ok(NavigationResult {
+        route: observation.route,
+        checkin_mode: observation.checkin_mode,
+        field_work_ready,
+        page_refresh_attempted,
+        page_refresh_confirmed,
+        hierarchy_status,
+        overlay_package: observation.foreign_package,
     })
 }
 
-#[allow(dead_code)]
-fn find_labeled_bounds(xml: &str, label: &str, min_center_y: u32) -> Option<(u32, u32)> {
-    find_labeled_bounds_internal(xml, label, min_center_y, false)
+#[cfg_attr(not(test), expect(dead_code, reason = "test-only label lookup helper"))]
+fn find_labeled_bounds(view: &PageView, label: &str, min_center_y: u32) -> Option<(u32, u32)> {
+    view.find_labeled(label, min_center_y, false)
 }
 
-fn find_clickable_labeled_bounds(xml: &str, label: &str, min_center_y: u32) -> Option<(u32, u32)> {
-    find_labeled_bounds_internal(xml, label, min_center_y, true)
-}
-
-fn find_labeled_bounds_internal(
-    xml: &str,
+fn find_clickable_labeled_bounds(
+    view: &PageView,
     label: &str,
     min_center_y: u32,
-    clickable_only: bool,
 ) -> Option<(u32, u32)> {
-    for attribute in ["content-desc", "text"] {
-        let prefix = format!("{}=\"", attribute);
-        let mut cursor = 0;
-        while let Some(relative) = xml[cursor..].find(&prefix) {
-            let value_start = cursor + relative + prefix.len();
-            let Some(value_length) = xml[value_start..].find('"') else {
-                cursor = value_start.saturating_add(1);
-                continue;
-            };
-            let value_end = value_start + value_length;
-            let value = &xml[value_start..value_end];
-            // A malformed attribute can swallow the start of the next node.
-            // Resume scanning at that nested node instead of losing the rest
-            // of the hierarchy dump.
-            if let Some(next_node) = value.find("<node") {
-                cursor = value_start + next_node + "<node".len();
-                continue;
-            }
-            if value.contains(label) {
-                let node_start = xml[..value_start].rfind("<node").unwrap_or(value_start);
-                let Some(node_length) = xml[node_start..].find('>') else {
-                    cursor = value_end + 1;
-                    continue;
-                };
-                let node_end = node_start + node_length;
-                let node = &xml[node_start..node_end];
-                if clickable_only && !node.contains("clickable=\"true\"") {
-                    cursor = value_end + 1;
-                    continue;
-                }
-                if let Some(bounds_start) = node.find("bounds=\"") {
-                    let bounds_value = &node[bounds_start + 8..];
-                    if let Some(end) = bounds_value.find('"') {
-                        let nums: Vec<u32> = bounds_value[..end]
-                            .split(['[', ']', ','])
-                            .filter_map(|s| s.parse().ok())
-                            .collect();
-                        if nums.len() >= 4 {
-                            let center_y = (nums[1] + nums[3]) / 2;
-                            if center_y >= min_center_y {
-                                return Some(((nums[0] + nums[2]) / 2, center_y));
-                            }
-                        }
-                    }
-                }
-            }
-            cursor = value_end + 1;
-        }
-    }
-    None
+    view.find_labeled(label, min_center_y, true)
 }
+
+/// The home/services entry that opens the check-in page.
+///
+/// The entry label is the same string as the check-in page's own title, so on a
+/// page that is *already* the check-in page this lookup would return the title
+/// node's coordinates -- a click that does nothing useful and could scroll the
+/// live page. The entry is therefore only ever resolved on a page that is not
+/// the check-in page.
+fn find_checkin_entry_bounds(view: &PageView, min_center_y: u32) -> Option<(u32, u32)> {
+    if detect_page_route(view) == PageRoute::Checkin {
+        return None;
+    }
+    find_clickable_labeled_bounds(view, CHECKIN_ENTRY_LABEL, min_center_y)
+}
+
+/// The navigation label that opens the check-in page from the home/services
+/// catalogue, and the page title of the check-in page itself.
+const CHECKIN_ENTRY_LABEL: &str = "晚点名签到";
 
 fn print_device(serial: &str, info: &adb::DeviceInfo) {
     println!(
@@ -2429,15 +3757,22 @@ fn print_device(serial: &str, info: &adb::DeviceInfo) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PageRoute, SyncLifecycle, TapDevice, TapRequest, build_task_command_line,
-        detect_page_route, find_clickable_labeled_bounds, find_labeled_bounds, guarded_tap,
-        restore_sync_backup,
+        GIT_COMMIT, PageRoute, PageView, RunStatus, SyncLifecycle, TapDevice, TapRequest, VERSION,
+        VisualCandidate, blocked_instance_result, build_id, build_id_for, build_task_command_line,
+        detect_page_route, finalize_run, find_checkin_entry_bounds, find_clickable_labeled_bounds,
+        find_labeled_bounds, foreground_check, git_dirty, guarded_tap, instance_summary_entry,
+        location_wait_limit, new_run_result, propagated_failure, restore_sync_backup,
+        set_run_failure, unconfirmed_page_failure, unconfirmed_route_for, visual_candidate,
     };
     use crate::{
-        domain::{CheckinMode, Mode},
+        config::{Config, EmulatorInstanceConfig},
+        domain::{CheckinMode, Mode, RunResult},
+        logger::RunLog,
         vision::ButtonState,
     };
     use anyhow::Result;
+    // `Parser` provides `try_parse_from`, used by the CLI argument tests.
+    use clap::Parser;
     use std::{
         cell::{Cell, RefCell},
         fs,
@@ -2445,20 +3780,726 @@ mod tests {
         time::Duration,
     };
 
+    /// Test-only package scope for hand-written hierarchy fixtures.
+    const TEST_PACKAGE: &str = "cn.edu.fzu.fdxypa";
+
+    /// Parse a hand-written XML fixture the way the run loop does. Fixtures
+    /// without a `package` attribute stay in scope, so existing expectations
+    /// are unchanged by package scoping.
+    fn page(xml: &str) -> PageView {
+        PageView::parse(xml, TEST_PACKAGE)
+    }
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("zhfd-{label}-{}-{nonce}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn fixture_image(name: &str) -> image::DynamicImage {
+        let bytes: &[u8] = match name {
+            "ready" => include_bytes!("../../autojs6/fixtures/ready.png"),
+            "gray" => include_bytes!("../../autojs6/fixtures/gray.png"),
+            _ => panic!("unknown fixture"),
+        };
+        crate::vision::decode(bytes).expect("fixture decode")
+    }
+
+    // ===== v0.3.0 route-evidence semantics (frozen decision D-08) =====
+
+    #[test]
+    fn detected_button_on_non_checkin_page_is_a_real_evidence_conflict() {
+        // A saturated sign-in control genuinely found in the screenshot while
+        // the hierarchy says the page is something else is a contradiction.
+        let image = fixture_image("ready");
+        assert!(matches!(
+            visual_candidate(&image, test_profile()),
+            VisualCandidate::Detected(_)
+        ));
+        assert_eq!(
+            unconfirmed_route_for(&image, test_profile(), PageRoute::Home),
+            PageRoute::RouteEvidenceConflict
+        );
+    }
+
+    #[test]
+    fn locating_wait_is_capped_at_the_frozen_120_seconds() {
+        let root = temp_root("locating-cap");
+        let mut config = Config::default();
+        config.runtime.location_timeout_seconds = 600;
+        let store = crate::config::ConfigStore {
+            root: root.clone(),
+            path: root.join("config.toml"),
+            config,
+            origin: crate::config::ConfigOrigin::Explicit,
+            created_default: false,
+            recovery_error: None,
+        };
+        assert_eq!(
+            location_wait_limit(&store),
+            120,
+            "配置不得把定位等待放宽到超过 D-09 的 120 秒硬上限"
+        );
+
+        let mut shorter = store.clone();
+        shorter.config.runtime.location_timeout_seconds = 30;
+        assert_eq!(location_wait_limit(&shorter), 30);
+
+        // A zero/absurd value must not disable the wait entirely.
+        let mut zero = store.clone();
+        zero.config.runtime.location_timeout_seconds = 0;
+        assert_eq!(location_wait_limit(&zero), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unreadable_hierarchy_stays_an_unconfirmed_candidate_even_with_visual_evidence() {
+        // D-08: when the hierarchy cannot be read there is no hierarchy evidence
+        // for the screenshot to contradict, so a visually plausible check-in
+        // control must NOT be reported as `route_evidence_conflict`.
+        let image = fixture_image("ready");
+        let profile = test_profile();
+        assert!(matches!(
+            visual_candidate(&image, profile),
+            VisualCandidate::Detected(_)
+        ));
+        assert_eq!(
+            unconfirmed_route_for(&image, profile, PageRoute::RouteCandidateUnconfirmed),
+            PageRoute::RouteCandidateUnconfirmed,
+            "层级不可读时不得报告证据冲突"
+        );
+    }
+
+    #[test]
+    fn geometry_only_fallback_colour_must_not_report_evidence_conflict() {
+        // A flat gray screen has no detectable sign-in control; only the
+        // profile geometry fallback box has any signal at all. That is weak
+        // evidence, not a hierarchy/visual contradiction.
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            900,
+            1600,
+            image::Rgb([150, 150, 150]),
+        ));
+        let profile = test_profile();
+        assert!(crate::vision::find_colored_button(&image).is_none());
+        assert_eq!(
+            visual_candidate(&image, profile),
+            VisualCandidate::GeometryOnly(ButtonState::Gray)
+        );
+        assert_eq!(
+            unconfirmed_route_for(&image, profile, PageRoute::Unknown),
+            PageRoute::RouteCandidateUnconfirmed,
+            "fallback geometry must not be promoted to route_evidence_conflict"
+        );
+        assert_eq!(
+            unconfirmed_route_for(&image, profile, PageRoute::Home),
+            PageRoute::Home,
+            "a known non-checkin route must not be overwritten by fallback geometry"
+        );
+    }
+
+    #[test]
+    fn unconfirmed_and_conflict_routes_can_never_authorize_a_tap() {
+        for route in [
+            PageRoute::RouteCandidateUnconfirmed,
+            PageRoute::RouteEvidenceConflict,
+        ] {
+            let device = MockTapDevice::default();
+            let mut request = request(ButtonState::Ready);
+            request.route = route;
+            assert!(
+                guarded_tap(&device, request).is_err(),
+                "{route:?} must not authorize a tap"
+            );
+            assert!(device.taps.borrow().is_empty());
+            assert_eq!(route.error_code(), Some(route.as_str()));
+        }
+    }
+
+    #[test]
+    fn route_error_codes_are_stable_and_checkin_has_none() {
+        assert_eq!(PageRoute::Login.error_code(), Some("login_required"));
+        for route in [PageRoute::Home, PageRoute::Services, PageRoute::Unknown] {
+            assert_eq!(route.error_code(), Some("navigation_not_confirmed"));
+        }
+        assert_eq!(PageRoute::Checkin.error_code(), None);
+    }
+
+    /// `unsupported_checkin` used to be a route. It was removed because a route
+    /// is page identity only (D-08) and the check-in *kind* belongs to
+    /// `checkin_mode`; the variant had no producer and only shadowed the
+    /// check-in page's real title evidence. Historical logs that still carry the
+    /// string must keep loading.
+    #[test]
+    fn the_retired_unsupported_checkin_route_still_deserializes_as_unknown() {
+        let retired: PageRoute = serde_json::from_str(r#""unsupported_checkin""#).unwrap();
+        assert_eq!(retired, PageRoute::Unknown);
+        assert_eq!(retired.error_code(), Some("navigation_not_confirmed"));
+
+        for route in [
+            PageRoute::Login,
+            PageRoute::Home,
+            PageRoute::Services,
+            PageRoute::Checkin,
+            PageRoute::RouteCandidateUnconfirmed,
+            PageRoute::RouteEvidenceConflict,
+            PageRoute::StalePageRefreshFailed,
+            PageRoute::StalePageRefreshUnconfirmed,
+            PageRoute::AppLeftForeground,
+            PageRoute::Unknown,
+        ] {
+            let text = serde_json::to_string(&route).unwrap();
+            assert_eq!(serde_json::from_str::<PageRoute>(&text).unwrap(), route);
+        }
+    }
+
+    // ===== v0.3.0 result convergence (frozen decisions D-05/D-07) =====
+
+    #[test]
+    fn set_run_failure_populates_the_stable_machine_code() {
+        let root = temp_root("run-failure");
+        let log = RunLog::new(&root).unwrap();
+        let mut result = new_run_result(Mode::DryRun, &log, &super::InstanceTargetArgs::default());
+        assert_eq!(result.status.as_deref(), Some("running"));
+        assert!(result.error_code.is_none());
+
+        set_run_failure(&mut result, "outside_window", "time_window", "请等待窗口");
+        assert_eq!(result.error_code.as_deref(), Some("outside_window"));
+        assert_eq!(result.error.as_deref(), Some("outside_window"));
+        assert_eq!(result.error_stage.as_deref(), Some("time_window"));
+        assert!(result.recovery_action.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finalize_run_converges_running_into_a_terminal_status() {
+        let root = temp_root("finalize");
+        let log = RunLog::new(&root).unwrap();
+
+        let mut ready = new_run_result(Mode::DryRun, &log, &super::InstanceTargetArgs::default());
+        ready.dry_run_ready = true;
+        finalize_run(&log, &mut ready).unwrap();
+        assert_eq!(ready.status.as_deref(), Some(RunStatus::Success.as_str()));
+        assert!(ready.finished_at.is_some());
+        assert!(
+            ready
+                .artifact_paths
+                .iter()
+                .any(|path| path.ends_with("result.json")),
+            "result.json must be referenced as an artifact"
+        );
+
+        let mut failed = new_run_result(Mode::DryRun, &log, &super::InstanceTargetArgs::default());
+        set_run_failure(&mut failed, "unknown_state", "visual_observation", "重试");
+        finalize_run(&log, &mut failed).unwrap();
+        assert_eq!(failed.status.as_deref(), Some(RunStatus::Failed.as_str()));
+        assert_eq!(failed.error_code.as_deref(), Some("unknown_state"));
+
+        // `blocked` is owned by the batch layer and must survive finalization.
+        let mut blocked = new_run_result(Mode::DryRun, &log, &super::InstanceTargetArgs::default());
+        blocked.status = Some(RunStatus::Blocked.as_str().into());
+        finalize_run(&log, &mut blocked).unwrap();
+        assert_eq!(blocked.status.as_deref(), Some(RunStatus::Blocked.as_str()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ===== v0.3.0 batch coordination (frozen decisions D-05/D-07) =====
+
+    #[test]
+    fn blocked_instance_result_keeps_identity_and_shared_blocker() {
+        let root = temp_root("blocked");
+        let log = RunLog::new(&root).unwrap();
+        let instance = EmulatorInstanceConfig {
+            instance_index: 2,
+            name: "签到实例 2".into(),
+            serial: String::new(),
+            enabled: true,
+        };
+        let result = blocked_instance_result(Mode::DryRun, &log, &instance, "ldconsole 不可用");
+
+        assert_eq!(result.status.as_deref(), Some(RunStatus::Blocked.as_str()));
+        assert_eq!(result.blocked_by.as_deref(), Some("shared_preflight"));
+        assert_eq!(
+            result.error_code.as_deref(),
+            Some("shared_preflight_failed")
+        );
+        assert_eq!(result.error_stage.as_deref(), Some("shared_preflight"));
+        assert_eq!(result.instance_index, Some(2));
+        assert_eq!(result.instance_name.as_deref(), Some("签到实例 2"));
+        // The serial is derived from the TCP ADB port for the index when the
+        // configuration does not pin one, so the summary entry stays usable.
+        assert_eq!(result.serial, "127.0.0.1:5559");
+        assert!(!result.clicked);
+        assert!(!result.success);
+
+        let entry = instance_summary_entry(&result, RunStatus::Blocked, None);
+        assert_eq!(entry["index"], 2);
+        assert_eq!(entry["name"], "签到实例 2");
+        assert_eq!(entry["serial"], "127.0.0.1:5559");
+        assert_eq!(entry["status"], "blocked");
+        assert_eq!(entry["blocked_by"], "shared_preflight");
+        assert_eq!(entry["error_code"], "shared_preflight_failed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_summary_is_written_under_a_batch_scoped_directory() {
+        let root = temp_root("batch-summary");
+        let summary = serde_json::json!({"schema_version": 3, "status": "blocked"});
+        let path =
+            crate::logger::write_batch_summary(&root, "2026-10-14_221000_000_1", &summary).unwrap();
+        assert_eq!(
+            path,
+            root.join("logs")
+                .join("batch-2026-10-14_221000_000_1")
+                .join("summary.json")
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["status"], "blocked");
+
+        // A second batch must not overwrite the first one's summary.
+        let other =
+            crate::logger::write_batch_summary(&root, "2026-10-14_221500_000_2", &summary).unwrap();
+        assert_ne!(other, path);
+        assert!(path.is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_result_route_and_page_route_stay_in_lockstep() {
+        let root = temp_root("route-lockstep");
+        let log = RunLog::new(&root).unwrap();
+        let mut result: RunResult =
+            new_run_result(Mode::DryRun, &log, &super::InstanceTargetArgs::default());
+        assert!(result.route.is_none());
+        super::set_page_route(&mut result, PageRoute::Checkin);
+        assert_eq!(result.route.as_deref(), Some("checkin"));
+        assert_eq!(result.page_route, Some(PageRoute::Checkin));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The profile only supplies the fallback geometry ratios, so the tests pin
+    /// one explicitly instead of depending on a fixture-to-profile match.
+    fn test_profile() -> &'static crate::profile::Profile {
+        crate::profile::find_profile_by_id("portrait_900x1600_d320")
+            .expect("built-in profile must exist")
+    }
+
+    // ===== v0.3.0 CLI config path (frozen decision D-01) =====
+
+    #[test]
+    fn global_config_flag_is_accepted_before_and_after_the_subcommand() {
+        let cli = super::Cli::try_parse_from([
+            "zhfd-checkin",
+            "--config",
+            r"C:\User Data\ZHFD\config.toml",
+            "run",
+            "--dry-run",
+        ])
+        .expect("--config 必须可作为全局参数出现在子命令之前");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(Path::new(r"C:\User Data\ZHFD\config.toml"))
+        );
+
+        let cli = super::Cli::try_parse_from([
+            "zhfd-checkin",
+            "run",
+            "--dry-run",
+            "--config",
+            r"C:\User Data\ZHFD\config.toml",
+        ])
+        .expect("--config 也必须可用于子命令之后");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(Path::new(r"C:\User Data\ZHFD\config.toml"))
+        );
+
+        // Without the flag the default path-selection chain applies.
+        let cli = super::Cli::try_parse_from(["zhfd-checkin", "run", "--dry-run"]).unwrap();
+        assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn damaged_config_makes_cli_fail_with_the_path_and_a_repair_pointer() {
+        let root = temp_root("cli-damaged-config");
+        let path = root.join("config.toml");
+        fs::write(&path, "this is not toml").unwrap();
+
+        let error = super::load_store_for_cli(Some(&path)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&path.display().to_string()),
+            "错误信息必须给出实际配置路径: {message}"
+        );
+        assert!(
+            message.contains("zhfd-checkin-gui.exe"),
+            "错误信息必须指向 GUI Setup/Repair 入口: {message}"
+        );
+        assert!(
+            message.contains("不会自动恢复默认配置"),
+            "CLI 不得暗示会静默恢复默认配置: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "this is not toml",
+            "CLI 失败不得改写损坏的配置"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_config_path_matches_the_loader_candidate_order() {
+        // The Repair page and the CLI error message must name the file the
+        // loader actually tried. With no explicit path and no portable config
+        // present, the first candidate is the portable one beside the EXE.
+        let path = crate::config::ConfigStore::default_config_path().unwrap();
+        assert_eq!(path.file_name().unwrap(), "config.toml");
+        let exe_root = crate::config::exe_root().unwrap();
+        // Either the portable candidate (no LocalAppData config) or the
+        // LocalAppData candidate, never something unrelated.
+        let local = crate::config::recommended_local_app_data_root();
+        assert!(
+            path == exe_root.join("config.toml")
+                || local.is_some_and(|root| path == root.join("config.toml")),
+            "recovery 路径必须来自加载候选链: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn cli_config_display_path_prefers_the_explicit_value() {
+        assert_eq!(
+            super::describe_config_path(Some(Path::new(r"C:\x\config.toml"))),
+            r"C:\x\config.toml"
+        );
+        // Without an explicit path the portable candidate is reported.
+        assert!(
+            super::describe_config_path(None).ends_with("config.toml"),
+            "默认路径提示必须指向某个 config.toml"
+        );
+    }
+
+    #[test]
+    fn propagated_failures_keep_a_stage_specific_machine_code() {
+        assert_eq!(propagated_failure("device_setup").0, "device_setup_failed");
+        assert_eq!(propagated_failure("app_launch").0, "app_start_failed");
+        assert_eq!(propagated_failure("app_foreground").0, "app_start_failed");
+        assert_eq!(
+            propagated_failure("visual_observation").0,
+            "observation_failed"
+        );
+        assert_eq!(propagated_failure("anything_else").0, "runtime_error");
+        // Every branch must carry actionable recovery text.
+        for stage in [
+            "device_setup",
+            "app_launch",
+            "visual_observation",
+            "runtime",
+        ] {
+            let (_, recovery) = propagated_failure(stage);
+            assert!(!recovery.trim().is_empty(), "stage {stage} 缺少恢复建议");
+        }
+    }
+
+    // ===== popup / advertisement blocking the page (v0.3.0 follow-up) =====
+
+    #[test]
+    fn a_foreign_window_is_detected_and_excluded_from_page_identity() {
+        // The app owns the foreground package, but a second process has drawn a
+        // window on top of it. Its words must not be able to impersonate the
+        // check-in page.
+        let xml = concat!(
+            r#"<hierarchy>"#,
+            r#"<node index="0" package="com.example.ad" text="限时活动 立即领取" bounds="[100,600][800,900]"/>"#,
+            r#"<node index="0" package="cn.edu.fzu.fdxypa" text="晚点名签到" bounds="[0,0][900,100]"/>"#,
+            r#"</hierarchy>"#
+        );
+        let view = PageView::parse(xml, TEST_PACKAGE);
+        assert_eq!(view.foreign_package(), Some("com.example.ad"));
+        // Only the target app's nodes carry page identity, so the sweepstake
+        // copy cannot become a route marker.
+        assert!(!view.scoped_text.contains("限时活动"));
+        assert!(view.scoped_text.contains("晚点名签到"));
+    }
+
+    #[test]
+    fn a_sweepstake_popup_alone_never_confirms_the_checkin_page() {
+        // Even if the advertisement reuses the page's own words, a route must
+        // not be confirmed from another process's window.
+        let xml = concat!(
+            r#"<hierarchy>"#,
+            r#"<node package="com.example.ad" text="晚点名签到"/>"#,
+            r#"<node package="com.example.ad" text="点击签到"/>"#,
+            r#"</hierarchy>"#
+        );
+        let view = PageView::parse(xml, TEST_PACKAGE);
+        assert_eq!(view.foreign_package(), Some("com.example.ad"));
+        assert_eq!(
+            detect_page_route(&view),
+            PageRoute::Unknown,
+            "外进程窗口不得确认签到路由"
+        );
+        assert!(matches!(
+            unconfirmed_page_failure(view.foreign_package()),
+            ("overlay_present", _)
+        ));
+    }
+
+    /// `unsupported_checkin` was retired as a route; `checkin_mode` already
+    /// carries that distinction on a confirmed check-in page, and the route had
+    /// no producer. The entry card's label and the check-in page's title are the
+    /// same string, so the retired variant only ever shadowed real page
+    /// evidence -- the home page's entry card must stay `Home`, and a
+    /// field-work-only page must stay unidentified rather than masquerade as a
+    /// check-in page.
+    #[test]
+    fn the_checkin_entry_card_is_never_mistaken_for_the_checkin_page() {
+        assert_eq!(
+            detect_page_route(&page(r#"<node text="我的服务"/><node text="晚点名签到"/>"#)),
+            PageRoute::Home
+        );
+        assert_eq!(
+            detect_page_route(&page(
+                r#"<node text="外勤签到"/><node text="当前位置"/><node text="签到时间"/>"#
+            )),
+            PageRoute::Unknown
+        );
+    }
+
+    /// The check-in page's own title node is clickable, and its label is the
+    /// same string as the home entry card. Resolving the entry on a page that is
+    /// already the check-in page would click the title, so it must return
+    /// nothing there.
+    #[test]
+    fn the_checkin_entry_is_only_resolved_off_the_checkin_page() {
+        let checkin_page = page(concat!(
+            r#"<node text="晚点名签到" clickable="true" bounds="[0,300][900,400]"/>"#,
+            r#"<node text="点击签到" clickable="true" bounds="[0,900][900,1000]"/>"#
+        ));
+        assert_eq!(detect_page_route(&checkin_page), PageRoute::Checkin);
+        assert_eq!(find_checkin_entry_bounds(&checkin_page, 100), None);
+
+        let home_page = page(concat!(
+            r#"<node text="我的服务" bounds="[0,0][900,100]"/>"#,
+            r#"<node text="晚点名签到" clickable="true" bounds="[0,600][900,700]"/>"#
+        ));
+        assert_eq!(detect_page_route(&home_page), PageRoute::Home);
+        assert_eq!(find_checkin_entry_bounds(&home_page, 100), Some((450, 650)));
+    }
+
+    #[test]
+    fn build_id_marks_a_dirty_or_undetermined_tree() {
+        // FR-014: `git_commit` alone would claim a provenance the binary may not
+        // have, so a dirty (or undeterminable) build must be visibly marked.
+        assert_eq!(
+            build_id_for("0.3.0", "abcdef123456", Some(false)),
+            "0.3.0-abcdef123456"
+        );
+        assert_eq!(
+            build_id_for("0.3.0", "abcdef123456", Some(true)),
+            "0.3.0-abcdef123456+dirty"
+        );
+        assert_eq!(
+            build_id_for("0.3.0", "unknown", None),
+            "0.3.0-unknown+unknown"
+        );
+        // The build that produced this test binary must be internally
+        // consistent: the id and the flag come from the same build-script run.
+        assert_eq!(build_id(), build_id_for(VERSION, GIT_COMMIT, git_dirty()));
+    }
+
+    #[test]
+    fn unconfirmed_page_failure_separates_overlay_from_missing_markers() {
+        let (code, recovery) = unconfirmed_page_failure(Some("com.example.ad"));
+        assert_eq!(code, "overlay_present");
+        assert!(
+            recovery.contains("com.example.ad"),
+            "恢复建议必须指出遮挡窗口的来源: {recovery}"
+        );
+        assert!(recovery.contains("未执行任何点击"));
+
+        let (code, recovery) = unconfirmed_page_failure(None);
+        assert_eq!(code, "route_candidate_unconfirmed");
+        assert!(!recovery.is_empty());
+    }
+
+    #[test]
+    fn overlay_does_not_authorize_the_stale_page_back_action() {
+        // A stale check-in page is normally refreshed with BACK. With a popup
+        // present there is no way to know which window BACK would act on, so
+        // the decision must stop instead of pressing a key.
+        let xml = concat!(
+            r#"<hierarchy>"#,
+            r#"<node package="com.example.ad" text="公告" bounds="[100,600][800,900]"/>"#,
+            r#"<node package="cn.edu.fzu.fdxypa" text="晚点名签到" bounds="[0,0][900,100]"/>"#,
+            r#"<node package="cn.edu.fzu.fdxypa" text="点击签到" bounds="[0,100][900,200]"/>"#,
+            r#"</hierarchy>"#
+        );
+        let view = PageView::parse(xml, TEST_PACKAGE);
+        assert_eq!(detect_page_route(&view), PageRoute::Checkin);
+        assert_eq!(view.foreign_package(), Some("com.example.ad"));
+    }
+
+    #[test]
+    fn fixtures_without_a_package_attribute_stay_in_scope() {
+        // Existing hand-written fixtures and partial dumps omit `package`; the
+        // scoping must only ever remove foreign evidence.
+        let view = page(r#"<node text="晚点名签到"/><node text="无法签到"/>"#);
+        assert!(view.packages.is_empty());
+        assert_eq!(view.foreign_package(), None);
+        assert_eq!(detect_page_route(&view), PageRoute::Checkin);
+    }
+
+    #[test]
+    fn unconfirmed_reobserve_is_bounded_and_only_for_unidentified_pages() {
+        // Only an unidentified page is re-read, and only a bounded number of
+        // times: a persistently blocked page must fail rather than loop.
+        assert!(super::should_reobserve(
+            PageRoute::RouteCandidateUnconfirmed,
+            1
+        ));
+        assert!(!super::should_reobserve(
+            PageRoute::RouteCandidateUnconfirmed,
+            super::UNCONFIRMED_REOBSERVE_ATTEMPTS
+        ));
+        for route in [
+            PageRoute::Checkin,
+            PageRoute::Home,
+            PageRoute::Services,
+            PageRoute::Login,
+            PageRoute::Unknown,
+            PageRoute::RouteEvidenceConflict,
+            PageRoute::StalePageRefreshFailed,
+            PageRoute::StalePageRefreshUnconfirmed,
+            PageRoute::AppLeftForeground,
+        ] {
+            assert!(
+                !super::should_reobserve(route, 1),
+                "{route:?} 不应触发重新观测"
+            );
+        }
+        assert!(super::UNCONFIRMED_REOBSERVE_INTERVAL >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn stale_refresh_failures_are_not_reported_as_evidence_conflicts() {
+        // Returning from an old check-in page is a navigation decision: no
+        // screenshot evidence is involved, so no outcome may claim a
+        // visual/hierarchy conflict.
+        const TARGET: &str = "cn.edu.fzu.fdxypa";
+        assert_eq!(
+            super::stale_refresh_route(PageRoute::RouteCandidateUnconfirmed, Some(TARGET), TARGET),
+            PageRoute::StalePageRefreshUnconfirmed
+        );
+        for route in [
+            PageRoute::Home,
+            PageRoute::Services,
+            PageRoute::Login,
+            PageRoute::Unknown,
+        ] {
+            assert_eq!(
+                super::stale_refresh_route(route, Some(TARGET), TARGET),
+                PageRoute::StalePageRefreshFailed,
+                "{route:?} 必须归类为 stale_page_refresh_failed"
+            );
+        }
+        // A failed foreground query is unobservable, never "still in the App".
+        for route in [PageRoute::RouteCandidateUnconfirmed, PageRoute::Home] {
+            assert_eq!(
+                super::stale_refresh_route(route, None, TARGET),
+                PageRoute::StalePageRefreshUnconfirmed,
+                "{route:?} 在前台查询失败时必须归类为 stale_page_refresh_unconfirmed"
+            );
+        }
+        // A different package means BACK dropped the App out of the foreground:
+        // distinct from both stale in-app outcomes for *every* fresh route,
+        // including the unconfirmed one that a Launcher dump produces.
+        for route in [
+            PageRoute::RouteCandidateUnconfirmed,
+            PageRoute::Home,
+            PageRoute::Services,
+            PageRoute::Login,
+            PageRoute::Unknown,
+            PageRoute::Checkin,
+        ] {
+            assert_eq!(
+                super::stale_refresh_route(route, Some("com.android.launcher3"), TARGET),
+                PageRoute::AppLeftForeground,
+                "{route:?} 在目标 App 离开前台时必须归类为 app_left_foreground"
+            );
+        }
+        assert_eq!(
+            PageRoute::StalePageRefreshFailed.error_code(),
+            Some("stale_page_refresh_failed")
+        );
+        assert_eq!(
+            PageRoute::StalePageRefreshUnconfirmed.error_code(),
+            Some("stale_page_refresh_unconfirmed")
+        );
+        // The app-left route reuses the FR-013 code, so GUI/CLI recovery stays
+        // correct without a third synonym for the same condition.
+        assert_eq!(
+            PageRoute::AppLeftForeground.error_code(),
+            Some("target_app_not_foreground")
+        );
+        assert_eq!(PageRoute::AppLeftForeground.as_str(), "app_left_foreground");
+    }
+
+    #[test]
+    fn foreground_check_separates_a_missing_app_from_an_unreadable_query() {
+        // Confirmed target App: no failure.
+        assert_eq!(
+            foreground_check(Some("cn.edu.fzu.fdxypa"), "cn.edu.fzu.fdxypa"),
+            None
+        );
+        // A different package is its own diagnosis with its own recovery.
+        assert_eq!(
+            foreground_check(Some("com.android.launcher"), "cn.edu.fzu.fdxypa")
+                .map(|(code, _)| code),
+            Some("target_app_not_foreground")
+        );
+        // A failed query must never be read as "still in the foreground".
+        assert_eq!(
+            foreground_check(None, "cn.edu.fzu.fdxypa").map(|(code, _)| code),
+            Some("foreground_query_failed")
+        );
+    }
+
+    #[test]
+    fn config_default_has_no_tool_paths_so_first_run_opens_setup() {
+        // The Setup page is entered when the config has no tool paths yet; that
+        // predicate must stay true for the shipped defaults.
+        let config = Config::default();
+        assert!(config.emulator.ldconsole_path.trim().is_empty());
+        assert!(config.emulator.adb_path.trim().is_empty());
+    }
+
     #[test]
     fn labeled_bounds_match_accessibility_suffix_and_skip_header() {
         let xml = r#"<node content-desc="晚点名签到" bounds="[10,20][30,40]"/><node content-desc="业务&#10;第 4 个标签，共 4 个" bounds="[100,600][300,700]"/>"#;
-        assert_eq!(find_labeled_bounds(xml, "晚点名签到", 100), None);
-        assert_eq!(find_labeled_bounds(xml, "业务", 100), Some((200, 650)));
+        assert_eq!(find_labeled_bounds(&page(xml), "晚点名签到", 100), None);
+        assert_eq!(
+            find_labeled_bounds(&page(xml), "业务", 100),
+            Some((200, 650))
+        );
         let clickable =
             r#"<node content-desc="晚点名签到" clickable="true" bounds="[10,200][30,240]"/>"#;
         assert_eq!(
-            find_clickable_labeled_bounds(clickable, "晚点名签到", 100),
+            find_clickable_labeled_bounds(&page(clickable), "晚点名签到", 100),
             Some((20, 220))
         );
         let malformed_then_valid = r#"<node content-desc="broken><node content-desc="晚点名签到" clickable="true" bounds="[10,200][30,240]"/>"#;
         assert_eq!(
-            find_clickable_labeled_bounds(malformed_then_valid, "晚点名签到", 100),
+            find_clickable_labeled_bounds(&page(malformed_then_valid), "晚点名签到", 100),
             Some((20, 220))
         );
     }
@@ -2466,40 +4507,43 @@ mod tests {
     #[test]
     fn page_route_detection_rejects_login_and_home_as_checkin() {
         assert_eq!(
-            detect_page_route(r#"<node content-desc="一键登录"/>"#),
+            detect_page_route(&page(r#"<node content-desc="一键登录"/>"#)),
             PageRoute::Login
         );
         assert_eq!(
-            detect_page_route(r#"<node content-desc="我的服务"/>"#),
+            detect_page_route(&page(r#"<node content-desc="我的服务"/>"#)),
             PageRoute::Home
         );
         assert_eq!(
-            detect_page_route(r#"<node text="晚点名签到"/><node text="无法签到"/>"#),
+            detect_page_route(&page(r#"<node text="晚点名签到"/><node text="无法签到"/>"#)),
             PageRoute::Checkin
         );
         assert_eq!(
-            detect_page_route(
+            detect_page_route(&page(
                 r#"<node text="晚点名签到"/><node text="未签到"/><node text="外勤签到"/><node text="当前位置"/>"#
-            ),
+            )),
             PageRoute::Checkin
         );
         assert_eq!(
-            detect_page_route(r#"<node text="我的服务"/><node text="外勤签到"/>"#),
+            detect_page_route(&page(r#"<node text="我的服务"/><node text="外勤签到"/>"#)),
             PageRoute::Home
         );
-        assert_eq!(detect_page_route("<hierarchy />"), PageRoute::Unknown);
+        assert_eq!(
+            detect_page_route(&page("<hierarchy />")),
+            PageRoute::Unknown
+        );
     }
 
     #[test]
     fn page_route_prioritizes_home_and_services_over_checkin_card_status_words() {
         assert_eq!(
-            detect_page_route(
+            detect_page_route(&page(
                 r#"<node text="我的服务"/><node text="晚点名签到"/><node text="已签到"/>"#
-            ),
+            )),
             PageRoute::Home
         );
         assert_eq!(
-            detect_page_route(r#"<node text="业务"/><node text="签到成功"/>"#),
+            detect_page_route(&page(r#"<node text="业务"/><node text="签到成功"/>"#)),
             PageRoute::Services
         );
         assert!(super::is_navigable_catalog_route(PageRoute::Home));
@@ -2508,37 +4552,39 @@ mod tests {
         assert!(!super::is_navigable_catalog_route(PageRoute::Login));
         assert!(!super::is_navigable_catalog_route(PageRoute::Checkin));
     }
+
     #[test]
     fn checkin_action_or_success_words_without_page_title_remain_unknown() {
         assert_eq!(
-            detect_page_route(r#"<node text="点击签到"/>"#),
+            detect_page_route(&page(r#"<node text="点击签到"/>"#)),
             PageRoute::Unknown
         );
         assert_eq!(
-            detect_page_route(r#"<node text="已签到"/>"#),
+            detect_page_route(&page(r#"<node text="已签到"/>"#)),
             PageRoute::Unknown
         );
         assert_eq!(
-            detect_page_route(
+            detect_page_route(&page(
                 r#"<node text="外勤签到"/><node text="未签到"/><node text="当前位置"/>"#
-            ),
+            )),
             PageRoute::Unknown
         );
     }
+
     #[test]
     fn checkin_mode_is_distinct_from_visual_color() {
         assert_eq!(
-            super::detect_checkin_mode(
+            super::detect_checkin_mode(&page(
                 r#"<node text="晚点名签到"/><node text="未签到"/><node text="外勤签到"/>"#
-            ),
+            )),
             CheckinMode::FieldWork
         );
         assert_eq!(
-            super::detect_checkin_mode(r#"<node text="无法签到"/><node text="点击签到"/>"#),
+            super::detect_checkin_mode(&page(r#"<node text="无法签到"/><node text="点击签到"/>"#)),
             CheckinMode::Ordinary
         );
         assert_eq!(
-            super::detect_checkin_mode("<hierarchy />"),
+            super::detect_checkin_mode(&page("<hierarchy />")),
             CheckinMode::Unsupported
         );
     }
@@ -2592,10 +4638,30 @@ mod tests {
             "run --dry-run",
             false,
             &target,
+            None,
         );
         assert_eq!(
             command,
             r#""C:\Program Files\ZHFD\zhfd-checkin.exe" run --dry-run --instance-index 1"#
+        );
+    }
+
+    #[test]
+    fn task_command_line_keeps_explicit_config_path() {
+        // A scheduled task starts a fresh process: without pinning `--config`
+        // the task would silently act on whatever root the portable/LocalAppData
+        // probe resolves to instead of the config the user actually edited.
+        let target = super::InstanceTargetArgs::default();
+        let command = build_task_command_line(
+            Path::new(r"C:\Program Files\ZHFD\zhfd-checkin.exe"),
+            "run --dry-run",
+            false,
+            &target,
+            Some(Path::new(r"C:\User Data\ZHFD\config.toml")),
+        );
+        assert!(
+            command.contains(r#"--config "C:\User Data\ZHFD\config.toml""#),
+            "scheduled task dropped the explicit config path: {command}"
         );
     }
 

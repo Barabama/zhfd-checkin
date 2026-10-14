@@ -8,6 +8,12 @@ pub enum Mode {
     Live,
 }
 
+/// Which page the App is showing. A route is *page identity only* (frozen
+/// decision D-08): the check-in *kind* on a confirmed check-in page is carried
+/// separately by [`CheckinMode`], so there is deliberately no
+/// "unsupported check-in" route. A page that only mentions 外勤签到 without the
+/// check-in page title is not identifiable as a check-in page at all, and the
+/// home page's 晚点名签到 entry card must never be mistaken for one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PageRoute {
@@ -15,10 +21,27 @@ pub enum PageRoute {
     Home,
     Services,
     Checkin,
-    UnsupportedCheckin,
-    Unknown,
     RouteCandidateUnconfirmed,
     RouteEvidenceConflict,
+    /// The run started on a check-in page and the refresh navigation did not
+    /// land on a catalogue page: the page identity transition cannot be
+    /// trusted, so no action may follow.
+    StalePageRefreshFailed,
+    /// The refresh navigation happened but the resulting state could not be
+    /// confirmed as a catalogue page: the hierarchy was unavailable, the dump
+    /// carried no page-identity markers, or the foreground package could not be
+    /// read at all.
+    StalePageRefreshUnconfirmed,
+    /// After the stale-page refresh BACK, the target App was no longer the
+    /// foreground package (for example the BACK dropped the App to the
+    /// Launcher). The run stops here with no further navigation or tap; the
+    /// stable machine code reuses FR-013's `target_app_not_foreground`.
+    AppLeftForeground,
+    /// Also the deserialization catch-all: a historical `result.json` written by
+    /// an older build may carry a route string this build no longer has (the
+    /// retired `unsupported_checkin`), and reading old logs must not fail.
+    #[serde(other)]
+    Unknown,
 }
 
 impl PageRoute {
@@ -28,10 +51,52 @@ impl PageRoute {
             Self::Home => "home",
             Self::Services => "services",
             Self::Checkin => "checkin",
-            Self::UnsupportedCheckin => "unsupported_checkin",
             Self::Unknown => "unknown",
             Self::RouteCandidateUnconfirmed => "route_candidate_unconfirmed",
             Self::RouteEvidenceConflict => "route_evidence_conflict",
+            Self::StalePageRefreshFailed => "stale_page_refresh_failed",
+            Self::StalePageRefreshUnconfirmed => "stale_page_refresh_unconfirmed",
+            Self::AppLeftForeground => "app_left_foreground",
+        }
+    }
+
+    /// Stable machine error code for a route that cannot authorize an action.
+    /// `Checkin` is the only route that is allowed to continue, so it has no
+    /// failure code; every caller must still check for it explicitly.
+    pub fn error_code(self) -> Option<&'static str> {
+        match self {
+            Self::Login => Some("login_required"),
+            Self::Home | Self::Services | Self::Unknown => Some("navigation_not_confirmed"),
+            Self::RouteCandidateUnconfirmed => Some("route_candidate_unconfirmed"),
+            Self::RouteEvidenceConflict => Some("route_evidence_conflict"),
+            Self::StalePageRefreshFailed => Some("stale_page_refresh_failed"),
+            Self::StalePageRefreshUnconfirmed => Some("stale_page_refresh_unconfirmed"),
+            // Reuses the FR-013 code that already names this exact condition
+            // (target App no longer foreground) instead of inventing a synonym.
+            Self::AppLeftForeground => Some("target_app_not_foreground"),
+            Self::Checkin => None,
+        }
+    }
+}
+
+/// Machine-readable terminal state of a run. Frozen by D-05/D-07: these four
+/// English values are the v0.3 wire format, and every stable machine error is
+/// carried separately in `error_code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Running,
+    Success,
+    Failed,
+    Blocked,
+}
+
+impl RunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
         }
     }
 }
@@ -206,10 +271,29 @@ pub struct RunResult {
     pub location_state: Option<String>,
     #[serde(default)]
     pub foreground_package: Option<String>,
+    /// Machine-observable result of the last hierarchy read. Distinguishes
+    /// `dump_succeeded`, `dump_failed`, `dump_empty_or_truncated` and
+    /// `route_markers_missing` (requirement FR-011) while the route keeps the
+    /// frozen `route_candidate_unconfirmed` code.
+    #[serde(default)]
+    pub hierarchy_status: Option<String>,
+    /// Package of a window that was on screen but does not belong to the target
+    /// app. Direct evidence that a popup or advertisement is blocking the page,
+    /// kept separate from `foreground_package` so "the app is in front" and
+    /// "something is drawn on top of it" are not conflated.
+    #[serde(default)]
+    pub overlay_package: Option<String>,
     #[serde(default)]
     pub app_version: Option<String>,
     #[serde(default)]
     pub git_commit: Option<String>,
+    /// Whether the working tree the binary was built from had uncommitted
+    /// tracked changes. `None` means the build could not tell (git missing or
+    /// the command failed) -- deliberately distinct from `Some(false)`.
+    /// Without this, `git_commit` alone would claim a provenance the binary may
+    /// not actually have (FR-014).
+    #[serde(default)]
+    pub git_dirty: Option<bool>,
     #[serde(default)]
     pub build_id: Option<String>,
     pub error: Option<String>,
@@ -242,10 +326,6 @@ pub fn in_configured_window(start: &str, end: &str, timezone: &str) -> Result<bo
 /// configured window ends. `None` means the current time is outside the
 /// window. Keeping this calculation here makes the run loop testable without
 /// depending on the host timezone or wall clock.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "reserved for bounded scheduled waiting")
-)]
 pub fn seconds_until_configured_window_end(
     start: &str,
     end: &str,
@@ -256,10 +336,6 @@ pub fn seconds_until_configured_window_end(
     seconds_until_configured_window_end_at(start, end, now)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "reserved for bounded scheduled waiting")
-)]
 pub fn seconds_until_configured_window_end_at(
     start: &str,
     end: &str,
@@ -296,10 +372,6 @@ fn timezone_offset(timezone: &str) -> Result<FixedOffset> {
     .ok_or_else(|| anyhow::anyhow!("无效 UTC offset"))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the scheduled-window helper tests")
-)]
 fn in_window_values(start: NaiveTime, end: NaiveTime, now: NaiveTime) -> bool {
     if start <= end {
         now >= start && now <= end

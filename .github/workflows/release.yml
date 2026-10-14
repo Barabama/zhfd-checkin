@@ -36,9 +36,22 @@ jobs:
         run: |
           .\scripts\portable_smoke.ps1 -ExePath "$pwd\rust\target\release\zhfd-checkin.exe" -FixturePath "$pwd\autojs6\fixtures\ready.png"
           $expected = (git rev-parse --short=12 HEAD).Trim()
-          $about = (& .\rust\target\release\zhfd-checkin.exe about | Out-String)
-          if ($about -notmatch [regex]::Escape($expected)) { throw "Release EXE commit mismatch: expected=$expected`n$about" }
-
+          $version = (cargo metadata --manifest-path rust/Cargo.toml --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $cliAbout = (& .\rust\target\release\zhfd-checkin.exe about | Out-String)
+          $guiAbout = (& .\rust\target\release\zhfd-checkin-gui.exe about | Out-String)
+          foreach ($binary in @(@{Name='CLI'; About=$cliAbout}, @{Name='GUI'; About=$guiAbout})) {
+            if ($binary.About -notmatch "(?m)^Git commit:\s*$([regex]::Escape($expected))\s*$") {
+              throw "$($binary.Name) commit mismatch. expected=$expected`n$($binary.About)"
+            }
+            # FR-014 provenance honesty: a tagged release must come from a
+            # clean checkout and both shipped binaries must name that commit.
+            if ($binary.About -notmatch "(?m)^Build id:\s*(\S+)") {
+              throw "$($binary.Name) did not report a build id.`n$($binary.About)"
+            }
+            if ($Matches[1] -ne "$version-$expected") {
+              throw "$($binary.Name) build id is not pinned to the tagged commit. build_id=$($Matches[1]) expected=$version-$expected`n$($binary.About)"
+            }
+          }
       - name: Package
         shell: pwsh
         run: .\scripts\package_release.ps1 -ReleaseDirectory "$pwd\dist"

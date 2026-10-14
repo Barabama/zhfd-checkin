@@ -21,7 +21,35 @@ foreach ($path in @($cli, $gui)) {
     }
 }
 
-$commit = (& git -C $repoRoot rev-parse --short=12 HEAD).Trim()
+$commitOutput = & git -C $repoRoot rev-parse --short=12 HEAD 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to resolve the release commit from the repository: $commitOutput"
+}
+$commit = ($commitOutput | Out-String).Trim()
+if ([string]::IsNullOrWhiteSpace($commit)) {
+    throw "Git returned an empty release commit."
+}
+
+# Provenance honesty (FR-014): every shipped executable must identify the same
+# commit as this package and must have been built from a clean tree. A dirty
+# or unknown build cannot truthfully be published under a commit-pinned name.
+foreach ($executable in @($cli, $gui)) {
+    $about = (& $executable about 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to read provenance from $executable.`n$about"
+    }
+    if ($about -notmatch "(?m)^Git commit:\s*$([regex]::Escape($commit))\s*$") {
+        throw "EXE commit does not match HEAD ($commit): $executable`n$about"
+    }
+    if ($about -notmatch "(?m)^Build id:\s*(\S+)") {
+        throw "EXE did not report a build id: $executable`n$about"
+    }
+    $buildId = $Matches[1]
+    if ($buildId -ne "$Version-$commit") {
+        throw "Refusing to package a build whose provenance does not exactly match the clean commit ($Version-$commit): $executable reports $buildId"
+    }
+}
+
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("zhfd-release-" + [guid]::NewGuid().ToString("N"))
 $packageName = "zhfd-checkin-windows-x64-v$Version-$commit"
 $packageDir = Join-Path $stage $packageName

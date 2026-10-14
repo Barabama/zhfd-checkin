@@ -1,18 +1,23 @@
-# 文档入口与历史映射
+# 智汇福大签到助手文档入口
 
-> 整理日期：2026-10-11（Asia/Shanghai）
-> 目的：减少多个上下文/交接/阶段总结彼此重复；以主题文档作为维护入口，历史原件移动归档保留。
+此处是当前用户文档与工程文档的索引。第一次使用建议按顺序阅读：
+
+1. [快速开始](./QUICK_START.md)：从准备环境、首次设置，到首次单实例 dry-run。
+2. GUI 左侧的“快速使用”：在程序内查看分步流程、结果解释和常见故障处理。
+3. [Windows 安装、配置与运维](./OPERATIONS.md)：依赖路径、实例、数据目录、CLI 和计划任务。
+4. [签到安全策略](./CHECKIN_SAFETY.md)：dry-run/live 边界、点击门禁、外勤限制和成功判定。
 
 ## 当前主题入口
 
 | 文档 | 维护范围 |
 |---|---|
-| [PRODUCT_AND_ARCHITECTURE.md](./PRODUCT_AND_ARCHITECTURE.md) | 产品职责、目标架构、Phase 状态与系统级待办 |
+| [快速开始](./QUICK_START.md) | 新用户首次运行流程、最小安全检查、dry-run 和结果确认 |
 | [OPERATIONS.md](./OPERATIONS.md) | Windows 便携部署、TOML 配置、依赖发现、模拟器/实例/CLI 操作 |
 | [CHECKIN_SAFETY.md](./CHECKIN_SAFETY.md) | 页面路由、签到业务类型、点击门禁、成功日期、证据边界 |
+| [PRODUCT_AND_ARCHITECTURE.md](./PRODUCT_AND_ARCHITECTURE.md) | 产品职责、目标架构、Phase 状态与系统级待办 |
 | [ENGINEERING_AND_RELEASE.md](./ENGINEERING_AND_RELEASE.md) | Cargo 项目布局、代码维护、CI/构建/打包与发布状态 |
-| [audits/](./audits/) | 2026-10-11 Phase 4 独立审计、修复复核及对应提示词/工程记录 |
-| [archive/2026-10-11/](./archive/2026-10-11/) | 本次整理前文档原件，按主题保存，未删除 |
+| [audits/](./audits/) | 独立审计、修复复核及对应工程记录 |
+| [archive/2026-10-11/](./archive/2026-10-11/) | 历史原件归档 |
 
 ## 历史原件映射
 

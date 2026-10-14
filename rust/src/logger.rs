@@ -7,11 +7,16 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 pub struct RunLog {
     pub dir: PathBuf,
     events: PathBuf,
+    /// Monotonic per-run counter backing `next_observation_id`. A hierarchy
+    /// read must carry a unique id across the whole run, not just within one
+    /// navigation stage (requirement FR-011).
+    observations: AtomicUsize,
 }
 
 pub struct SyncLog {
@@ -54,7 +59,6 @@ pub struct LogSummary {
     pub summary: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct EventSummary {
     pub at: String,
@@ -67,6 +71,19 @@ struct Event<'a, T: Serialize> {
     at: String,
     kind: &'a str,
     data: T,
+}
+
+/// Identifier for a batch run. It is a timestamp plus pid, matching the log
+/// directory naming so a batch id and a run id are visually comparable, but it
+/// deliberately does NOT create a log directory: the batch only owns
+/// `logs/batch-<id>/summary.json`, and per-instance results keep their own
+/// directories.
+pub fn new_batch_id() -> String {
+    format!(
+        "{}{}",
+        Local::now().format("%Y-%m-%d_%H%M%S_%3f"),
+        std::process::id()
+    )
 }
 
 fn unique_log_dir(root: &Path, prefix: &str) -> Result<PathBuf> {
@@ -127,7 +144,13 @@ impl RunLog {
         Ok(Self {
             events: dir.join("events.jsonl"),
             dir,
+            observations: AtomicUsize::new(0),
         })
+    }
+
+    /// Next unique observation id for a hierarchy read in this run.
+    pub fn next_observation_id(&self) -> usize {
+        self.observations.fetch_add(1, Ordering::Relaxed) + 1
     }
     pub fn event<T: Serialize>(&self, kind: &str, data: T) -> Result<()> {
         let line = serde_json::to_string(&Event {
@@ -153,6 +176,25 @@ impl RunLog {
         fs::write(&p, serde_json::to_vec_pretty(value)?)?;
         Ok(p)
     }
+}
+
+/// Write the run-level summary for a batch (`--all-instances`) execution.
+///
+/// The summary lives in its own `logs/batch-<id>/` directory so concurrent
+/// batches can never overwrite each other's aggregate result. Per-instance
+/// `result.json` files stay in their own log directories and are referenced
+/// from the summary entries.
+pub fn write_batch_summary(
+    root: &Path,
+    batch_id: &str,
+    summary: &serde_json::Value,
+) -> Result<PathBuf> {
+    let dir = root.join("logs").join(format!("batch-{batch_id}"));
+    fs::create_dir_all(&dir).with_context(|| format!("无法创建批量摘要目录: {}", dir.display()))?;
+    let path = dir.join("summary.json");
+    fs::write(&path, serde_json::to_vec_pretty(summary)?)
+        .with_context(|| format!("写入批量运行摘要失败: {}", path.display()))?;
+    Ok(path)
 }
 
 #[derive(Debug, Serialize)]
@@ -191,7 +233,6 @@ pub fn write_diagnostic_report(store: &ConfigStore) -> Result<PathBuf> {
     Ok(path)
 }
 
-#[allow(dead_code)]
 pub fn read_recent_events(dir: &Path, limit: usize) -> Result<Vec<EventSummary>> {
     let path = dir.join("events.jsonl");
     if !path.is_file() || limit == 0 {
@@ -224,15 +265,34 @@ pub fn read_recent_events(dir: &Path, limit: usize) -> Result<Vec<EventSummary>>
     Ok(events.into_iter().skip(start).collect())
 }
 
-#[allow(dead_code)]
+/// One-line rendering of a structured event for the GUI timeline.
+///
+/// The v0.3 event vocabulary is what ties a route decision to the same round's
+/// foreground read, hierarchy dump and screenshot (requirement FR-012), so each
+/// kind renders the fields that carry that linkage.
 fn event_summary(kind: &str, data: &serde_json::Value) -> String {
     let field = |name: &str| data.get(name).map(value_summary).unwrap_or_default();
     match kind {
         "hierarchy_observation" => format!(
-            "stage={} status={} bytes={} markers={}",
+            "#{} stage={} status={} bytes={} utf8={} markers={}",
+            field("observation_id"),
             field("stage"),
             field("status"),
             field("bytes"),
+            field("utf8_valid"),
+            field("marker_summary")
+        ),
+        "hierarchy_unavailable" => format!(
+            "#{} stage={} reason={} exit={}",
+            field("observation_id"),
+            field("stage"),
+            field("reason"),
+            field("exit_code")
+        ),
+        "route_markers_missing" => format!(
+            "#{} stage={} markers={}",
+            field("observation_id"),
+            field("stage"),
             field("marker_summary")
         ),
         "foreground_snapshot" => format!(
@@ -241,19 +301,52 @@ fn event_summary(kind: &str, data: &serde_json::Value) -> String {
             field("package"),
             field("error")
         ),
-        "page_route" => format!("route={}", field("route")),
+        "page_route" => format!("stage={} route={}", field("stage"), field("route")),
+        "page_observation" => format!("route={} mode={}", field("route"), field("checkin_mode")),
+        "navigation_action" => format!(
+            "action={} label={} stage={} before={}",
+            field("action"),
+            field("label"),
+            field("stage"),
+            field("before_route")
+        ),
         "state" => format!(
             "button={} coverage={}",
             field("state"),
             field("color_coverage")
         ),
+        "locating_wait" => format!(
+            "elapsed={}s limit={}s clicked=false",
+            field("elapsed_seconds"),
+            field("limit_seconds")
+        ),
+        "blocked" => format!("blocked_by={}", field("blocked_by")),
+        "foreign_window" => format!(
+            "#{} stage={} package={} nodes={} focus={}",
+            field("observation_id"),
+            field("stage"),
+            field("package"),
+            field("node_count"),
+            field("focused_window")
+        ),
+        "reobserve" => format!(
+            "stage={} attempt={} status={} overlay={}",
+            field("stage"),
+            field("attempt"),
+            field("status"),
+            field("overlay_package")
+        ),
+        "navigation_blocked" => format!(
+            "reason={} overlay={}",
+            field("reason"),
+            field("overlay_package")
+        ),
         "home_scroll" => format!("attempt={}", field("attempt")),
-        "clicked_ready" => format!("x={} y={}", field("x"), field("y")),
+        "clicked_ready" | "tap" => format!("x={} y={}", field("x"), field("y")),
         _ => serde_json::to_string(data).unwrap_or_else(|_| "{}".into()),
     }
 }
 
-#[allow(dead_code)]
 fn value_summary(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
@@ -278,7 +371,48 @@ pub fn recent_logs(root: &Path, limit: usize) -> Result<Vec<LogSummary>> {
     for dir in dirs.into_iter().take(limit) {
         let sync_path = dir.join("sync.json");
         let run_path = dir.join("result.json");
-        if sync_path.is_file() {
+        let batch_path = dir.join("summary.json");
+        if batch_path.is_file() {
+            // Run-level summary for a batch (`--all-instances`). It carries the
+            // shared blocker and one entry per planned instance (D-05/D-07), so
+            // it must be visible next to the per-instance results.
+            let value: serde_json::Value = match fs::read_to_string(&batch_path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+            {
+                Some(value) => value,
+                None => continue,
+            };
+            let status = value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let instances = value
+                .get("instances")
+                .and_then(serde_json::Value::as_array)
+                .map(|entries| entries.len())
+                .unwrap_or(0);
+            let blocked_by = value
+                .get("blocked_by")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| format!(" blocked_by={value}"))
+                .unwrap_or_default();
+            summaries.push(LogSummary {
+                directory: dir,
+                kind: "batch".into(),
+                status: status.into(),
+                summary: format!(
+                    "batch / mode={} / status={}{} / instances={}",
+                    value
+                        .get("mode")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    status,
+                    blocked_by,
+                    instances
+                ),
+            });
+        } else if sync_path.is_file() {
             // A single truncated or partially written artifact must not hide the
             // whole log list; skip unreadable entries and keep the rest.
             let value: serde_json::Value = match fs::read_to_string(&sync_path)
@@ -326,25 +460,41 @@ pub fn recent_logs(root: &Path, limit: usize) -> Result<Vec<LogSummary>> {
                 "field_work_ready"
             } else if result.dry_run_ready {
                 "dry-run-ready"
+            } else if result.blocked_by.is_some() {
+                // A blocked instance is not an ordinary failure: the batch never
+                // started it, so its status must read as blocked (D-05). The
+                // blocker itself is rendered in the summary line below.
+                "blocked"
             } else {
-                result.error.as_deref().unwrap_or("incomplete")
+                result
+                    .error_code
+                    .as_deref()
+                    .or(result.error.as_deref())
+                    .unwrap_or("incomplete")
             };
             let instance = result
                 .instance_index
                 .map(|index| format!("instance={}", index))
                 .unwrap_or_else(|| "instance=unknown".into());
+            let blocked = result
+                .blocked_by
+                .as_deref()
+                .map(|value| format!(" blocked_by={value}"))
+                .unwrap_or_default();
             summaries.push(LogSummary {
                 directory: dir,
                 kind: "run".into(),
                 status: status.into(),
                 summary: format!(
-                    "run / {} / {} / {} / route={} mode={} state={} clicked={} success={}",
+                    "run / {} / {} / {}{} / route={} mode={} state={} clicked={} success={}",
                     instance,
                     profile,
                     status,
+                    blocked,
                     result
-                        .page_route
-                        .map(|route| route.as_str())
+                        .route
+                        .as_deref()
+                        .or_else(|| result.page_route.map(crate::domain::PageRoute::as_str))
                         .unwrap_or("unknown"),
                     result
                         .checkin_mode
@@ -364,7 +514,7 @@ pub fn recent_logs(root: &Path, limit: usize) -> Result<Vec<LogSummary>> {
 }
 
 pub fn log_artifact_path(directory: &Path) -> Option<PathBuf> {
-    ["result.json", "sync.json", "events.jsonl"]
+    ["result.json", "summary.json", "sync.json", "events.jsonl"]
         .into_iter()
         .map(|name| directory.join(name))
         .find(|path| path.is_file())
@@ -396,7 +546,7 @@ pub fn export_log_artifact_named(
     artifact_name: &str,
     destination: &Path,
 ) -> Result<PathBuf> {
-    if !["result.json", "sync.json", "events.jsonl"].contains(&artifact_name) {
+    if !["result.json", "summary.json", "sync.json", "events.jsonl"].contains(&artifact_name) {
         bail!("不支持导出的日志证据类型: {artifact_name}");
     }
     let source = directory.join(artifact_name);
@@ -567,8 +717,11 @@ mod tests {
             button_state: None,
             location_state: None,
             foreground_package: None,
+            hierarchy_status: None,
+            overlay_package: None,
             app_version: Some("0.3.0".into()),
             git_commit: Some("test".into()),
+            git_dirty: Some(false),
             build_id: Some("0.3.0-test".into()),
             error: Some("navigation_not_confirmed".into()),
         };
@@ -631,8 +784,11 @@ mod tests {
             button_state: None,
             location_state: None,
             foreground_package: None,
+            hierarchy_status: None,
+            overlay_package: None,
             app_version: None,
             git_commit: None,
+            git_dirty: None,
             build_id: None,
             error: Some("location_timeout".into()),
         };
@@ -689,8 +845,11 @@ mod tests {
             button_state: Some("ready".into()),
             location_state: Some("ready".into()),
             foreground_package: None,
+            hierarchy_status: None,
+            overlay_package: None,
             app_version: None,
             git_commit: None,
+            git_dirty: None,
             build_id: None,
             error: None,
         };
@@ -714,6 +873,53 @@ mod tests {
         assert_eq!(logs[0].kind, "sync");
         assert_eq!(logs[1].status, "dry-run-ready");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recent_logs_reports_batch_summaries_as_their_own_kind() {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-batch-logs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let batch = root.join("logs/batch-2026-10-14_221000_000_1");
+        fs::create_dir_all(&batch).unwrap();
+        fs::write(
+            batch.join("summary.json"),
+            serde_json::json!({
+                "schema_version": 3,
+                "mode": "dry-run",
+                "status": "blocked",
+                "blocked_by": "shared_preflight",
+                "error_code": "shared_preflight_failed",
+                "instances": [
+                    {"index": 0, "status": "blocked"},
+                    {"index": 1, "status": "blocked"},
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let logs = recent_logs(&root, 10).unwrap();
+        let entry = logs
+            .iter()
+            .find(|entry| entry.kind == "batch")
+            .expect("批量摘要必须出现在日志列表中");
+        assert_eq!(entry.status, "blocked");
+        assert!(entry.summary.contains("blocked_by=shared_preflight"));
+        assert!(entry.summary.contains("instances=2"));
+        // The summary must also be previewable/exportable from the logs page.
+        let artifact = log_artifact_path(&entry.directory);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            artifact.and_then(|path| path.file_name().map(|name| name.to_owned())),
+            Some("summary.json".into())
+        );
     }
 
     #[test]

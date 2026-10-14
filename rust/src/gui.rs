@@ -4,21 +4,24 @@ use crate::{
     ConfigCommand, InstanceTargetArgs, RunArgs, TaskCommand, analyze_image_file,
     dependency_diagnostics, diagnose, dump_ui_hierarchy, inspect_apk_metadata, install_apk,
     installed_app_version, list_instance_summaries, run, runtime_with_target, sync_profile,
-    task_command,
+    task_command, validate_dependency_selection,
 };
 use crate::{config, logger, profile};
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-pub fn launch(store: ConfigStore) -> anyhow::Result<()> {
+/// `startup_error` carries a config load/validation failure. When it is set the
+/// GUI opens directly on the Repair page instead of failing to start, so a
+/// damaged config never leaves the user without a recovery entry point.
+pub fn launch(store: ConfigStore, startup_error: Option<String>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "智汇福大自动签到",
         options,
         Box::new(move |cc| {
             configure_fonts(&cc.egui_ctx);
-            Ok(Box::new(GuiApp::new(store)))
+            Ok(Box::new(GuiApp::new(store, startup_error)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI 启动失败: {}", e))
@@ -55,6 +58,7 @@ struct GuiApp {
     job: Option<GuiJob>,
     pending_sync: Option<String>,
     pending_live_run: bool,
+    pending_migration: Option<std::path::PathBuf>,
     latest_result: Option<RunResult>,
     latest_log_dir: Option<String>,
     report_path: Option<String>,
@@ -64,6 +68,7 @@ struct GuiApp {
     app_version_checked: bool,
     apk_install_result: Option<String>,
     recent_logs: Vec<logger::LogSummary>,
+    recent_events: Vec<logger::EventSummary>,
     logs_filter: String,
     selected_log_directory: Option<std::path::PathBuf>,
     selected_log_artifact: Option<std::path::PathBuf>,
@@ -74,6 +79,23 @@ struct GuiApp {
     run_all_instances: bool,
     instance_summaries: Vec<crate::InstanceSummary>,
     selected_instance_index: u32,
+    /// Setup/Repair is the page shown while the configuration is missing or
+    /// damaged; `setup_error` carries the load error text when there is one.
+    setup_required: bool,
+    setup_ldconsole: String,
+    setup_adb: String,
+    /// A genuine config load/validation failure. Only this makes the page a
+    /// Repair condition.
+    setup_error: Option<String>,
+    /// Success or neutral feedback for the last Setup/Repair action. Rendered
+    /// as ordinary text, never as a red "配置问题".
+    setup_notice: Option<String>,
+    /// Result slot for the background dependency validation. The validation
+    /// spawns ldconsole/adb, so it must never run on the egui update thread.
+    setup_validation: Option<SetupValidationSlot>,
+    migration_target: String,
+    /// Third click confirms "restore safe defaults"; the first two only arm it.
+    confirm_reset_defaults: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,6 +109,11 @@ struct JobOutput {
     message: String,
     installed_version: Option<String>,
 }
+
+/// Shared slot the validation thread writes its outcome into; the UI thread
+/// polls it each frame with `try_lock` so a hanging child process cannot block
+/// rendering.
+type SetupValidationSlot = Arc<Mutex<Option<Result<String, String>>>>;
 
 struct GuiJob {
     label: String,
@@ -109,7 +136,7 @@ fn run_target_for_selection(
 }
 
 impl GuiApp {
-    fn new(store: ConfigStore) -> Self {
+    fn new(store: ConfigStore, startup_error: Option<String>) -> Self {
         let apk_path = store.config.app.apk_path.clone();
         let selected_instance_index = store
             .config
@@ -118,10 +145,26 @@ impl GuiApp {
             .first()
             .map(|instance| instance.instance_index)
             .unwrap_or(store.config.emulator.instance_index);
+        // A missing dependency path or a created-default config means the user
+        // has not finished first-run setup yet, so open on the Setup page.
+        let setup_required = startup_error.is_some()
+            || store.created_default
+            || store.config.emulator.ldconsole_path.trim().is_empty()
+            || store.config.emulator.adb_path.trim().is_empty();
+        let setup_ldconsole = store.config.emulator.ldconsole_path.clone();
+        let setup_adb = store.config.emulator.adb_path.clone();
+        let setup_error = startup_error.or_else(|| store.recovery_error.clone());
+        let migration_target = config::recommended_local_app_data_root()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
         Self {
             store,
-            tab: 0,
-            status: "就绪。默认模式为 dry-run。".into(),
+            tab: if setup_required { SETUP_TAB } else { 0 },
+            status: if setup_required {
+                "需要完成首次配置或修复配置后继续。".into()
+            } else {
+                "就绪。默认模式为 dry-run。".into()
+            },
             dependency_report: None,
             selected_ldplayer_candidate: None,
             selected_adb_candidate: None,
@@ -130,6 +173,7 @@ impl GuiApp {
             job: None,
             pending_sync: None,
             pending_live_run: false,
+            pending_migration: None,
             latest_result: None,
             latest_log_dir: None,
             report_path: None,
@@ -139,6 +183,7 @@ impl GuiApp {
             app_version_checked: false,
             apk_install_result: None,
             recent_logs: Vec::new(),
+            recent_events: Vec::new(),
             logs_filter: String::new(),
             selected_log_directory: None,
             selected_log_artifact: None,
@@ -149,6 +194,14 @@ impl GuiApp {
             run_all_instances: false,
             instance_summaries: Vec::new(),
             selected_instance_index,
+            setup_required,
+            setup_ldconsole,
+            setup_adb,
+            setup_error,
+            setup_notice: None,
+            setup_validation: None,
+            migration_target,
+            confirm_reset_defaults: false,
         }
     }
 
@@ -292,6 +345,90 @@ impl GuiApp {
         self.load_selected_log_artifact();
     }
 
+    /// Read the structured events of the selected run so the timeline shows
+    /// foreground snapshots, hierarchy observations, route decisions and
+    /// navigation actions from the same round (requirement FR-012).
+    fn refresh_events(&mut self) {
+        self.recent_events = match self.selected_log_directory.as_ref() {
+            Some(directory) => logger::read_recent_events(directory, 200).unwrap_or_default(),
+            None => Vec::new(),
+        };
+    }
+
+    /// Validate the dependency paths off the UI thread.
+    ///
+    /// `validate_dependency_selection` runs `where.exe`, `ldconsole list2` and
+    /// `adb version` with no timeout, so calling it inline in `update()` would
+    /// freeze the window whenever one of those tools hangs.
+    fn start_setup_validation(&mut self) {
+        if self.setup_validation.is_some() {
+            self.status = "依赖验证正在运行".into();
+            return;
+        }
+        let store = self.store.clone();
+        let ldconsole = self.setup_ldconsole.clone();
+        let adb = self.setup_adb.clone();
+        let slot = Arc::new(Mutex::new(None));
+        let result_slot = Arc::clone(&slot);
+        thread::spawn(move || {
+            let outcome = validate_dependency_selection(&store, &ldconsole, &adb)
+                .map_err(|error| format!("{error:#}"));
+            if let Ok(mut result) = result_slot.lock() {
+                *result = Some(outcome);
+            }
+        });
+        self.setup_validation = Some(slot);
+        self.status = "正在验证 LDPlayer / ADB 并读取实例……".into();
+    }
+
+    fn poll_setup_validation(&mut self) {
+        let outcome = self
+            .setup_validation
+            .as_ref()
+            .and_then(|slot| slot.try_lock().ok().and_then(|mut result| result.take()));
+        let Some(outcome) = outcome else {
+            return;
+        };
+        self.setup_validation = None;
+        match outcome {
+            Ok(summary) => {
+                self.setup_error = None;
+                self.setup_notice =
+                    Some(format!("{summary}（已验证工具并读取到实例；尚未写入配置）"));
+                self.status = "依赖验证通过".into();
+            }
+            Err(error) => {
+                self.setup_error = Some(format!("验证失败：{error}"));
+                self.setup_notice = None;
+                self.status = "依赖验证失败".into();
+            }
+        }
+    }
+
+    fn migrate_data_root(&mut self, destination: std::path::PathBuf) {
+        match self.store.migrate_to_root(&destination) {
+            Ok(store) => {
+                self.store = store;
+                self.apk_path = self.store.config.app.apk_path.clone();
+                self.setup_ldconsole = self.store.config.emulator.ldconsole_path.clone();
+                self.setup_adb = self.store.config.emulator.adb_path.clone();
+                self.setup_notice = Some(format!(
+                    "数据目录已迁移到 {}；源目录保留未删除。",
+                    self.store.root.display()
+                ));
+                self.status = "数据目录迁移完成".into();
+                self.refresh_latest_result();
+            }
+            Err(error) => {
+                // A failed migration must leave the store on the original root.
+                self.setup_error = Some(format!(
+                    "迁移失败，仍使用原数据目录 {}：{error:#}",
+                    self.store.root.display()
+                ));
+            }
+        }
+    }
+
     fn load_selected_log_artifact(&mut self) {
         let Some(directory) = self.selected_log_directory.as_ref() else {
             self.selected_log_artifact = None;
@@ -309,6 +446,7 @@ impl GuiApp {
                 self.status = format!("读取选中日志失败: {error:#}");
             }
         }
+        self.refresh_events();
     }
 
     fn refresh_latest_result(&mut self) {
@@ -417,15 +555,30 @@ fn run_result_status(result: &RunResult) -> String {
 fn explain_error(error: &str) -> &'static str {
     match error {
         "unknown_state" => "视觉状态未能确认；请查看最新日志截图。",
-        "location_timeout" => "定位等待超时；未执行点击。",
+        "overlay_present" => {
+            "检测到非目标应用的窗口（弹窗/广告）遮挡了页面；请手动关闭后重新运行，程序未点击。"
+        }
+        "stale_page_refresh_failed" => "启动时停留在旧签到页且返回后未回到服务页；请手动返回首页。",
+        "stale_page_refresh_unconfirmed" => {
+            "启动时停留在旧签到页且返回后页面无法读取；请手动返回首页。"
+        }
+        "location_timeout" | "location_wait_timeout" => {
+            "定位等待达到上限；已保留最后一轮证据并安全停止，未执行点击。"
+        }
+        "shared_preflight_failed" => {
+            "公共依赖(ldconsole.exe / adb.exe)不可用；本批次没有启动任何设备。"
+        }
+        "runtime_error" => "运行时出现未分类错误；请查看诊断报告和最新截图。",
         "success_timeout" => "点击后未在超时内确认成功；请人工核对页面。",
         "outside_window" => "当前不在配置的签到时间窗口；未执行点击。",
         "foreground_package_changed" | "target_app_not_foreground" => {
-            "目标 App 已离开前台；安全策略阻止继续操作。"
+            "目标 App 已离开前台（可能退到了桌面）；安全策略阻止继续操作，程序未点击。请在模拟器中手动把 App 的普通签到页切回前台后重新运行。"
         }
         "foreground_query_failed" => "无法读取前台应用；安全策略阻止继续操作。",
         "route_candidate_unconfirmed" => "页面截图仅能形成候选，层级证据未确认；未执行点击。",
-        "unsupported_checkin_mode" => "当前是外勤或其他不支持的签到页面；未执行点击。",
+        "unsupported_checkin_mode" => {
+            "已确认在签到页，但签到模式不是普通晚点名（外勤或其他）；未执行点击。"
+        }
         "route_evidence_conflict" => "页面截图与层级证据冲突；安全策略阻止继续操作。",
         "ready_confirmation_failed" => "点击前二次 ready 确认失败；未执行点击。",
         "unknown_profile" => "设备分辨率/DPI 没有精确 profile；未执行点击。",
@@ -450,6 +603,7 @@ fn explain_error(error: &str) -> &'static str {
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job();
+        self.poll_setup_validation();
         let completed_dependency_scan = self
             .dependency_scan
             .as_ref()
@@ -500,8 +654,22 @@ impl eframe::App for GuiApp {
                         }
                         ui.add_space(8.0);
                         ui.label(egui::RichText::new("帮助").strong());
+                        if ui
+                            .selectable_label(self.tab == HELP_TAB, "快速使用")
+                            .clicked()
+                        {
+                            self.tab = HELP_TAB;
+                        }
                         if ui.selectable_label(self.tab == 8, "About / 版本").clicked() {
                             self.tab = 8;
+                        }
+                        // First-run/Repair stays reachable from the normal
+                        // workspace after the initial wizard has been left.
+                        if ui
+                            .selectable_label(self.tab == SETUP_TAB, "首次设置 / 配置修复")
+                            .clicked()
+                        {
+                            self.tab = SETUP_TAB;
                         }
                     });
             });
@@ -520,17 +688,378 @@ impl eframe::App for GuiApp {
             5 => self.config_page(ui),
             6 => self.tasks_page(ui),
             7 => self.logs_page(ui),
-            _ => self.about(ui),
+            8 => self.about(ui),
+            HELP_TAB => self.quick_use(ui),
+            _ => self.setup_page(ui),
         });
         self.sync_confirmation_window(ctx);
         self.apk_install_confirmation_window(ctx);
         self.live_confirmation_window(ctx);
+        self.migration_confirmation_window(ctx);
     }
 }
 
+/// Navigation index of the Setup/Repair page.
+const SETUP_TAB: usize = 9;
+/// Navigation index for user-facing first-run and daily-use guidance.
+const HELP_TAB: usize = 10;
+
 impl GuiApp {
+    /// A task-oriented guide for first-time and returning users. Keep each
+    /// section actionable and link into the existing workbench pages instead
+    /// of duplicating the configuration controls here.
+    fn quick_use(&mut self, ui: &mut egui::Ui) {
+        ui.heading("快速使用");
+        ui.label("按顺序完成首次检查和 dry-run；长期使用时也可从这里进入诊断、日志和配置。");
+        ui.separator();
+
+        egui::CollapsingHeader::new("首次使用：准备环境并完成设置")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("1. 启动 LDPlayer，并在模拟器中手动打开智汇福大 App、完成登录。程序不会替你输入凭据或同意协议。");
+                ui.label("2. 在“首次设置 / 配置修复”中确认 ldconsole.exe、adb.exe 路径及实例；验证通过后保存。损坏的配置不会被静默覆盖。");
+                ui.label("3. 到“环境诊断”检查所选实例、ADB 连接和设备几何/Profile；运行前请在模拟器中手动确认目标 App 位于前台。诊断只读取依赖和设备信息，不执行签到点击。");
+                ui.label("4. 返回“运行控制”，选择一个实例后运行 dry-run。首次建议不要勾选全部实例。");
+                ui.horizontal(|ui| {
+                    if ui.button("打开设置 / 修复").clicked() {
+                        self.tab = SETUP_TAB;
+                    }
+                    if ui.button("打开环境诊断").clicked() {
+                        self.tab = 1;
+                    }
+                    if ui.button("返回运行控制").clicked() {
+                        self.tab = 0;
+                    }
+                });
+            });
+
+        egui::CollapsingHeader::new("dry-run 结果怎么看")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("dry-run 用于观察页面和签到状态，不执行签到点击；它不等于签到成功。即使顶层 status 显示 success，也要结合 success、dry_run_ready 和 error_code 判断。");
+                ui.label("在“运行日志与结果”查看 status、route、checkin_mode、checkin_state 和 error_code；点击某次运行可查看事件时间线与文本结果，截图请通过“打开目录”在文件夹中查看。");
+                ui.label("只有 result 明确显示 success=true 才代表程序验证了成功；dry_run_ready=true 仅表示观察到可签到状态。");
+                if ui.button("打开运行日志与结果").clicked() {
+                    self.tab = 7;
+                    self.refresh_logs();
+                }
+            });
+
+        egui::CollapsingHeader::new("常见情况：先看提示，再手动处理")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("设备未连接 / ADB 失败：确认模拟器已启动、配置的实例与 serial 正确，再运行环境诊断。");
+                ui.label("需要登录：在模拟器中手动登录后重新运行；程序不会自动登录。");
+                ui.label("检测到弹窗或广告：按提示在模拟器中手动关闭，再重试。程序不会自动关闭、同意或点击弹窗。");
+                ui.label("页面未确认、页面证据冲突或定位超时：停止并查看最新日志/截图；确认页面状态后再决定是否重试，不要反复盲目运行。");
+                ui.label("配置损坏：进入“首次设置 / 配置修复”检查原文件并按需修复；原配置不会被 CLI 静默重置。");
+                ui.horizontal(|ui| {
+                    if ui.button("查看运行结果 / 日志").clicked() {
+                        self.tab = 7;
+                        self.refresh_logs();
+                    }
+                    if ui.button("重新运行环境诊断").clicked() {
+                        self.tab = 1;
+                    }
+                    if ui.button("打开配置修复").clicked() {
+                        self.tab = SETUP_TAB;
+                    }
+                });
+            });
+
+        egui::CollapsingHeader::new("长期使用：多实例、计划任务与数据")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label("确认单实例 dry-run 正常后，再按需选择全部已启用实例；批量运行会逐个记录结果，单实例失败不会抹掉其他实例结果。");
+                ui.label("计划任务建议保持 dry-run。不要将 live 设置为无人值守任务；live 需要显式确认，并继续受页面、前台、时间窗、Profile 和 ready 状态门禁保护。");
+                ui.label("运行日志、截图和报告保存在当前数据目录。导出或分享诊断资料前，请检查其中的本机路径、实例信息和截图。");
+                ui.label("迁移数据目录前确认目标位置可写；迁移会先备份并验证，不会在目标配置已存在时覆盖它。");
+                ui.horizontal(|ui| {
+                    if ui.button("打开计划任务").clicked() {
+                        self.tab = 6;
+                    }
+                    if ui.button("打开数据与配置").clicked() {
+                        self.tab = 5;
+                    }
+                    if ui.button("查看日志和证据").clicked() {
+                        self.tab = 7;
+                        self.refresh_logs();
+                    }
+                });
+            });
+
+        ui.separator();
+        ui.label("安全边界：未知页面、证据不足或不支持的签到类型会停止；dry-run 不点击。live 只对明确确认的普通签到流程开放，且不自动登录、不自动同意、不自动关闭广告。");
+        if ui.button("打开安全策略说明").clicked() {
+            self.tab = 8;
+        }
+    }
+
+    /// Setup (first run) and Repair (damaged config) share one page: the same
+    /// actions are needed in both cases, and the frozen decisions require a
+    /// reachable recovery entry rather than a startup-failure dialog.
+    fn setup_page(&mut self, ui: &mut egui::Ui) {
+        // Only a genuine load/validation failure makes this a Repair page;
+        // a successful reload or tool validation is ordinary feedback.
+        let repairing = self.setup_error.is_some() || self.store.recovery_error.is_some();
+        ui.heading(if repairing {
+            "配置修复(Repair)"
+        } else {
+            "首次设置(Setup)"
+        });
+        ui.label(format!("配置文件:{}", self.store.path.display()));
+        ui.label(format!("数据目录:{}", self.store.root.display()));
+        ui.label(format!(
+            "配置来源:{}",
+            match self.store.origin {
+                config::ConfigOrigin::Explicit => "显式 --config / 修复路径",
+                config::ConfigOrigin::Portable => "EXE 便携目录",
+                config::ConfigOrigin::LocalAppData => "%LOCALAPPDATA%\\ZHFDCheckin",
+            }
+        ));
+        if let Some(error) = self.setup_error.clone() {
+            ui.separator();
+            ui.colored_label(egui::Color32::LIGHT_RED, format!("配置问题:{error}"));
+            ui.label(
+                "原文件未被覆盖。请重新载入、选择另一份配置，或在确认后显式恢复安全默认配置。",
+            );
+            if ui.button("复制错误信息").clicked() {
+                ui.ctx().copy_text(error);
+                self.status = "配置错误信息已复制".into();
+            }
+        }
+        if let Some(notice) = self.setup_notice.clone() {
+            ui.separator();
+            ui.colored_label(egui::Color32::LIGHT_GREEN, format!("上次操作:{notice}"));
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new("1. 依赖工具路径").strong());
+        ui.horizontal(|ui| {
+            ui.label("ldconsole.exe");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.setup_ldconsole)
+                    .desired_width(430.0)
+                    .hint_text("雷电模拟器控制台可执行文件"),
+            );
+            if ui.button("浏览...").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("ldconsole.exe", &["exe"])
+                    .pick_file()
+            {
+                self.setup_ldconsole = path.display().to_string();
+                // D-02: the sibling adb.exe is a *candidate suggestion* only;
+                // it is never written to the config without confirmation.
+                let sibling = path.with_file_name("adb.exe");
+                if sibling.is_file() {
+                    self.setup_adb = sibling.display().to_string();
+                    self.setup_notice = Some("已建议同目录 adb.exe；请确认后再保存。".into());
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("adb.exe");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.setup_adb)
+                    .desired_width(430.0)
+                    .hint_text("Android Debug Bridge 可执行文件"),
+            );
+            if ui.button("浏览...").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("adb.exe", &["exe"])
+                    .pick_file()
+            {
+                self.setup_adb = path.display().to_string();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("验证工具并读取实例").clicked() {
+                self.start_setup_validation();
+            }
+            if self.setup_validation.is_some() {
+                ui.spinner();
+                ui.label("验证中……");
+            }
+            if ui.button("确认并保存路径").clicked() {
+                // Persist a candidate and only publish it after the atomic
+                // write succeeded, so a failure keeps the last good config.
+                let mut candidate = self.store.config.clone();
+                candidate.emulator.ldconsole_path = self.setup_ldconsole.clone();
+                candidate.emulator.adb_path = self.setup_adb.clone();
+                match self.store.save_candidate(candidate) {
+                    Ok(()) => {
+                        self.setup_required = false;
+                        self.setup_error = None;
+                        self.setup_notice = None;
+                        self.status = "依赖配置已保存".into();
+                        self.tab = 0;
+                    }
+                    Err(error) => {
+                        // The write is atomic, so both the on-disk config and the
+                        // in-memory config are still the previous ones.
+                        self.setup_error = Some(format!("保存失败,现有配置保持不变:{error:#}"));
+                        self.setup_notice = None;
+                    }
+                }
+            }
+            if ui.button("打开配置所在目录").clicked()
+                && let Some(parent) = self.store.path.parent()
+                && let Err(error) = crate::process::open_path(parent)
+            {
+                self.status = format!("打开配置目录失败:{error:#}");
+            }
+        });
+
+        ui.separator();
+        ui.label(egui::RichText::new("2. 恢复与重新载入").strong());
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("重新载入磁盘配置").clicked() {
+                match self.store.reload() {
+                    Ok(()) => {
+                        self.setup_ldconsole = self.store.config.emulator.ldconsole_path.clone();
+                        self.setup_adb = self.store.config.emulator.adb_path.clone();
+                        self.setup_required = false;
+                        self.setup_error = None;
+                        self.setup_notice = Some("已从磁盘重新载入并验证配置。".into());
+                    }
+                    Err(error) => {
+                        // Reload failure must keep the last valid in-memory config.
+                        self.setup_error = Some(format!("未载入,保留当前有效配置:{error:#}"));
+                        self.setup_notice = None;
+                    }
+                }
+            }
+            if ui.button("选择另一份 config.toml...").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("TOML", &["toml"])
+                    .pick_file()
+            {
+                match ConfigStore::load_alternate(&path) {
+                    Ok(store) => {
+                        self.setup_ldconsole = store.config.emulator.ldconsole_path.clone();
+                        self.setup_adb = store.config.emulator.adb_path.clone();
+                        self.setup_required = store.created_default
+                            || self.setup_ldconsole.trim().is_empty()
+                            || self.setup_adb.trim().is_empty();
+                        self.apk_path = store.config.app.apk_path.clone();
+                        self.store = store;
+                        self.setup_error = None;
+                        self.setup_notice = Some("已切换到所选配置文件。".into());
+                    }
+                    Err(error) => {
+                        self.setup_error = Some(format!("所选配置不可用:{error:#}"));
+                        self.setup_notice = None;
+                    }
+                }
+            }
+            if ui
+                .button(if self.confirm_reset_defaults {
+                    "再次点击确认:备份并恢复安全默认"
+                } else {
+                    "恢复安全默认配置..."
+                })
+                .clicked()
+            {
+                if self.confirm_reset_defaults {
+                    // `save_candidate` writes through `write_config`, which backs
+                    // the existing file up before replacing it (decision D-06).
+                    match self.store.save_candidate(config::Config::default()) {
+                        Ok(()) => {
+                            self.setup_ldconsole.clear();
+                            self.setup_adb.clear();
+                            self.setup_required = true;
+                            self.setup_error = None;
+                            self.setup_notice =
+                                Some("已备份原配置并恢复安全默认值；请重新设置依赖路径。".into());
+                        }
+                        Err(error) => {
+                            self.setup_error = Some(format!("恢复失败,原配置保持不变:{error:#}"));
+                            self.setup_notice = None;
+                        }
+                    }
+                    self.confirm_reset_defaults = false;
+                } else {
+                    self.confirm_reset_defaults = true;
+                    self.status = "恢复默认配置需要再次确认。".into();
+                }
+            }
+        });
+
+        ui.separator();
+        ui.label(egui::RichText::new("3. 数据目录迁移").strong());
+        ui.label(
+            "迁移会复制 config、logs、captures、reports、backups;仅在目标配置验证通过后切换当前数据目录,源目录不会删除。",
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.migration_target)
+                    .desired_width(430.0)
+                    .hint_text("目标数据目录"),
+            );
+            if ui.button("选择目录...").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                self.migration_target = path.display().to_string();
+            }
+            if ui.button("迁移并切换").clicked() {
+                if self.migration_target.trim().is_empty() {
+                    self.setup_notice = Some("请先选择目标数据目录。".into());
+                } else {
+                    self.pending_migration =
+                        Some(std::path::PathBuf::from(self.migration_target.trim()));
+                }
+            }
+        });
+
+        ui.separator();
+        ui.label(
+            "程序不会自动登录、不会输入账号/密码/验证码,也不会自动签到。首次 dry-run 默认只运行一个选中实例。",
+        );
+    }
+
+    fn migration_confirmation_window(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.pending_migration.clone() else {
+            return;
+        };
+        let mut action = None;
+        egui::Window::new("确认迁移数据目录")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("当前:{}", self.store.root.display()));
+                ui.label(format!("目标:{}", target.display()));
+                ui.label("迁移前会先备份当前配置;源目录不会删除。确认继续?");
+                ui.horizontal(|ui| {
+                    if ui.button("确认迁移").clicked() {
+                        action = Some(true);
+                    }
+                    if ui.button("取消").clicked() {
+                        action = Some(false);
+                    }
+                });
+            });
+        if let Some(confirm) = action {
+            self.pending_migration = None;
+            if confirm {
+                self.migrate_data_root(target);
+            } else {
+                self.setup_notice = Some("已取消数据目录迁移。".into());
+            }
+        }
+    }
+
     fn home(&mut self, ui: &mut egui::Ui) {
         ui.heading("运行控制");
+        if self.setup_required {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "首次配置尚未完成：请先进入“首次设置 / 配置修复”完成依赖路径并保存，再运行 dry-run。",
+            );
+            if ui.button("打开首次设置 / 配置修复").clicked() {
+                self.tab = SETUP_TAB;
+            }
+            ui.separator();
+        }
         ui.label("Rust CLI/GUI 迁移第一阶段：默认只进行 dry-run，不执行真实点击。");
         let options = self.instance_options();
         ui.checkbox(
@@ -557,10 +1086,20 @@ impl GuiApp {
                 self.tab = 1;
             }
             if ui.button("运行 dry-run").clicked() {
-                self.start_dry_run();
+                if self.setup_required {
+                    self.status = "首次配置尚未完成，无法运行；请先保存依赖路径。".into();
+                    self.tab = SETUP_TAB;
+                } else {
+                    self.start_dry_run();
+                }
             }
             if ui.button("准备 live 运行").clicked() {
-                self.pending_live_run = true;
+                if self.setup_required {
+                    self.status = "首次配置尚未完成，无法准备 live 运行。".into();
+                    self.tab = SETUP_TAB;
+                } else {
+                    self.pending_live_run = true;
+                }
             }
             if ui.button("打开配置").clicked() {
                 self.tab = 5;
@@ -604,6 +1143,7 @@ impl GuiApp {
 
     fn diagnostics(&mut self, ui: &mut egui::Ui) {
         ui.heading("环境诊断");
+        self.render_run_status_card(ui);
         ui.horizontal(|ui| {
             if ui.button("重新检测 LDPlayer / ADB").clicked() {
                 let store = self.store.clone();
@@ -729,6 +1269,93 @@ impl GuiApp {
         ui.label("默认模式为 dry-run。只有普通签到页面可进入 live 点击策略；外勤签到与未知模式保持无点击观察。");
     }
 
+    /// Structured status card for the most recent run.
+    ///
+    /// Route, page loading, button state, locating state and foreground package
+    /// are shown as separate dimensions: "the button is not ready yet" must not
+    /// read as "the page is unknown" (requirement FR-016).
+    fn render_run_status_card(&self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("最近运行状态").strong());
+            let Some(result) = &self.latest_result else {
+                ui.label("暂无 result.json;先运行一次 dry-run。");
+                return;
+            };
+            let unknown = |value: Option<&str>| value.unwrap_or("unknown").to_string();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("status={}", unknown(result.status.as_deref())));
+                ui.label(format!(
+                    "route={}",
+                    unknown(
+                        result.route.as_deref().or_else(|| {
+                            result.page_route.map(crate::domain::PageRoute::as_str)
+                        })
+                    )
+                ));
+                ui.label(format!(
+                    "mode={}",
+                    unknown(result.checkin_mode.map(crate::domain::CheckinMode::as_str))
+                ));
+                ui.label(format!(
+                    "button={}",
+                    unknown(result.button_state.as_deref())
+                ));
+                ui.label(format!(
+                    "location={}",
+                    unknown(result.location_state.as_deref())
+                ));
+                ui.label(format!(
+                    "page_loading={}",
+                    result
+                        .page_loading
+                        .map(|value| if value { "yes" } else { "no" })
+                        .unwrap_or("unknown")
+                ));
+                ui.label(format!(
+                    "hierarchy={}",
+                    unknown(result.hierarchy_status.as_deref())
+                ));
+                if let Some(overlay) = &result.overlay_package {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        format!("检测到遮挡窗口：{overlay}（弹窗/广告，请手动关闭）"),
+                    );
+                }
+                ui.label(format!(
+                    "foreground={}",
+                    unknown(result.foreground_package.as_deref())
+                ));
+                ui.label(format!(
+                    "refresh={}/{}",
+                    result
+                        .page_refresh_attempted
+                        .map(|value| if value { "attempted" } else { "not_needed" })
+                        .unwrap_or("unknown"),
+                    result
+                        .page_refresh_confirmed
+                        .map(|value| if value { "confirmed" } else { "unconfirmed" })
+                        .unwrap_or("unknown")
+                ));
+            });
+            if let Some(code) = &result.error_code {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!(
+                        "error_code={} ({});stage={}",
+                        code,
+                        explain_error(code),
+                        unknown(result.error_stage.as_deref())
+                    ),
+                );
+            } else {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, "未记录机器错误码");
+            }
+            if let Some(action) = &result.recovery_action {
+                ui.label(format!("建议操作:{action}"));
+            }
+        });
+    }
+
     fn instances_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("模拟器实例");
         if ui.button("刷新实例列表").clicked() {
@@ -752,6 +1379,7 @@ impl GuiApp {
             ui.label("TCP ADB serial");
             ui.label("list2 报告端口（参考）");
             ui.label("尺寸/DPI");
+            ui.label("Profile");
             ui.label("启用");
             ui.end_row();
             for instance in &self.instance_summaries {
@@ -774,6 +1402,7 @@ impl GuiApp {
                     instance.height.unwrap_or(0),
                     instance.dpi.unwrap_or(0)
                 ));
+                ui.label(instance.profile_id.as_deref().unwrap_or("unknown"));
                 ui.label(if instance.enabled { "是" } else { "否" });
                 ui.end_row();
             }
@@ -930,8 +1559,9 @@ impl GuiApp {
         ui.horizontal(|ui| {
             if ui.button("查询任务").clicked() {
                 let name = self.task_name.clone();
+                let config_path = self.store.path.clone();
                 self.start_background_job("计划任务查询", move || {
-                    match task_command(TaskCommand::Query { name }) {
+                    match task_command(TaskCommand::Query { name }, Some(&config_path)) {
                         Ok(code) => format!("完成，退出码 {:?}", code),
                         Err(error) => format!("失败: {:#}", error),
                     }
@@ -941,19 +1571,23 @@ impl GuiApp {
                 let name = self.task_name.clone();
                 let live = self.task_live;
                 let all_instances = self.task_all_instances;
+                let config_path = self.store.path.clone();
                 let target = self.instance_target();
                 if live {
                     self.status = "live 计划任务需要再次确认；请点击下方确认按钮".into();
                 } else {
                     self.start_background_job("创建 dry-run 计划任务", move || {
-                        match task_command(TaskCommand::Create {
-                            name,
-                            live: false,
-                            confirm: false,
-                            all_instances,
-                            target,
-                        }) {
-                            Ok(code) => format!("完成，退出码 {:?}", code),
+                        match task_command(
+                            TaskCommand::Create {
+                                name,
+                                live: false,
+                                confirm: false,
+                                all_instances,
+                                target,
+                            },
+                            Some(&config_path),
+                        ) {
+                            Ok(code) => format!("完成,退出码 {:?}", code),
                             Err(error) => format!("失败: {:#}", error),
                         }
                     });
@@ -961,8 +1595,9 @@ impl GuiApp {
             }
             if ui.button("删除任务").clicked() {
                 let name = self.task_name.clone();
+                let config_path = self.store.path.clone();
                 self.start_background_job("删除计划任务", move || {
-                    match task_command(TaskCommand::Delete { name }) {
+                    match task_command(TaskCommand::Delete { name }, Some(&config_path)) {
                         Ok(code) => format!("完成，退出码 {:?}", code),
                         Err(error) => format!("失败: {:#}", error),
                     }
@@ -979,14 +1614,18 @@ impl GuiApp {
                 let name = self.task_name.clone();
                 let all_instances = self.task_all_instances;
                 let target = self.instance_target();
+                let config_path = self.store.path.clone();
                 self.start_background_job("创建 live 计划任务", move || {
-                    match task_command(TaskCommand::Create {
-                        name,
-                        live: true,
-                        confirm: true,
-                        all_instances,
-                        target,
-                    }) {
+                    match task_command(
+                        TaskCommand::Create {
+                            name,
+                            live: true,
+                            confirm: true,
+                            all_instances,
+                            target,
+                        },
+                        Some(&config_path),
+                    ) {
                         Ok(code) => format!("完成，退出码 {:?}", code),
                         Err(error) => format!("失败: {:#}", error),
                     }
@@ -1120,6 +1759,9 @@ impl GuiApp {
             } else {
                 "没有匹配当前筛选条件的日志。"
             });
+            // The filter only narrows the run list; the structured event
+            // timeline belongs to the still-selected run and must stay visible.
+            self.render_event_timeline(ui);
             return;
         }
 
@@ -1166,6 +1808,8 @@ impl GuiApp {
             self.select_log_directory(directory);
         }
 
+        self.render_event_timeline(ui);
+
         if let (Some(artifact), Some(preview)) =
             (&self.selected_log_artifact, &self.selected_log_preview)
         {
@@ -1181,6 +1825,47 @@ impl GuiApp {
                     ui.add(egui::Label::new(egui::RichText::new(preview).monospace()).wrap());
                 });
         }
+    }
+
+    /// Structured event timeline for the selected run.
+    ///
+    /// Foreground snapshots, hierarchy observations, route decisions and
+    /// navigation actions share one ordered view so a route decision can be
+    /// read together with the same round's evidence (requirement FR-012).
+    fn render_event_timeline(&self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label(egui::RichText::new("事件时间线(前台 / 层级 / 路由 / 导航)").strong());
+        if self.recent_events.is_empty() {
+            ui.label("选中目录没有可展示的结构化事件(events.jsonl)。");
+            return;
+        }
+        let height = (ui.available_height() * 0.35).clamp(120.0, 300.0);
+        egui::ScrollArea::both()
+            .id_salt("event_timeline")
+            .max_height(height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_min_width(760.0);
+                egui::Grid::new("event_timeline_grid")
+                    .striped(true)
+                    .min_col_width(96.0)
+                    .show(ui, |ui| {
+                        for heading in ["时间", "事件", "摘要"] {
+                            ui.label(egui::RichText::new(heading).strong());
+                        }
+                        ui.end_row();
+                        for event in &self.recent_events {
+                            ui.label(&event.at);
+                            ui.label(&event.kind);
+                            ui.add_sized(
+                                [520.0, 20.0],
+                                egui::Label::new(&event.summary).truncate(),
+                            )
+                            .on_hover_text(&event.summary);
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 
     fn apk_install_confirmation_window(&mut self, ctx: &egui::Context) {
@@ -1430,9 +2115,26 @@ impl GuiApp {
     }
 
     fn about(&mut self, ui: &mut egui::Ui) {
-        ui.heading("帮助 / About");
+        ui.heading("关于 / About");
         ui.label(format!("版本：{}", env!("CARGO_PKG_VERSION")));
         ui.label(format!("Git commit：{}", crate::GIT_COMMIT));
+        ui.label(format!("Build id：{}", crate::build_id()));
+        // A dirty build is not the commit it names; surface it here so a bug
+        // report cannot be attributed to a clean build of that commit (FR-014).
+        match crate::git_dirty() {
+            Some(true) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 120, 0),
+                    "工作区状态：dirty（包含未提交的已跟踪改动）",
+                );
+            }
+            Some(false) => {
+                ui.label("工作区状态：clean");
+            }
+            None => {
+                ui.label("工作区状态：unknown（构建时无法运行 git status）");
+            }
+        }
         ui.hyperlink_to("雷电模拟器官网", "https://www.ldmnq.com/");
         ui.hyperlink_to("智汇福大官网", "https://app.fzu.edu.cn/fd-app/m/index.html");
         ui.separator();
