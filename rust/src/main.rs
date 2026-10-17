@@ -1141,21 +1141,16 @@ fn task_command(command: TaskCommand, config_path: Option<&Path>) -> Result<Exit
                 "run --dry-run"
             };
             let task_run = build_task_command_line(&exe, mode, all_instances, &target, config_path);
-            let task_run_arg = format!("\"{}\"", task_run);
+            // `schtasks /TR` stores its value verbatim as the action's command
+            // line. The value already quotes the executable, so wrapping the
+            // whole thing in a second pair of quotes makes the Task Scheduler
+            // parse the action as a program named `""` and fail to launch it
+            // with 2147942487 (E_INVALIDARG). Pass it through unwrapped.
             let store = load_store_for_cli(config_path)?;
             let start = store.config.window.start.clone();
             let output = process::command("schtasks.exe")
                 .args([
-                    "/Create",
-                    "/TN",
-                    &name,
-                    "/TR",
-                    &task_run_arg,
-                    "/SC",
-                    "DAILY",
-                    "/ST",
-                    &start,
-                    "/F",
+                    "/Create", "/TN", &name, "/TR", &task_run, "/SC", "DAILY", "/ST", &start, "/F",
                 ])
                 .output()
                 .context("无法执行 schtasks.exe")?;
@@ -1182,11 +1177,26 @@ fn task_command(command: TaskCommand, config_path: Option<&Path>) -> Result<Exit
         }
         TaskCommand::Query { name } => {
             let output = process::command("schtasks.exe")
-                .args(["/Query", "/TN", &name, "/FO", "LIST"])
+                .args(["/Query", "/TN", &name, "/FO", "LIST", "/V"])
                 .output()
                 .context("无法执行 schtasks.exe")?;
-            println!("{}", String::from_utf8_lossy(&output.stdout));
-            if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.success() {
+                println!("{}", stdout);
+            } else {
+                // "Task does not exist" is the common case and is not an
+                // execution failure, so say which one happened instead of only
+                // returning a bare non-zero exit code.
+                println!(
+                    "计划任务不存在或无法查询: {} (schtasks 退出码 {:?})",
+                    name,
+                    output.status.code()
+                );
+                let detail = stderr.trim();
+                if !detail.is_empty() {
+                    println!("{}", detail);
+                }
                 return Ok(ExitCode::BusinessFailure);
             }
         }
@@ -1846,35 +1856,99 @@ fn extract_dates_from_text(text: &str) -> Vec<chrono::NaiveDate> {
     dates
 }
 
+/// Extract the success date from a check-in page hierarchy.
+///
+/// The observed success page splits a label from its value across sibling
+/// nodes, so a date is not always in the same node as the text that gives it
+/// meaning:
+///
+/// ```text
+/// <node content-desc="date" />            <node text="2026-10-17 星期六" />
+/// <node text="已签到：" />                 <node text="2026-10-17 22:37:10" />
+/// ```
+///
+/// A date therefore counts as contextual when it is either
+/// * in a node that itself says `签到成功` / `已签到`, or starts with `日期`, or
+/// * the value of the node directly following an explicit date label
+///   (`content-desc="date"`, or text `已签到` / `已签到：`).
+///
+/// A generic `签到成功` banner deliberately does **not** anchor the next node:
+/// otherwise an unrelated date such as `上次更新 2026-10-11` would inherit its
+/// context and be reported as the check-in date.
+///
+/// The result stays `None` unless exactly one contextual date exists and every
+/// date on the page agrees with it, so conflicting evidence fails closed.
 fn extract_hierarchy_date(xml: &str) -> Option<chrono::NaiveDate> {
     let mut all_dates = Vec::new();
     let mut contextual_dates = Vec::new();
-    for attribute in ["text=\"", "content-desc=\""] {
-        let mut cursor = 0;
-        while let Some(relative) = xml.get(cursor..)?.find(attribute) {
-            let value_start = cursor + relative + attribute.len();
-            let value_length = xml.get(value_start..)?.find('"')?;
-            let value_end = value_start + value_length;
-            let value = &xml[value_start..value_end];
-            let has_checkin_context = value.contains("签到成功") || value.contains("已签到");
-            let has_explicit_date_label = value.trim_start().starts_with("日期");
-            for date in extract_dates_from_text(value) {
+    // Labels of the previous sibling node, used to anchor a split value.
+    let mut previous_labels: Vec<String> = Vec::new();
+
+    for chunk in xml.split("<node").skip(1) {
+        let Some(tag_end) = tag_body_end(chunk, 0) else {
+            continue;
+        };
+        let body = &chunk[..tag_end];
+        let text = attribute_value(body, "text").unwrap_or("");
+        let content_desc = attribute_value(body, "content-desc").unwrap_or("");
+        let labels: Vec<String> = [text, content_desc]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        let anchored_by_previous = previous_labels
+            .iter()
+            .any(|label| is_date_or_status_label(label));
+        let mut node_dates = Vec::new();
+        for label in &labels {
+            for date in extract_dates_from_text(label) {
+                if !node_dates.contains(&date) {
+                    node_dates.push(date);
+                }
                 if !all_dates.contains(&date) {
                     all_dates.push(date);
                 }
-                if (has_checkin_context || has_explicit_date_label)
-                    && !contextual_dates.contains(&date)
-                {
+            }
+        }
+        let has_checkin_context = labels
+            .iter()
+            .any(|label| label.contains("签到成功") || label.contains("已签到"));
+        let has_explicit_date_label = labels
+            .iter()
+            .any(|label| label.trim_start().starts_with("日期"));
+        if has_checkin_context || has_explicit_date_label || anchored_by_previous {
+            for date in node_dates {
+                if !contextual_dates.contains(&date) {
                     contextual_dates.push(date);
                 }
             }
-            cursor = value_end + 1;
+        }
+
+        // Only label-bearing nodes replace the anchor; intermediate layout
+        // containers with no text must not break a label/value pair.
+        if !labels.is_empty() {
+            previous_labels = labels;
         }
     }
+
     if contextual_dates.len() != 1 || all_dates.iter().any(|date| *date != contextual_dates[0]) {
         return None;
     }
     contextual_dates.first().copied()
+}
+
+/// Whether a node's own label introduces the date that follows it.
+///
+/// Kept deliberately narrow: `签到成功` is a result banner that can appear next
+/// to an unrelated date, so it is not a label for the following node.
+fn is_date_or_status_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    if trimmed.eq_ignore_ascii_case("date") {
+        return true;
+    }
+    let normalized = trimmed.trim_end_matches([':', '：']).trim();
+    normalized == "已签到"
 }
 fn run_inner_with_device<F>(
     store: &ConfigStore,
@@ -2247,7 +2321,10 @@ where
                 &store.config.app.package_name,
             )?;
             let success_route = success_page.route;
+            // Marker checks read the scoped text; date extraction needs the raw
+            // document, because the date and its label live in separate nodes.
             let success_xml = &success_page.view.scoped_text;
+            let success_document = &success_page.xml;
             result.overlay_package = success_page.foreign_package.clone();
             result.hierarchy_status = Some(success_page.status.into());
             if success_route != PageRoute::Checkin {
@@ -2291,7 +2368,7 @@ where
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
-            match extract_hierarchy_date(success_xml) {
+            match extract_hierarchy_date(success_document) {
                 Some(detected_date) => {
                     let today = domain::configured_date(&store.config.window.timezone)?;
                     result.success_date = Some(detected_date.to_string());
@@ -3085,6 +3162,13 @@ fn require_target_foreground(
 #[derive(Debug, Clone)]
 struct PageObservation {
     view: PageView,
+    /// Raw hierarchy XML for this observation.
+    ///
+    /// `view.scoped_text` is a flattened label blob; node boundaries and
+    /// attributes (such as the `date` icon's `content-desc`) are only present
+    /// in the raw document. Success-date extraction needs them, so the XML is
+    /// carried alongside the parsed view instead of being re-derived.
+    xml: String,
     route: PageRoute,
     checkin_mode: CheckinMode,
     /// `dump_succeeded`, `dump_failed`, `dump_empty_or_truncated` or
@@ -3098,6 +3182,7 @@ impl PageObservation {
     fn unreadable(status: &'static str, target_package: &str) -> Self {
         Self {
             view: PageView::parse("", target_package),
+            xml: String::new(),
             route: PageRoute::RouteCandidateUnconfirmed,
             checkin_mode: CheckinMode::Unsupported,
             status,
@@ -3200,6 +3285,7 @@ fn observe_page_route(
         )?;
         return Ok(PageObservation {
             view,
+            xml,
             route: PageRoute::RouteCandidateUnconfirmed,
             checkin_mode: CheckinMode::Unsupported,
             status: "route_markers_missing",
@@ -3213,6 +3299,7 @@ fn observe_page_route(
     };
     Ok(PageObservation {
         view,
+        xml,
         route,
         checkin_mode,
         status: adb::HierarchyStatus::DumpSucceeded.as_str(),
@@ -3290,6 +3377,22 @@ fn visual_candidate(image: &image::DynamicImage, profile: &profile::Profile) -> 
 const UNCONFIRMED_REOBSERVE_ATTEMPTS: u32 = 3;
 const UNCONFIRMED_REOBSERVE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Whether a page observed after the stale-page BACK refresh may still be used.
+///
+/// `Home`/`Services` means the refresh reached the catalogue. A page that is
+/// *still* the check-in page, owned by the target app, with no foreign window
+/// may also be used: some app builds swallow BACK on the check-in page (verified
+/// on-device, where repeated keyevents leave the hierarchy byte-identical), and
+/// the run loop re-observes the page before every decision, so continuing does
+/// not weaken any gate.
+fn may_continue_on_checkin_page(
+    route: PageRoute,
+    foreign_package_present: bool,
+    app_foreground: bool,
+) -> bool {
+    route == PageRoute::Checkin && !foreign_package_present && app_foreground
+}
+
 /// Whether an unidentifiable page should be read again before giving up.
 ///
 /// Pure so the bound is testable without a device: the loop must terminate, and
@@ -3345,6 +3448,9 @@ fn locate_or_navigate(
 
     let mut page_refresh_attempted = false;
     let mut page_refresh_confirmed = false;
+    // Set when BACK could not leave a confirmed check-in page (some app builds
+    // swallow the key). The page is then used as-is instead of failing.
+    let mut continued_on_checkin_page = false;
 
     // A page that still cannot be identified is a *candidate*, never a
     // confirmed route: no navigation action and no tap may follow from it.
@@ -3419,7 +3525,26 @@ fn locate_or_navigate(
         // target App out of the foreground entirely (e.g. to the Launcher), and
         // that must be diagnosed as such instead of as a stale in-app page.
         let after_back = log_foreground_snapshot(device, log, "page_refresh_after_back", result)?;
-        let fresh = observe("page_refresh_after_back")?;
+        let mut fresh = observe("page_refresh_after_back")?;
+        // BACK can leave the WebView mid-repaint: the first dump then carries
+        // only the page title, so the route looks unconfirmed even though the
+        // page is fine. Re-observe a bounded number of times before deciding;
+        // otherwise a transient repaint would be reported as a failed refresh.
+        let mut refresh_attempts = 1u32;
+        while should_reobserve(fresh.route, refresh_attempts) {
+            log.event(
+                "reobserve",
+                serde_json::json!({
+                    "stage": "page_refresh_after_back",
+                    "attempt": refresh_attempts + 1,
+                    "status": fresh.status,
+                    "clicked": false,
+                }),
+            )?;
+            thread::sleep(UNCONFIRMED_REOBSERVE_INTERVAL);
+            fresh = observe("page_refresh_after_back")?;
+            refresh_attempts += 1;
+        }
         let app_foreground = after_back.as_deref() == Some(target_package);
         page_refresh_confirmed = matches!(fresh.route, PageRoute::Home | PageRoute::Services)
             && fresh.foreign_package.is_none()
@@ -3429,35 +3554,66 @@ fn locate_or_navigate(
             serde_json::json!({"reason":"checkin_page_at_start","before_route":before_route.as_str(),"after_route":fresh.route.as_str(),"after_foreground":after_back,"confirmed":page_refresh_confirmed}),
         )?;
         if !page_refresh_confirmed {
-            log.save_bytes("navigation_result.png", &bytes)?;
-            let route = stale_refresh_route(fresh.route, after_back.as_deref(), target_package);
-            // The App having left the foreground is not a popup overlay: never
-            // record the Launcher (or any non-target package) as an overlay.
-            let overlay = if route == PageRoute::AppLeftForeground {
-                None
-            } else {
-                fresh.foreign_package.clone()
-            };
-            if route == PageRoute::AppLeftForeground {
+            // Some app builds swallow BACK on the check-in page: verified
+            // on-device, repeated keyevents leave the hierarchy byte-identical
+            // while the target app stays in the foreground. The refresh is only
+            // a convenience that re-enters the page through the catalogue; it
+            // is not what makes the observation trustworthy. When the post-BACK
+            // observation is still a confirmed check-in page owned by the
+            // target app with no foreign window, continue on that page: the run
+            // loop re-reads the hierarchy, the foreground package and a fresh
+            // screenshot before every decision, and `success` still requires
+            // today's date, so a stale success cannot be reported as success.
+            let still_checkin = may_continue_on_checkin_page(
+                fresh.route,
+                fresh.foreign_package.is_some(),
+                app_foreground,
+            );
+            if still_checkin {
                 log.event(
-                    "navigation_blocked",
+                    "page_refresh",
                     serde_json::json!({
-                        "reason": "app_left_foreground",
+                        "reason": "checkin_page_at_start",
+                        "before_route": before_route.as_str(),
+                        "after_route": fresh.route.as_str(),
                         "after_foreground": after_back,
-                        "route": route.as_str(),
+                        "confirmed": false,
+                        "fallback": "continue_on_checkin_page",
                         "clicked": false,
                     }),
                 )?;
+                continued_on_checkin_page = true;
+            } else {
+                log.save_bytes("navigation_result.png", &bytes)?;
+                let route = stale_refresh_route(fresh.route, after_back.as_deref(), target_package);
+                // The App having left the foreground is not a popup overlay: never
+                // record the Launcher (or any non-target package) as an overlay.
+                let overlay = if route == PageRoute::AppLeftForeground {
+                    None
+                } else {
+                    fresh.foreign_package.clone()
+                };
+                if route == PageRoute::AppLeftForeground {
+                    log.event(
+                        "navigation_blocked",
+                        serde_json::json!({
+                            "reason": "app_left_foreground",
+                            "after_foreground": after_back,
+                            "route": route.as_str(),
+                            "clicked": false,
+                        }),
+                    )?;
+                }
+                return Ok(NavigationResult {
+                    route,
+                    checkin_mode: CheckinMode::Unsupported,
+                    field_work_ready: false,
+                    page_refresh_attempted,
+                    page_refresh_confirmed,
+                    hierarchy_status: last_status,
+                    overlay_package: overlay,
+                });
             }
-            return Ok(NavigationResult {
-                route,
-                checkin_mode: CheckinMode::Unsupported,
-                field_work_ready: false,
-                page_refresh_attempted,
-                page_refresh_confirmed,
-                hierarchy_status: last_status,
-                overlay_package: overlay,
-            });
         }
         observation = fresh;
         bytes = device.screenshot()?;
@@ -3600,7 +3756,11 @@ fn locate_or_navigate(
     // Do not fall back to a profile coordinate on an unknown page. The last
     // *observed* page identity is reported instead of a bare Unknown, so the
     // diagnosis says "still on the home page" rather than losing that fact.
-    if !navigated {
+    //
+    // A page that was already the check-in page needs no navigation at all:
+    // fall through to the check-in handling below so its mode and button are
+    // evaluated by the normal, fail-closed path.
+    if !navigated && !continued_on_checkin_page {
         log.save_bytes("navigation_result.png", &bytes)?;
         let last = current.unwrap_or_else(|| observation.clone());
         return Ok(NavigationResult {
@@ -3822,8 +3982,9 @@ mod tests {
         VisualCandidate, blocked_instance_result, build_id, build_id_for, build_task_command_line,
         detect_page_route, finalize_run, find_checkin_entry_bounds, find_clickable_labeled_bounds,
         find_labeled_bounds, foreground_check, git_dirty, guarded_tap, instance_summary_entry,
-        location_wait_limit, new_run_result, propagated_failure, restore_sync_backup,
-        set_run_failure, unconfirmed_page_failure, unconfirmed_route_for, visual_candidate,
+        location_wait_limit, may_continue_on_checkin_page, new_run_result, propagated_failure,
+        restore_sync_backup, set_run_failure, unconfirmed_page_failure, unconfirmed_route_for,
+        visual_candidate,
     };
     use crate::{
         config::{Config, EmulatorInstanceConfig},
@@ -4516,6 +4677,43 @@ mod tests {
     }
 
     #[test]
+    fn a_checkin_page_that_swallowed_back_may_still_be_used() {
+        // Some app builds ignore BACK on the check-in page; the page is then
+        // still a legitimate, fully re-observed check-in page.
+        assert!(may_continue_on_checkin_page(
+            PageRoute::Checkin,
+            false,
+            true
+        ));
+        // Every other outcome keeps the existing fail-closed paths.
+        for route in [
+            PageRoute::Home,
+            PageRoute::Services,
+            PageRoute::Login,
+            PageRoute::Unknown,
+            PageRoute::RouteCandidateUnconfirmed,
+            PageRoute::StalePageRefreshFailed,
+            PageRoute::AppLeftForeground,
+        ] {
+            assert!(
+                !may_continue_on_checkin_page(route, false, true),
+                "{route:?} 不得被当作可继续的签到页"
+            );
+        }
+        // A foreign window or a lost foreground is never usable.
+        assert!(!may_continue_on_checkin_page(
+            PageRoute::Checkin,
+            true,
+            true
+        ));
+        assert!(!may_continue_on_checkin_page(
+            PageRoute::Checkin,
+            false,
+            false
+        ));
+    }
+
+    #[test]
     fn foreground_check_separates_a_missing_app_from_an_unreadable_query() {
         // Confirmed target App: no failure.
         assert_eq!(
@@ -4671,11 +4869,69 @@ mod tests {
         let hierarchy = r#"<node text="签到成功"/><node text="上次更新 2026-10-11"/>"#;
         assert_eq!(super::extract_hierarchy_date(hierarchy), None);
     }
+
+    #[test]
+    fn success_page_date_row_after_the_date_icon_is_accepted() {
+        // Real layout: the calendar icon carries `content-desc="date"` and the
+        // value is the next sibling node, so the date is not in a node that
+        // itself contains 签到成功.
+        let hierarchy = concat!(
+            r#"<node content-desc="晚点名签到"/>"#,
+            r#"<node text="晚点打卡"/>"#,
+            r#"<node text="签到成功"/>"#,
+            r#"<node content-desc="date"/>"#,
+            r#"<node text="2026-10-17 星期六"/>"#,
+            r#"<node text="签到时段：21:00 -23:59"/>"#,
+            r#"<node text="已签到："/>"#,
+            r#"<node text="2026-10-17 22:37:10"/>"#,
+            r#"<node text="签到成功"/>"#
+        );
+        assert_eq!(
+            super::extract_hierarchy_date(hierarchy),
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 17)
+        );
+    }
+
+    #[test]
+    fn success_page_split_checkin_timestamp_is_accepted() {
+        // `已签到：` and its timestamp are separate nodes; the timestamp alone
+        // has no check-in wording of its own.
+        let hierarchy = concat!(
+            r#"<node content-desc="晚点名签到"/>"#,
+            r#"<node text="签到成功"/>"#,
+            r#"<node text="已签到："/>"#,
+            r#"<node text="2026-10-17 22:37:10"/>"#
+        );
+        assert_eq!(
+            super::extract_hierarchy_date(hierarchy),
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 17)
+        );
+    }
+
+    #[test]
+    fn split_date_anchor_does_not_accept_a_conflicting_date() {
+        // The anchored date disagrees with another date on the page: fail closed
+        // instead of guessing which one is the check-in date.
+        let hierarchy = concat!(
+            r#"<node content-desc="date"/>"#,
+            r#"<node text="2026-10-17 星期六"/>"#,
+            r#"<node text="上次更新 2026-10-16"/>"#
+        );
+        assert_eq!(super::extract_hierarchy_date(hierarchy), None);
+    }
+
+    #[test]
+    fn success_banner_does_not_anchor_an_unrelated_date() {
+        // A result banner must not lend its context to the next node.
+        let hierarchy = r#"<node text="签到成功"/><node text="2026-10-11"/>"#;
+        assert_eq!(super::extract_hierarchy_date(hierarchy), None);
+    }
     #[test]
     fn hierarchy_date_is_unknown_when_success_and_unrelated_dates_conflict() {
         let hierarchy = r#"<node text="2026年10月11日"/><node text="签到成功：2026年10月10日"/>"#;
         assert_eq!(super::extract_hierarchy_date(hierarchy), None);
     }
+
     #[test]
     fn gui_task_creation_targets_cli_companion() {
         assert_eq!(
@@ -4723,6 +4979,35 @@ mod tests {
         assert!(
             command.contains(r#"--config "C:\User Data\ZHFD\config.toml""#),
             "scheduled task dropped the explicit config path: {command}"
+        );
+    }
+
+    #[test]
+    fn task_command_line_is_already_a_complete_task_scheduler_action() {
+        // Regression: `schtasks /TR` stores its value verbatim, so the built
+        // string must already be the exact action command line. An extra outer
+        // pair of quotes made the Task Scheduler read the program name as `""`
+        // and fail the launch with 2147942487 (E_INVALIDARG).
+        let target = super::InstanceTargetArgs::default();
+        let command = build_task_command_line(
+            Path::new(r"C:\Program Files\ZHFD\zhfd-checkin.exe"),
+            "run --live --confirm",
+            true,
+            &target,
+            Some(Path::new(r"C:\Data\config.toml")),
+        );
+        // Starts with the quoted executable and never with a doubled quote.
+        assert!(command.starts_with(r#""C:\Program Files\ZHFD\zhfd-checkin.exe" "#));
+        assert!(
+            !command.starts_with("\"\""),
+            "action command line must not be wrapped in a second pair of quotes: {command}"
+        );
+        assert!(command.ends_with("--all-instances"));
+        // Exactly four quote characters: the exe pair and the config pair.
+        assert_eq!(
+            command.matches('"').count(),
+            4,
+            "unexpected quoting in action command line: {command}"
         );
     }
 
