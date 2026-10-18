@@ -17,7 +17,7 @@
 运行：
 
 ```powershell
-conda activate D:\Documents\Projects\check-in-zhfd\.conda
+conda activate <repo>\.conda
 python .\scripts\analyze_images.py
 ```
 

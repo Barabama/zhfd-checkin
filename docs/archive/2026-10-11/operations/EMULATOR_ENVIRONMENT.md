@@ -10,8 +10,8 @@
 - CPU 虚拟化固件：已开启
 - Windows 已检测到 Hyper-V hypervisor
 - C 盘剩余约 72 GiB；D 盘剩余约 141 GiB
-- 现有 ADB：`D:\Programs\platform-tools\adb.exe`
-- Python 环境：`D:\Documents\Projects\check-in-zhfd\.conda`
+- 现有 ADB：`<adb-dir>\adb.exe`
+- Python 环境：`<repo>\.conda`
 - Android Studio 已安装：`C:\Program Files\Android\Android Studio`
 - Android Studio 已安装；SDK 组件已安装到 `D:\Documents\Android\Sdk`，Android Studio 首次向导已完成或 SDK 已由向导配置
 
@@ -38,7 +38,7 @@ Android Studio 官方安装页面和 Emulator 文档说明了 SDK、模拟器及
 完成后只需回复“Android Studio 向导完成”，Agent 会通过命令行检查：
 
 ```powershell
-Test-Path D:\Documents\Android\Sdk\platform-tools\adb.exe
+Test-Path <android-sdk>\platform-tools\adb.exe
 Test-Path D:\Documents\Android\Sdk\emulator\emulator.exe
 Test-Path D:\Documents\Android\Sdk\cmdline-tools\latest\bin\sdkmanager.bat
 & D:\Documents\Android\Sdk\emulator\emulator.exe -accel-check

@@ -7,8 +7,8 @@
 
 ## 安装与实例
 
-- 安装目录：`E:\leidian\LDPlayer14`（v14.0.28.0）
-- 控制台工具：`E:\leidian\LDPlayer14\ldconsole.exe`（同目录 `dnconsole.exe` 是同一工具的旧名副本）
+- 安装目录：`<ldplayer-dir>`（v14.0.28.0）
+- 控制台工具：`<ldplayer-dir>\ldconsole.exe`（同目录 `dnconsole.exe` 是同一工具的旧名副本）
 - 实例 0「雷电模拟器」：竖屏 900×1600，320 dpi，已安装并登录智汇福大
   （用户已手动点开过晚点名签到页面）
 - App：`cn.edu.fzu.fdxypa` v1.17.4（versionCode 26091701，2026-09-21 11:57 安装）
@@ -45,7 +45,7 @@ Android 14 内核版本线（中文官网 ldmnq.com 有专门入口），与雷�
 ## ldconsole 常用命令（LD14 实测）
 
 ```bash
-LD="E:/leidian/LDPlayer14/ldconsole.exe"
+LD="<ldplayer-dir>/ldconsole.exe"
 "$LD" list                      # 实例名列表
 "$LD" list2                     # 详情CSV: index,名,顶层窗口PID,实例PID,是否启动,窗口句柄?,adb端口,宽,高,dpi
 "$LD" isrunning --index 0
@@ -62,7 +62,7 @@ LD="E:/leidian/LDPlayer14/ldconsole.exe"
 注意：
 - `list2` 中文实例名在 Git Bash 输出为 GBK 乱码，按逗号取字段即可，不影响使用。
 - `locate` 立即返回 exit=0，坐标写入
-  `E:\leidian\LDPlayer14\vms\config\leidian0.config`
+  `<ldplayer-dir>\vms\config\leidian0.config`
   的 `statusSettings.location`（实测 lng/lat 已正确落盘）。
   App 请求定位时由模拟器注入该坐标。
 - LD14 没有内置 `monkey`（`/system/bin/sh: monkey: inaccessible`），

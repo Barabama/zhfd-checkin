@@ -4,7 +4,7 @@
 
 ## 任务目标
 
-对 `D:/Documents/Projects/check-in-zhfd` 当前工作区进行 Phase 0–4 全量独立审计，重点验证：
+对 `<repo>` 当前工作区进行 Phase 0–4 全量独立审计，重点验证：
 
 1. 新机器依赖发现、配置路径、Windows 子进程隐藏策略；
 2. CLI/GUI 共享业务逻辑和 GUI 信息架构；
@@ -21,7 +21,7 @@
 
 ## 工作区和约束
 
-- 工作区：`D:/Documents/Projects/check-in-zhfd`
+- 工作区：`<repo>`
 - 当前分支：`feature/phase1-environment-discovery`
 - 当前存在未提交改动；**不得 reset、clean、checkout 覆盖或删除既有改动**。
 - 不创建 tag，不 push，不发布 GitHub Release。

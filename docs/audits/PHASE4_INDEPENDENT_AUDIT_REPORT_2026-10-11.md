@@ -1,7 +1,7 @@
 # check-in-zhfd Phase 0–4 独立审计报告
 
 - 审计日期：2026-10-11（Asia/Shanghai）
-- 工作区：`D:\Documents\Projects\check-in-zhfd`
+- 工作区：`<repo>`
 - 分支：`feature/phase1-environment-discovery`
 - HEAD：`4cfff0a6abed6ff83fe6191939b47bb1d6a3bda1`
 - 目标：Phase 0–4 改进的独立测试与边界审计；**不是发布验收或 live 设备验收**。
@@ -146,7 +146,7 @@ git ls-files --others --exclude-standard
 
 ### [P2] GUI 配置解析失败没有用户可见提示，进程仍报告成功退出
 
-- 位置：`D:\Documents\Projects\check-in-zhfd\rust\src\bin\zhfd-checkin-gui.rs:3-15`；GUI 加载路径由 `rust/src/main.rs:365-368` 调用 `ConfigStore::load()`。
+- 位置：`<repo>\rust\src\bin\zhfd-checkin-gui.rs:3-15`；GUI 加载路径由 `rust/src/main.rs:365-368` 调用 `ConfigStore::load()`。
 - 最小复现：隔离目录放入 GUI EXE 与 `config.toml` 内容 `[not valid TOML`，隐藏启动 GUI。
 - 实际：GUI 进程 `ExitCode=0`；目录中生成 `gui-startup-error.log`，内容为 TOML parse error；没有观察到 message box、GUI 页面或用户可见错误。由于它是 `windows_subsystem = "windows"`，普通双击时用户可能只看到窗口未出现，难以恢复配置。
 - 类型：代码 UX/恢复缺陷，不是配置解析器误接受；未发现凭据泄漏。
@@ -154,7 +154,7 @@ git ls-files --others --exclude-standard
 
 ### [P2 / 发布准备] 工作区/便携包版本仍为 0.1.0，而审计目标标注 v0.2.0 改进
 
-- 位置：`D:\Documents\Projects\check-in-zhfd\rust\Cargo.toml:3`；Release 脚本从 Cargo metadata 读取版本。
+- 位置：`<repo>\rust\Cargo.toml:3`；Release 脚本从 Cargo metadata 读取版本。
 - 证据：本地 about 和 package metadata 均输出 `0.1.0`；隔离 ZIP 命名 `zhfd-checkin-windows-x64-v0.1.0-4cfff0a6abed.zip`。
 - 类型：版本/发布治理状态，不是运行时 correctness bug。没有擅自 bump 版本、建 tag 或发布；若 `v0.2.0` 是本轮目标版本，需在独立验收通过后同步 Cargo/docs/发布说明并再执行 tag 模拟。
 
@@ -200,7 +200,7 @@ git ls-files --others --exclude-standard
 
 ### P2-1 — GUI 无效配置启动提示：CLOSED
 
-复核文件：`D:\Documents\Projects\check-in-zhfd\rust\src\bin\zhfd-checkin-gui.rs:3-58`。
+复核文件：`<repo>\rust\src\bin\zhfd-checkin-gui.rs:3-58`。
 
 **非法 TOML 复现**：在 `rust/target/audit-gui-invalid-*` 隔离便携目录中，仅放 GUI EXE 与 `config.toml` 内容 `[not valid TOML`，直接启动 release GUI companion；没有传 CLI 参数，也没有真实设备连接。
 

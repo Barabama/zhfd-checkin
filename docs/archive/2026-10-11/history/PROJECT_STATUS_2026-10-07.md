@@ -2,7 +2,7 @@
 
 > 更新时间：2026-10-07（Asia/Shanghai）
 > 项目：`check-in-zhfd`
-> 工作区：`D:\Documents\Projects\check-in-zhfd`
+> 工作区：`<repo>`
 
 ## 1. 当前结论
 
@@ -355,7 +355,7 @@ Schedule Type: Daily
 实际执行命令：
 
 ```text
-"D:\Documents\Projects\check-in-zhfd\rust\target\release\zhfd-checkin.exe" run --dry-run --all-instances
+"<repo>\rust\target\release\zhfd-checkin.exe" run --dry-run --all-instances
 ```
 
 已确认没有指向：

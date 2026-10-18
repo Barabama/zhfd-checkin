@@ -1,6 +1,6 @@
 # 手机签到自动化 — 项目上下文
 
-> 本文档为会话上下文存档，稍后在 `D:\Documents\Projects\check-in-zhfd` 继续工作。
+> 本文档为会话上下文存档，稍后在 `<repo>` 继续工作。
 > 日期：2026-09-17/18 创建
 
 ## 目标
@@ -27,7 +27,7 @@
 ## 环境信息
 
 - Windows 11 Pro，bash (Git Bash) shell
-- platform-tools (adb) 位置：**D:\Programs\platform-tools\**（用户在编辑器中选中此路径）
+- platform-tools (adb) 位置：**<adb-dir>\**（用户在编辑器中选中此路径）
 - 计划任务参考：`schtasks /create /tn "AutoCheckin" /tr "python C:\checkin\checkin.py" /sc daily /st 07:55 /f`
 - 依赖：`pip install uiautomator2 opencv-python numpy requests`，一次性 `python -m uiautomator2 init`
 - 手机需开 USB 调试；锁屏无密码才能自动解锁，有密码需手动
@@ -41,7 +41,7 @@
 
 ## 待办（下次继续的步骤）
 
-1. 手机连 USB，`adb devices -l` 确认显示 `402b184f device`。
+1. 手机连 USB，`adb devices -l` 确认显示 `<device-serial> device`。
 2. 在真实签到窗口 21:30-23:59 运行一次 `ZHFD_DRY_RUN=1`，确认 ready 识别不会点击。
 3. 确认定位中、点击签到、签到成功状态转换稳定后，再关闭 dry-run。
 4. 最后配置 Windows 计划任务定时执行。
@@ -56,12 +56,12 @@
 
 ## 环境检查（2026-09-18）
 
-- Conda 环境：`D:\Documents\Projects\check-in-zhfd\.conda`
+- Conda 环境：`<repo>\.conda`
 - Python：3.12.14
 - 已安装并通过导入测试：`uiautomator2 3.7.0`、`opencv-python 5.0.0.93`、`numpy 2.5.3`、`requests 2.34.2`
 - `pip check`：通过；`scripts/checkin.py`、`scripts/probe.py`：编译通过
-- ADB：`D:\Programs\platform-tools\adb.exe`，版本 1.0.41 / 37.0.1-15733141
-- 2026-09-19 真实设备已恢复连接：`402b184f device`（PHY110）；ADB 服务可用
+- ADB：`<adb-dir>\adb.exe`，版本 1.0.41 / 37.0.1-15733141
+- 2026-09-19 真实设备已恢复连接：`<device-serial> device`（PHY110）；ADB 服务可用
 - 已增加 `requirements.txt`，并让脚本自动加入 ADB 路径、支持 `ZHFD_PKG` / `ANDROID_SERIAL` 环境变量；`probe.py` 在未设置包名时会保留当前前台 App，不再启动占位包名
 
 ## 收尾记录
@@ -81,7 +81,7 @@
 
 ## 2026-09-20 手机端安装与导入
 
-- 已确认设备 `402b184f` 在线，PHY110 / Android 16。
+- 已确认设备 `<device-serial>` 在线，PHY110 / Android 16。
 - AutoJs6：`org.autojs.autojs6`，版本 6.7.0；PCAPdroid：`com.emanuelef.remote_capture`，版本 2.0.1。
 - 已将 `autojs6/` 复制到手机 `/storage/emulated/0/脚本/zhfd-autojs6/`，并预创建 `logs/`。
 - AutoJs6 无障碍服务已通过 ADB 设置为启用，但手机实际设置页可能显示为未启用，需用户在设置中确认一次。
@@ -105,7 +105,7 @@
 
 ## 2026-09-21 切换到雷电模拟器（LDPlayer 14）路线
 
-- 用户已安装 LDPlayer 14（`E:\leidian\LDPlayer14`，v14.0.28.0，Android 14 / API 34），
+- 用户已安装 LDPlayer 14（`<ldplayer-dir>`，v14.0.28.0，Android 14 / API 34），
   实例 0 为 900×1600 竖屏，已安装并登录智汇福大 v1.17.4。
 - ldconsole/adb/uiautomator2 联动已验证；定位命令 `locate --LLI <Lng,Lat>` 已写入旗山校区坐标。
 - 定位权限已通过 adb `pm grant` 授予 App。

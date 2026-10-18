@@ -116,8 +116,8 @@ PCAPdroid 只用于观察连接、域名、时间、请求数量和 PCAP 时序�
 授权后可用以下方式确认结果，不需要查看截图：
 
 ```powershell
-& 'D:\Programs\platform-tools\adb.exe' -s 402b184f shell 'find /storage/emulated/0/脚本/zhfd-autojs6/logs -maxdepth 3 -type f | sort'
-& 'D:\Programs\platform-tools\adb.exe' -s 402b184f shell 'find /storage/emulated/0/脚本/zhfd-autojs6/logs -name probe.json -type f -exec cat {} \;'
+& '<adb-dir>\adb.exe' -s <device-serial> shell 'find /storage/emulated/0/脚本/zhfd-autojs6/logs -maxdepth 3 -type f | sort'
+& '<adb-dir>\adb.exe' -s <device-serial> shell 'find /storage/emulated/0/脚本/zhfd-autojs6/logs -name probe.json -type f -exec cat {} \;'
 ```
 
 后续调试优先读取 `probe.json`、`events.log`、AutoJs6 日志和当前前台包名，不直接查看图片。

@@ -9,7 +9,7 @@
 
 ## 电脑环境
 
-- 工作区：`D:\Documents\Projects\check-in-zhfd`
+- 工作区：`<repo>`
 - Windows 10 Pro 64 位，构建 `26200`
 - CPU：AMD Ryzen 5 5600，6 核 / 12 线程
 - 内存：约 32 GiB
@@ -49,7 +49,7 @@ D:\Documents\Android\Sdk
 已确认存在：
 
 ```text
-D:\Documents\Android\Sdk\platform-tools\adb.exe
+<android-sdk>\platform-tools\adb.exe
 D:\Documents\Android\Sdk\emulator\emulator.exe
 D:\Documents\Android\Sdk\cmdline-tools\latest\bin\sdkmanager.bat
 D:\Documents\Android\Sdk\cmdline-tools\latest\bin\avdmanager.bat
@@ -108,12 +108,12 @@ sdkmanager.bat --sdk_root=D:\Documents\Android\Sdk system-images/android-36/goog
 
 ```powershell
 $env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'
-$env:PATH="$env:JAVA_HOME\bin;D:\Documents\Android\Sdk\platform-tools;D:\Documents\Android\Sdk\emulator;D:\Documents\Android\Sdk\cmdline-tools\latest\bin;$env:PATH"
+$env:PATH="$env:JAVA_HOME\bin;<android-sdk>\platform-tools;D:\Documents\Android\Sdk\emulator;D:\Documents\Android\Sdk\cmdline-tools\latest\bin;$env:PATH"
 ```
 
 ## 原实体手机/AutoJs6 状态
 
-- 手机序列号：`402b184f`
+- 手机序列号：`<device-serial>`
 - 设备：PHY110 / Android 16 / 1440×3168
 - AutoJs6：`org.autojs.autojs6`，6.7.0
 - PCAPdroid：`com.emanuelef.remote_capture`，2.0.1

@@ -57,9 +57,9 @@
 
 ```bash
 # 模拟器
-E:/leidian/LDPlayer14/ldconsole.exe isrunning --index 0   # 查状态
-E:/leidian/LDPlayer14/ldconsole.exe launch --index 0       # 启动（boot 约 20-25s）
-E:/leidian/LDPlayer14/ldconsole.exe locate --index 0 --LLI 119.190379,26.065882
+<ldplayer-dir>/ldconsole.exe isrunning --index 0   # 查状态
+<ldplayer-dir>/ldconsole.exe launch --index 0       # 启动（boot 约 20-25s）
+<ldplayer-dir>/ldconsole.exe locate --index 0 --LLI 119.190379,26.065882
 # ↑ 学生街 WGS-84 坐标（GCJ-02 26.0628,119.1952 转换而来）；改坐标后 grep gps_hal 确认
 
 # adb / u2
@@ -69,7 +69,7 @@ adb -s 127.0.0.1:5555 shell pm grant cn.edu.fzu.fdxypa android.permission.ACCESS
 adb -s 127.0.0.1:5555 shell pm grant cn.edu.fzu.fdxypa android.permission.ACCESS_COARSE_LOCATION
 
 # 真机
-ADB: D:/Programs/platform-tools/adb.exe；序列号 402b184f（PHY110, Android 16, 1440×3168）
+ADB: <adb-dir>/adb.exe；序列号 <device-serial>（PHY110, Android 16, 1440×3168）
 
 # 运行
 cd d:/Documents/Projects/check-in-zhfd
@@ -93,7 +93,7 @@ ZHFD_SERIAL=127.0.0.1:5555 ZHFD_DRY_RUN=1 .conda/python.exe scripts/checkin.py
 2. 用模拟器做一次窗口内完整 dry-run（步骤见 LDPLAYER_ENVIRONMENT.md），
    确认状态机输出 gray→locating→ready 且 DRY_RUN 不点击。
 3. 验证通过后与用户确认生产载体（真机 USB / 模拟器 / 手机 AutoJs6）；
-   默认建议真机 USB：ZHFD_SERIAL=402b184f，脚本零改动。
+   默认建议真机 USB：ZHFD_SERIAL=<device-serial>，脚本零改动。
 
 安全边界（必须遵守）：
 - 一切验证用 ZHFD_DRY_RUN=1，绝不点击"点击签到"按钮；
