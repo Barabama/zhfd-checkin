@@ -57,7 +57,7 @@ struct GuiApp {
     apk_path: String,
     job: Option<GuiJob>,
     pending_sync: Option<String>,
-    pending_live_run: bool,
+    pending_live_run: Option<LiveRunIntent>,
     pending_migration: Option<std::path::PathBuf>,
     latest_result: Option<RunResult>,
     latest_log_dir: Option<String>,
@@ -105,6 +105,31 @@ enum JobKind {
     AppVersion,
 }
 
+/// What the user reviewed when the live confirmation dialog opened.
+///
+/// Confirming must run exactly this target. Store/config switches, reset to
+/// defaults, or an instance change while the dialog is open would otherwise
+/// execute live against something the user never reviewed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveRunIntent {
+    config_path: std::path::PathBuf,
+    data_root: std::path::PathBuf,
+    instance_index: u32,
+    all_instances: bool,
+}
+
+/// Whether the workspace must stay behind Setup/Repair.
+///
+/// One predicate for startup, reload, alternate-config selection, and save, so
+/// those paths cannot disagree and clear the gate while a dependency path is
+/// still empty or the loaded file is a damaged one held in recovery mode.
+fn requires_setup(store: &ConfigStore) -> bool {
+    store.recovery_error.is_some()
+        || store.created_default
+        || store.config.emulator.ldconsole_path.trim().is_empty()
+        || store.config.emulator.adb_path.trim().is_empty()
+}
+
 struct JobOutput {
     message: String,
     installed_version: Option<String>,
@@ -147,10 +172,7 @@ impl GuiApp {
             .unwrap_or(store.config.emulator.instance_index);
         // A missing dependency path or a created-default config means the user
         // has not finished first-run setup yet, so open on the Setup page.
-        let setup_required = startup_error.is_some()
-            || store.created_default
-            || store.config.emulator.ldconsole_path.trim().is_empty()
-            || store.config.emulator.adb_path.trim().is_empty();
+        let setup_required = startup_error.is_some() || requires_setup(&store);
         let setup_ldconsole = store.config.emulator.ldconsole_path.clone();
         let setup_adb = store.config.emulator.adb_path.clone();
         let setup_error = startup_error.or_else(|| store.recovery_error.clone());
@@ -172,7 +194,7 @@ impl GuiApp {
             apk_path,
             job: None,
             pending_sync: None,
-            pending_live_run: false,
+            pending_live_run: None,
             pending_migration: None,
             latest_result: None,
             latest_log_dir: None,
@@ -270,6 +292,48 @@ impl GuiApp {
             instance_index: Some(self.selected_instance_index),
             serial: None,
         }
+    }
+
+    /// Snapshot the live target the user is about to review.
+    fn live_intent(&self) -> LiveRunIntent {
+        LiveRunIntent {
+            config_path: self.store.path.clone(),
+            data_root: self.store.root.clone(),
+            instance_index: self.selected_instance_index,
+            all_instances: self.run_all_instances,
+        }
+    }
+
+    /// Replace the active store after a config switch or data-root migration.
+    ///
+    /// Everything derived from the previous store is recomputed: the selected
+    /// instance, the Setup gate, the setup fields, and the log/result/event
+    /// views. Without this the combo could show "未选择" while runs still used
+    /// the previous config's instance index, and the status card could keep
+    /// rendering results from the old data root.
+    fn adopt_store(&mut self, store: ConfigStore) {
+        self.setup_ldconsole = store.config.emulator.ldconsole_path.clone();
+        self.setup_adb = store.config.emulator.adb_path.clone();
+        self.apk_path = store.config.app.apk_path.clone();
+        self.selected_instance_index = store
+            .config
+            .emulator
+            .effective_instances()
+            .first()
+            .map(|instance| instance.instance_index)
+            .unwrap_or(store.config.emulator.instance_index);
+        self.setup_required = requires_setup(&store);
+        self.store = store;
+        self.setup_error = None;
+        self.latest_result = None;
+        self.latest_log_dir = None;
+        self.recent_logs.clear();
+        self.recent_events.clear();
+        self.selected_log_directory = None;
+        self.selected_log_artifact = None;
+        self.selected_log_preview = None;
+        self.refresh_latest_result();
+        self.refresh_events();
     }
 
     fn instance_options(&self) -> Vec<(u32, String)> {
@@ -408,16 +472,29 @@ impl GuiApp {
     fn migrate_data_root(&mut self, destination: std::path::PathBuf) {
         match self.store.migrate_to_root(&destination) {
             Ok(store) => {
-                self.store = store;
-                self.apk_path = self.store.config.app.apk_path.clone();
-                self.setup_ldconsole = self.store.config.emulator.ldconsole_path.clone();
-                self.setup_adb = self.store.config.emulator.adb_path.clone();
-                self.setup_notice = Some(format!(
-                    "数据目录已迁移到 {}；源目录保留未删除。",
-                    self.store.root.display()
-                ));
-                self.status = "数据目录迁移完成".into();
-                self.refresh_latest_result();
+                // Record only from the GUI entry point: the library migration
+                // itself must not touch the real user-level pointer (tests call
+                // it). Without the pointer the next start would silently fall
+                // back to the source root.
+                let recorded = store.record_current_root();
+                let root = store.root.clone();
+                self.adopt_store(store);
+                match recorded {
+                    Ok(()) => {
+                        self.setup_notice = Some(format!(
+                            "数据目录已迁移到 {}；源目录保留未删除。",
+                            root.display()
+                        ));
+                        self.status = "数据目录迁移完成".into();
+                    }
+                    Err(error) => {
+                        self.setup_error = Some(format!(
+                            "数据已复制到 {}，但无法记录新数据目录；重启后会回到旧目录：{error:#}",
+                            root.display()
+                        ));
+                        self.status = "数据目录迁移未完成（记录新目录失败）".into();
+                    }
+                }
             }
             Err(error) => {
                 // A failed migration must leave the store on the original root.
@@ -817,6 +894,7 @@ impl GuiApp {
                 config::ConfigOrigin::Explicit => "显式 --config / 修复路径",
                 config::ConfigOrigin::Portable => "EXE 便携目录",
                 config::ConfigOrigin::LocalAppData => "%LOCALAPPDATA%\\ZHFDCheckin",
+                config::ConfigOrigin::Recorded => "已迁移的数据目录",
             }
         ));
         if let Some(error) = self.setup_error.clone() {
@@ -883,24 +961,41 @@ impl GuiApp {
                 ui.label("验证中……");
             }
             if ui.button("确认并保存路径").clicked() {
-                // Persist a candidate and only publish it after the atomic
-                // write succeeded, so a failure keeps the last good config.
-                let mut candidate = self.store.config.clone();
-                candidate.emulator.ldconsole_path = self.setup_ldconsole.clone();
-                candidate.emulator.adb_path = self.setup_adb.clone();
-                match self.store.save_candidate(candidate) {
-                    Ok(()) => {
-                        self.setup_required = false;
-                        self.setup_error = None;
-                        self.setup_notice = None;
-                        self.status = "依赖配置已保存".into();
-                        self.tab = 0;
-                    }
-                    Err(error) => {
-                        // The write is atomic, so both the on-disk config and the
-                        // in-memory config are still the previous ones.
-                        self.setup_error = Some(format!("保存失败,现有配置保持不变:{error:#}"));
-                        self.setup_notice = None;
+                // Empty dependency paths are not a usable setup: refuse the
+                // write and keep the gate closed instead of publishing a config
+                // that can only fail at run time.
+                if self.setup_ldconsole.trim().is_empty() || self.setup_adb.trim().is_empty() {
+                    self.setup_error = None;
+                    self.setup_notice = Some(
+                        "请先填写 ldconsole.exe 和 adb.exe 路径；依赖为空时不会解除首次设置。"
+                            .into(),
+                    );
+                    self.status = "依赖路径不完整，配置未保存".into();
+                } else {
+                    // Persist a candidate and only publish it after the atomic
+                    // write succeeded, so a failure keeps the last good config.
+                    let mut candidate = self.store.config.clone();
+                    candidate.emulator.ldconsole_path = self.setup_ldconsole.clone();
+                    candidate.emulator.adb_path = self.setup_adb.clone();
+                    match self.store.save_candidate(candidate) {
+                        Ok(()) => {
+                            // Recompute from the same predicate used at startup;
+                            // a successful write is not by itself proof that the
+                            // dependencies are usable.
+                            self.setup_required = requires_setup(&self.store);
+                            self.setup_error = None;
+                            self.setup_notice = None;
+                            self.status = "依赖配置已保存".into();
+                            if !self.setup_required {
+                                self.tab = 0;
+                            }
+                        }
+                        Err(error) => {
+                            // The write is atomic, so both the on-disk config and the
+                            // in-memory config are still the previous ones.
+                            self.setup_error = Some(format!("保存失败,现有配置保持不变:{error:#}"));
+                            self.setup_notice = None;
+                        }
                     }
                 }
             }
@@ -920,9 +1015,15 @@ impl GuiApp {
                     Ok(()) => {
                         self.setup_ldconsole = self.store.config.emulator.ldconsole_path.clone();
                         self.setup_adb = self.store.config.emulator.adb_path.clone();
-                        self.setup_required = false;
+                        // Reload validates the file, not the dependencies: an
+                        // empty tool path must keep Setup open.
+                        self.setup_required = requires_setup(&self.store);
                         self.setup_error = None;
-                        self.setup_notice = Some("已从磁盘重新载入并验证配置。".into());
+                        self.setup_notice = Some(if self.setup_required {
+                            "已从磁盘重新载入；依赖路径仍为空，请完成设置。".into()
+                        } else {
+                            "已从磁盘重新载入并验证配置。".into()
+                        });
                     }
                     Err(error) => {
                         // Reload failure must keep the last valid in-memory config.
@@ -938,14 +1039,7 @@ impl GuiApp {
             {
                 match ConfigStore::load_alternate(&path) {
                     Ok(store) => {
-                        self.setup_ldconsole = store.config.emulator.ldconsole_path.clone();
-                        self.setup_adb = store.config.emulator.adb_path.clone();
-                        self.setup_required = store.created_default
-                            || self.setup_ldconsole.trim().is_empty()
-                            || self.setup_adb.trim().is_empty();
-                        self.apk_path = store.config.app.apk_path.clone();
-                        self.store = store;
-                        self.setup_error = None;
+                        self.adopt_store(store);
                         self.setup_notice = Some("已切换到所选配置文件。".into());
                     }
                     Err(error) => {
@@ -1100,7 +1194,7 @@ impl GuiApp {
                     self.status = "首次配置尚未完成，无法准备 live 运行。".into();
                     self.tab = SETUP_TAB;
                 } else {
-                    self.pending_live_run = true;
+                    self.pending_live_run = Some(self.live_intent());
                 }
             }
             if ui.button("打开配置").clicked() {
@@ -1471,20 +1565,27 @@ impl GuiApp {
     }
 
     fn live_confirmation_window(&mut self, ctx: &egui::Context) {
-        if !self.pending_live_run {
+        let Some(intent) = self.pending_live_run.clone() else {
             return;
-        }
+        };
         let mut action = None;
         egui::Window::new("确认正式 live 运行")
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                let scope = if self.run_all_instances {
+                let scope = if intent.all_instances {
                     "全部已启用实例"
                 } else {
                     "当前选择的实例"
                 };
                 ui.colored_label(egui::Color32::YELLOW, format!("范围：{}", scope));
+                // Show the snapshot, not the current state: the user reviews
+                // exactly what will run.
+                ui.label(format!("配置文件：{}", intent.config_path.display()));
+                ui.label(format!("数据目录：{}", intent.data_root.display()));
+                if !intent.all_instances {
+                    ui.label(format!("实例 index：{}", intent.instance_index));
+                }
                 ui.label("将执行真实签到点击。普通签到仍检查 calibrated Profile、时间窗口、前台包名、连续 ready 和点击前二次确认；外勤签到还要求 config.toml 中显式设置 runtime.allow_field_work_live = true，并使用外勤页面自己的按钮。程序不会把外勤降级为普通签到。" );
                 ui.label("请确认设备、实例和当前页面均正确；确认后将调用 CLI 同一套 run --live --confirm 业务逻辑。");
                 ui.horizontal(|ui| {
@@ -1497,9 +1598,18 @@ impl GuiApp {
                 });
             });
         if let Some(confirm) = action {
-            self.pending_live_run = false;
+            self.pending_live_run = None;
             if confirm {
-                self.start_run(true);
+                // The dialog may have been open while the config, instance, or
+                // data root changed. Never run live against a different target
+                // than the one displayed.
+                if self.live_intent() != intent {
+                    self.status =
+                        "配置、数据目录或实例已在确认前变化；live 未启动，请重新准备 live 运行。"
+                            .into();
+                } else {
+                    self.start_run(true);
+                }
             } else {
                 self.status = "已取消 live 运行".into();
             }
@@ -2240,5 +2350,51 @@ mod tests {
         let target = run_target_for_selection(false, 2);
         assert_eq!(target.instance_index, Some(2));
         assert!(target.serial.is_none());
+    }
+
+    #[test]
+    fn requires_setup_tracks_dependencies_and_recovery_state() {
+        let root = std::path::PathBuf::from("C:/tmp/zhfd-gui-test");
+        let store = |config: config::Config,
+                     created_default: bool,
+                     recovery_error: Option<String>| ConfigStore {
+            root: root.clone(),
+            path: root.join("config.toml"),
+            config,
+            origin: config::ConfigOrigin::Explicit,
+            created_default,
+            recovery_error,
+        };
+
+        // Embedded defaults have empty tool paths.
+        assert!(requires_setup(&store(
+            config::Config::default(),
+            false,
+            None
+        )));
+        // A created-default config keeps Setup open even after a write.
+        assert!(requires_setup(&store(
+            config::Config::default(),
+            true,
+            None
+        )));
+        // A damaged config held in recovery mode is never "ready".
+        assert!(requires_setup(&store(
+            config::Config::default(),
+            false,
+            Some("parse error".into())
+        )));
+
+        let mut filled = config::Config::default();
+        filled.emulator.ldconsole_path = "E:/leidian/ldconsole.exe".into();
+        filled.emulator.adb_path = "E:/leidian/adb.exe".into();
+        assert!(!requires_setup(&store(filled.clone(), false, None)));
+
+        // A created-default flag still wins, and one blank path keeps the gate
+        // closed even when the other path is set.
+        assert!(requires_setup(&store(filled.clone(), true, None)));
+        let mut half = filled;
+        half.emulator.adb_path = "   ".into();
+        assert!(requires_setup(&store(half, false, None)));
     }
 }

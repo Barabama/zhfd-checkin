@@ -17,10 +17,15 @@ CLI/GUI 共享业务函数，不把 UI 的按钮/输入当作第二套业务策�
 
 ## 版本与发布状态
 
-- Cargo package 元数据当前是 `0.3.0`；本次 field-work live opt-in 修复计划作为 `v0.3.1` 发布；
-- P2 复核后的本地审计包版本和清单见 [Phase 4 审计报告](./audits/PHASE4_INDEPENDENT_AUDIT_REPORT_2026-10-11.md)；
-- 当前没有基于 `0.3.0` 的正式发布声明；本地工作区不等于发布；
-- 独立审计明确：真实 LDPlayer、多实例设备级联、完整 GUI 视觉验收、GitHub CI/release runner 尚未验证。因此 Phase 4 总体验收尚未通过。
+- Cargo package 元数据当前是 `0.3.2`；
+- 已发布 tag：`v0.1.0`（`4cfff0a`）、`v0.2.0`（`9147790`）、`v0.3.0`（`de3e33d`）、`v0.3.1`（`9a66664`）；
+- `v0.3.2` 包含 v0.3.1 之后的计划任务引号、成功日期作用域、数据根目录持久化、
+  Repair 保存保护、Setup 门禁和 live 目标快照修复；
+- `v0.3.1` 的 GitHub Release 与 CI 已成功运行，发布资产为
+  `zhfd-checkin-windows-x64-v0.3.1-9a666641c872.zip`；
+- 详细审计与未完成项见
+  [V0.3.1 独立审计报告](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)；
+- 本地工作区不等于发布，tag/Release 仍须独立验收与用户明确批准。
 
 ## 本地构建入口
 

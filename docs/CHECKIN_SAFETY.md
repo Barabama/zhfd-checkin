@@ -37,13 +37,15 @@ AND second Ready confirmation AND this run has not tapped
 签到成功后程序不主动退出 App、不发送额外的 BACK，也不会把 App 拉回前台或重启（FR-013）。若某次运行启动时已停留在旧的签到页，程序只做一次受控的 BACK 刷新：
 
 - 仅在层级确认签到页且无外部窗口时发送 BACK；
-- BACK 后重新读取前台包名与页面层级；
+- BACK 后重新读取前台包名与页面层级；若首次读取层级不可确认，按既有上限重读若干次；
 - 只有确认回到目标 App 的 Home/Services 页（前台仍是目标包且无遮挡）才继续导航；
-- 若返回后层级不可读或无法确认，记 `stale_page_refresh_unconfirmed` 并停止；
-- 若返回后可读但不是目录页，记 `stale_page_refresh_failed` 并停止；
+- 若返回后层级持续不可读或无法确认，记 `stale_page_refresh_unconfirmed` 并停止；
+- 若返回后可读但不是目录页，且也不是目标 App 的签到页，记 `stale_page_refresh_failed` 并停止；
 - 若返回后目标 App 已不在前台（例如退到了桌面/Launcher），记 `app_left_foreground`（机器码复用 FR-013 的 `target_app_not_foreground`）并停止，且不把该前台包记录为弹窗遮挡。
 
-以上任何一种情况都在任何 tap 之前停止（`clicked=false`），不尝试自动拉起或重新启动 App；恢复动作由用户手动完成。
+**BACK 被吞时的回退（ADR-0002）**：部分 App 构建会忽略签到页上的 BACK（实测连续按键后层级字节完全不变）。当 BACK 后仍满足「目标 App 前台 + 无外部窗口 + 层级确认签到页」时，程序不再判刷新失败，而是继续使用该页并进入正常状态机。所有门禁保持不变：每轮重新观察 route/mode/前台，点击前再次复核，`success=true` 仍要求当天日期。该路径在事件中记录 `fallback=continue_on_checkin_page`，结果中表现为 `page_refresh_attempted=true` + `page_refresh_confirmed=false`。
+
+除上述回退外，任何无法确认的情况都在任何 tap 之前停止（`clicked=false`），不尝试自动拉起或重新启动 App；恢复动作由用户手动完成。
 
 ## 成功判定
 

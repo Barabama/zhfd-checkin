@@ -16,6 +16,7 @@
 | [CHECKIN_SAFETY.md](./CHECKIN_SAFETY.md) | 页面路由、签到业务类型、点击门禁、成功日期、证据边界 |
 | [PRODUCT_AND_ARCHITECTURE.md](./PRODUCT_AND_ARCHITECTURE.md) | 产品职责、目标架构、Phase 状态与系统级待办 |
 | [ENGINEERING_AND_RELEASE.md](./ENGINEERING_AND_RELEASE.md) | Cargo 项目布局、代码维护、CI/构建/打包与发布状态 |
+| [adr/](./adr/) | 对冻结决策的修订记录（外勤 opt-in、BACK 回退、迁移持久化） |
 | [audits/](./audits/) | 独立审计、修复复核及对应工程记录 |
 | [archive/2026-10-11/](./archive/2026-10-11/) | 历史原件归档 |
 
@@ -44,10 +45,20 @@
 
 ## 当前审计证据
 
-- [独立审计报告](./audits/PHASE4_INDEPENDENT_AUDIT_REPORT_2026-10-11.md)：包含完整测试矩阵、原始 findings 与 P2 修复后复核。当前两项 P2 已有独立证据关闭；Phase 4 整体仍因没有真实 LDPlayer、多实例级联、完整 GUI 视觉和 GitHub workflow 运行而未完成验收。
+- [V0.3.1 独立审计报告（2026-10-18）](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)：针对 `master` `e135369` / `v0.3.1` `9a66664`。结论为**不构成独立验收通过**，列出 P1（数据丢失、迁移持久化、计划任务路径、日期作用域、Setup 门禁、live 目标快照等）与设备/CI 证据缺口。
+- [v0.3.0 独立审计报告（2026-10-12）](./V0.3.0_INDEPENDENT_AUDIT_REPORT_2026-10-12.md)：针对 `c4b3bc4` 的历史审计，**不代表当前 master**。
+- [Phase 4 独立审计报告](./audits/PHASE4_INDEPENDENT_AUDIT_REPORT_2026-10-11.md)：更早的 Phase 4 审计与 P2 修复复核，同样属于历史证据。
 - [P2 修复说明](./audits/PHASE4_P2_REMEDIATION_2026-10-11.md)：实现侧变更范围。
 - [审计提示词](./audits/PHASE4_INDEPENDENT_AUDIT_PROMPT_2026-10-10.md)：审计能力、设备安全边界和复核要求。
 - [工程记录](./audits/PHASE4_ENGINEERING_NOTES_2026-10-10.md)：Phase 4 技术决策与剩余审计范围。
+
+## 决策修订（ADR）
+
+| ADR | 内容 |
+|---|---|
+| [ADR-0001](./adr/ADR-0001-field-work-live-opt-in.md) | 外勤签到 live 显式 opt-in（修订 D-08） |
+| [ADR-0002](./adr/ADR-0002-swallowed-back-fallback.md) | BACK 被 App 吞掉时继续使用已确认签到页 |
+| [ADR-0003](./adr/ADR-0003-recorded-data-root.md) | 持久化 GUI 迁移后的数据目录（修订 D-01） |
 
 ## 重复度盘点及归档说明
 

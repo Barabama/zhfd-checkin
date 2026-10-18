@@ -1140,13 +1140,23 @@ fn task_command(command: TaskCommand, config_path: Option<&Path>) -> Result<Exit
             } else {
                 "run --dry-run"
             };
-            let task_run = build_task_command_line(&exe, mode, all_instances, &target, config_path);
+            // Load first so the task pins the *resolved absolute* config path.
+            // A relative `--config` would otherwise be stored verbatim and
+            // resolved against the Task Scheduler's own working directory
+            // (System32), where the loader could even create a default config.
+            let store = load_store_for_cli(config_path)?;
+            let task_run = build_task_command_line(
+                &exe,
+                mode,
+                all_instances,
+                &target,
+                Some(store.path.as_path()),
+            );
             // `schtasks /TR` stores its value verbatim as the action's command
             // line. The value already quotes the executable, so wrapping the
             // whole thing in a second pair of quotes makes the Task Scheduler
             // parse the action as a program named `""` and fail to launch it
             // with 2147942487 (E_INVALIDARG). Pass it through unwrapped.
-            let store = load_store_for_cli(config_path)?;
             let start = store.config.window.start.clone();
             let output = process::command("schtasks.exe")
                 .args([
@@ -1878,7 +1888,12 @@ fn extract_dates_from_text(text: &str) -> Vec<chrono::NaiveDate> {
 ///
 /// The result stays `None` unless exactly one contextual date exists and every
 /// date on the page agrees with it, so conflicting evidence fails closed.
-fn extract_hierarchy_date(xml: &str) -> Option<chrono::NaiveDate> {
+///
+/// Nodes that declare a `package` other than `target_package` are ignored
+/// entirely: a status-bar clock, a foreign overlay, or a hidden system node
+/// must never supply (or veto) the check-in date. Nodes without a `package`
+/// attribute are kept, matching [`PageView::parse`].
+fn extract_hierarchy_date(xml: &str, target_package: &str) -> Option<chrono::NaiveDate> {
     let mut all_dates = Vec::new();
     let mut contextual_dates = Vec::new();
     // Labels of the previous sibling node, used to anchor a split value.
@@ -1889,6 +1904,13 @@ fn extract_hierarchy_date(xml: &str) -> Option<chrono::NaiveDate> {
             continue;
         };
         let body = &chunk[..tag_end];
+        if let Some(package) = attribute_value(body, "package")
+            && !package.is_empty()
+            && package != target_package
+        {
+            // Foreign window: contributes neither dates nor an anchor.
+            continue;
+        }
         let text = attribute_value(body, "text").unwrap_or("");
         let content_desc = attribute_value(body, "content-desc").unwrap_or("");
         let labels: Vec<String> = [text, content_desc]
@@ -2368,7 +2390,7 @@ where
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
-            match extract_hierarchy_date(success_document) {
+            match extract_hierarchy_date(success_document, &store.config.app.package_name) {
                 Some(detected_date) => {
                     let today = domain::configured_date(&store.config.window.timezone)?;
                     result.success_date = Some(detected_date.to_string());
@@ -4005,6 +4027,12 @@ mod tests {
     /// Test-only package scope for hand-written hierarchy fixtures.
     const TEST_PACKAGE: &str = "cn.edu.fzu.fdxypa";
 
+    /// Success-date parsing in tests always scopes to the target package,
+    /// matching the production call site.
+    fn parse_success_date(xml: &str) -> Option<chrono::NaiveDate> {
+        super::extract_hierarchy_date(xml, TEST_PACKAGE)
+    }
+
     /// Parse a hand-written XML fixture the way the run loop does. Fixtures
     /// without a `package` attribute stay in scope, so existing expectations
     /// are unchanged by package scoping.
@@ -4851,23 +4879,20 @@ mod tests {
     #[test]
     fn success_date_parser_supports_chinese_and_numeric_formats() {
         assert_eq!(
-            super::extract_hierarchy_date(r#"<node text="签到成功：2026年10月10日"/>"#),
+            parse_success_date(r#"<node text="签到成功：2026年10月10日"/>"#),
             chrono::NaiveDate::from_ymd_opt(2026, 10, 10)
         );
         assert_eq!(
-            super::extract_hierarchy_date(r#"<node text="日期 2026-10-10"/>"#),
+            parse_success_date(r#"<node text="日期 2026-10-10"/>"#),
             chrono::NaiveDate::from_ymd_opt(2026, 10, 10)
         );
-        assert_eq!(
-            super::extract_hierarchy_date(r#"<node text="没有日期"/>"#),
-            None
-        );
+        assert_eq!(parse_success_date(r#"<node text="没有日期"/>"#), None);
     }
 
     #[test]
     fn unrelated_update_date_is_not_accepted_as_success_date() {
         let hierarchy = r#"<node text="签到成功"/><node text="上次更新 2026-10-11"/>"#;
-        assert_eq!(super::extract_hierarchy_date(hierarchy), None);
+        assert_eq!(parse_success_date(hierarchy), None);
     }
 
     #[test]
@@ -4887,7 +4912,7 @@ mod tests {
             r#"<node text="签到成功"/>"#
         );
         assert_eq!(
-            super::extract_hierarchy_date(hierarchy),
+            parse_success_date(hierarchy),
             chrono::NaiveDate::from_ymd_opt(2026, 10, 17)
         );
     }
@@ -4903,7 +4928,7 @@ mod tests {
             r#"<node text="2026-10-17 22:37:10"/>"#
         );
         assert_eq!(
-            super::extract_hierarchy_date(hierarchy),
+            parse_success_date(hierarchy),
             chrono::NaiveDate::from_ymd_opt(2026, 10, 17)
         );
     }
@@ -4917,19 +4942,48 @@ mod tests {
             r#"<node text="2026-10-17 星期六"/>"#,
             r#"<node text="上次更新 2026-10-16"/>"#
         );
-        assert_eq!(super::extract_hierarchy_date(hierarchy), None);
+        assert_eq!(parse_success_date(hierarchy), None);
     }
 
     #[test]
     fn success_banner_does_not_anchor_an_unrelated_date() {
         // A result banner must not lend its context to the next node.
         let hierarchy = r#"<node text="签到成功"/><node text="2026-10-11"/>"#;
-        assert_eq!(super::extract_hierarchy_date(hierarchy), None);
+        assert_eq!(parse_success_date(hierarchy), None);
     }
+
+    #[test]
+    fn foreign_package_dates_never_supply_or_veto_the_success_date() {
+        // A status-bar or system node with a different package must not add a
+        // date (which would trip the all-dates-agree rule) nor anchor one.
+        let hierarchy = concat!(
+            r#"<node package="com.android.systemui" content-desc="date"/>"#,
+            r#"<node package="com.android.systemui" text="2026-10-16 星期五"/>"#,
+            r#"<node package="cn.edu.fzu.fdxypa" content-desc="date"/>"#,
+            r#"<node package="cn.edu.fzu.fdxypa" text="2026-10-17 星期六"/>"#,
+            r#"<node package="cn.edu.fzu.fdxypa" text="已签到："/>"#,
+            r#"<node package="cn.edu.fzu.fdxypa" text="2026-10-17 22:37:10"/>"#
+        );
+        assert_eq!(
+            parse_success_date(hierarchy),
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 17)
+        );
+    }
+
+    #[test]
+    fn foreign_package_date_alone_is_not_a_success_date() {
+        let hierarchy = concat!(
+            r#"<node package="cn.edu.fzu.fdxypa" text="签到成功"/>"#,
+            r#"<node package="com.android.systemui" content-desc="date"/>"#,
+            r#"<node package="com.android.systemui" text="2026-10-17"/>"#
+        );
+        assert_eq!(parse_success_date(hierarchy), None);
+    }
+
     #[test]
     fn hierarchy_date_is_unknown_when_success_and_unrelated_dates_conflict() {
         let hierarchy = r#"<node text="2026年10月11日"/><node text="签到成功：2026年10月10日"/>"#;
-        assert_eq!(super::extract_hierarchy_date(hierarchy), None);
+        assert_eq!(parse_success_date(hierarchy), None);
     }
 
     #[test]

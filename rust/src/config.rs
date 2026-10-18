@@ -216,6 +216,10 @@ pub enum ConfigOrigin {
     Explicit,
     Portable,
     LocalAppData,
+    /// A data root chosen through the GUI migration flow. It is recorded in a
+    /// per-user pointer file so a restart does not silently fall back to the
+    /// source root (ADR-0003).
+    Recorded,
 }
 
 impl ConfigStore {
@@ -234,6 +238,17 @@ impl ConfigStore {
         }
 
         let portable_root = exe_root()?;
+        // A root chosen through the GUI migration flow wins over the portable
+        // and LocalAppData candidates; otherwise a successful migration would
+        // silently revert on the next start. Explicit `--config` still wins.
+        if let Some(recorded_config) = read_recorded_root() {
+            let root = recorded_config
+                .parent()
+                .context("已记录的数据目录没有父目录")?
+                .to_path_buf();
+            return Self::load_root(root, recorded_config, ConfigOrigin::Recorded, false);
+        }
+
         let portable_config = portable_root.join("config.toml");
         if portable_config.is_file() {
             // A present but invalid portable config must be repaired in place;
@@ -387,7 +402,21 @@ impl ConfigStore {
         Self::load_root(root, path, ConfigOrigin::Explicit, false)
     }
 
+    /// Overwrite the on-disk config with the current in-memory value.
+    ///
+    /// A store built by [`ConfigStore::recovery`] holds `Config::default()`,
+    /// not the user's damaged file. Writing it would silently destroy the
+    /// original settings, so ordinary saves are refused while a recovery error
+    /// is present. Repair must go through [`ConfigStore::save_candidate`], which
+    /// is the explicit "apply this configuration" action.
     pub fn save(&self) -> Result<()> {
+        if let Some(error) = &self.recovery_error {
+            anyhow::bail!(
+                "配置文件尚未修复，拒绝用默认配置覆盖: {}（原始错误: {}）",
+                self.path.display(),
+                error
+            );
+        }
         write_config(&self.root, &self.path, &self.config)
     }
 
@@ -417,6 +446,15 @@ impl ConfigStore {
     /// Copy this complete data root to a user-selected directory without
     /// changing the current store until the destination has a valid config.
     pub fn migrate_to_root(&self, destination: &Path) -> Result<Self> {
+        // A recovery store holds defaults, not the user's damaged file. Copying
+        // it would create a destination config that never existed.
+        if let Some(error) = &self.recovery_error {
+            anyhow::bail!(
+                "配置文件尚未修复，拒绝迁移: {}（原始错误: {}）",
+                self.path.display(),
+                error
+            );
+        }
         let destination = if destination.is_absolute() {
             destination.to_path_buf()
         } else {
@@ -454,9 +492,20 @@ impl ConfigStore {
         let origin = if local_app_data_root().as_deref() == Some(destination.as_path()) {
             ConfigOrigin::LocalAppData
         } else {
-            ConfigOrigin::Explicit
+            ConfigOrigin::Recorded
         };
         Self::load_root(destination, destination_config, origin, false)
+    }
+
+    /// Persist this store's config path as the user's chosen data root
+    /// (ADR-0003).
+    ///
+    /// Kept separate from [`ConfigStore::migrate_to_root`] so the library test
+    /// suite never touches the real `%LOCALAPPDATA%` pointer. The GUI calls this
+    /// after a successful migration; a failure means the copy succeeded but the
+    /// next start would fall back to the source root.
+    pub fn record_current_root(&self) -> Result<()> {
+        record_root(&self.path)
     }
 }
 
@@ -539,6 +588,57 @@ fn local_app_data_root() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
     base.map(|path| path.join("ZHFDCheckin"))
+}
+
+/// Per-user file that records the data root chosen through migration.
+///
+/// It lives in the LocalAppData root rather than beside the EXE so moving the
+/// portable directory does not silently change which data root is used.
+fn recorded_root_file() -> Option<PathBuf> {
+    local_app_data_root().map(|root| root.join("data-root.txt"))
+}
+
+/// Absolute config path previously chosen by the user, if it still exists.
+///
+/// A missing, unreadable, relative, or nonexistent pointer is ignored so a
+/// broken pointer can never block startup; the normal candidate chain applies.
+fn read_recorded_root() -> Option<PathBuf> {
+    read_recorded_root_from(&recorded_root_file()?)
+}
+
+fn read_recorded_root_from(file: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(file).ok()?;
+    let path = PathBuf::from(text.trim());
+    (path.is_absolute() && path.is_file()).then_some(path)
+}
+
+/// Persist the migrated config path (ADR-0003).
+fn record_root(config_path: &Path) -> Result<()> {
+    record_root_in(
+        &recorded_root_file().context("无法确定数据目录指针位置")?,
+        config_path,
+    )
+}
+
+fn record_root_in(file: &Path, config_path: &Path) -> Result<()> {
+    let parent = file.parent().context("数据目录指针没有父目录")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("无法创建数据目录指针目录: {}", parent.display()))?;
+    let temp = unique_sibling_temp(file)?;
+    let text = format!("{}\n", config_path.display());
+    let written = (|| -> Result<()> {
+        fs::write(&temp, text.as_bytes())
+            .with_context(|| format!("写入数据目录指针失败: {}", temp.display()))?;
+        if let Ok(handle) = fs::File::open(&temp) {
+            let _ = handle.sync_all();
+        }
+        atomic_replace(&temp, file)
+            .with_context(|| format!("原子替换数据目录指针失败: {}", file.display()))
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 fn probe_writable(root: &Path) -> Result<()> {
@@ -801,6 +901,59 @@ mod tests {
             path_for_config(root, Path::new(r"D:\downloads\zhfd.apk")),
             r"D:\downloads\zhfd.apk"
         );
+    }
+
+    #[test]
+    fn save_is_refused_while_a_recovery_error_is_present() {
+        let root = std::env::temp_dir().join(format!("zhfd-recovery-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "[broken").unwrap();
+        let mut store = ConfigStore {
+            root: root.clone(),
+            path: path.clone(),
+            config: Config::default(),
+            origin: ConfigOrigin::Explicit,
+            created_default: false,
+            recovery_error: Some("parse error".into()),
+        };
+        // A recovery store must never overwrite the damaged file with defaults.
+        assert!(store.save().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[broken");
+        // The explicit repair action is still allowed and clears the error.
+        store.save_candidate(Config::default()).unwrap();
+        assert!(store.recovery_error.is_none());
+        assert!(fs::read_to_string(&path).unwrap().contains("package_name"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recorded_root_round_trips_and_invalid_pointers_are_ignored() {
+        let root = std::env::temp_dir().join(format!("zhfd-recorded-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let pointer = root.join("data-root.txt");
+        let config = root.join("root").join("config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "config").unwrap();
+
+        record_root_in(&pointer, &config).unwrap();
+        assert_eq!(read_recorded_root_from(&pointer), Some(config.clone()));
+
+        // A relative pointer is refused.
+        fs::write(&pointer, "config.toml\n").unwrap();
+        assert_eq!(read_recorded_root_from(&pointer), None);
+
+        // A pointer to a missing file is refused.
+        fs::write(&pointer, root.join("missing.toml").display().to_string()).unwrap();
+        assert_eq!(read_recorded_root_from(&pointer), None);
+
+        // A missing pointer file is refused, not an error.
+        fs::remove_file(&pointer).unwrap();
+        assert_eq!(read_recorded_root_from(&pointer), None);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

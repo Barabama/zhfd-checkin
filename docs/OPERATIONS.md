@@ -1,14 +1,22 @@
 # Windows 安装、配置与运维
 
-更新时间：2026-10-14（Asia/Shanghai）
+更新时间：2026-10-18（Asia/Shanghai）
 
 > 第一次使用请先阅读 [QUICK_START.md](./QUICK_START.md)；本文件用于补充路径、实例、CLI、数据目录和长期运维细节。
 
 ## 便携部署
 
-发布包包含 CLI 与 GUI 两个 EXE。首次运行在 EXE 同目录创建 `config.toml`、`logs/`、`captures/`、`reports/`。当前 Cargo package 元数据为 `0.3.0`；源码工作区构建不等同正式发布包。
+发布包包含 CLI 与 GUI 两个 EXE。首次运行在 EXE 同目录创建 `config.toml`、`logs/`、`captures/`、`reports/`、`backups/`。当前 Cargo package 元数据为 `0.3.2`；源码工作区构建不等同正式发布包。
 
 配置默认跟随 EXE 所在目录，因此推荐将整个目录放在可写位置，而不是 `Program Files` 只读目录。便携包不应包含用户 config、日志、截图或模拟器状态。
+
+## 数据目录迁移
+
+GUI「首次设置 / 配置修复」页提供数据目录迁移。迁移会先把源配置备份到 `backups/`，复制 `logs/`、`captures/`、`reports/`、`backups/`，在目标写入并验证 `config.toml` 后才切换；源目录保留不删除。
+
+迁移成功后会写入用户级指针 `%LOCALAPPDATA%\ZHFDCheckin\data-root.txt`（目标 `config.toml` 的绝对路径），后续启动优先使用该目录，避免重启后退回源目录（ADR-0003）。显式 `--config` 仍拥有最高优先级。删除该指针文件即可回滚到原有路径选择顺序。
+
+损坏配置处于 Repair 状态时，普通保存和迁移都会被拒绝，避免把默认配置覆盖到原文件；请在 Repair 页显式完成修复后再操作。
 
 ## Windows TOML 路径
 
