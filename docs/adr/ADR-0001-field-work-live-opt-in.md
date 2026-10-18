@@ -1,7 +1,7 @@
 # ADR-0001：外勤签到 live 显式 opt-in
 
 - 状态：已接受（事后补记，2026-10-18）
-- 变更日期：2026-10-14（`v0.3.1` / `9a66664`）
+- 变更日期：2026-10-14（`v0.3.1` / `a955d0a`）
 - 影响决策：`docs/V0.3.0_DECISIONS.md` D-08；`docs/V0.3.0_FIRST_RUN_AND_RECOVERY_REQUIREMENTS.md` §10
 
 ## 背景
