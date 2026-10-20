@@ -1,6 +1,6 @@
 # 当前状态（唯一事实源）
 
-- 最后核对：2026-10-20（Asia/Shanghai）
+- 最后核对：2026-10-21（Asia/Shanghai）
 - 仓库：`https://github.com/Barabama/zhfd-checkin`
 - 本文件是**当前状态的唯一事实源**。其他文档只描述稳定知识；状态数字以这里为准。
 
@@ -9,14 +9,14 @@
 | 项目 | 值 |
 |---|---|
 | 默认分支 | `master` |
-| HEAD | `1b1931f`（docs: privacy history rewrite note） |
-| HEAD 与远端 | 与 `origin/master` 同步 |
-| Cargo 版本 | `0.3.2` |
-| `v0.3.2` tag commit | `8d3f58e`（HEAD 比它多 2 个 docs-only 提交） |
-| 最新 GitHub Release | `v0.3.2` |
-| Release 资产 | `zhfd-checkin-windows-x64-v0.3.2-d63d3b3a38af.zip`（资产名保留打包时的旧 commit；二进制代码与 `8d3f58e` 相同） |
+| HEAD（代码合并） | `394b078`（PR #1 squash merge） |
+| HEAD 与远端 | 与 `origin/master` 同步；tag 前可能有 docs-only 提交 |
+| Cargo 版本 | `0.3.3` |
+| `v0.3.3` tag commit | 本文件随后的发布提交（`git rev-list -n1 v0.3.3`） |
+| 最新 GitHub Release | `v0.3.3`（由 tag 触发的 release workflow 生成） |
+| Release 资产 | 由 release workflow 生成，名称包含打包 commit 短 SHA |
 
-> 未发布分支：`feat/auto-login` 实现了默认关闭的登录页「一键登录」（[ADR-0004](./adr/ADR-0004-auto-login-opt-in.md)），尚未合并、发布或完成现场 live 验证。master 行为仍与 `v0.3.2` 一致。
+> `v0.3.3` 已合并：默认关闭的登录页「一键登录」（[ADR-0004](./adr/ADR-0004-auto-login-opt-in.md)）、LDPlayer 预设对齐、`page`/`foreground`/`auto_login` 分层。Live 一键登录已在 index 0 验证一次；完整签到 live 与独立审计仍未完成。master 行为相对 v0.3.2 新增了上述特征。
 
 ### tag → commit
 
@@ -27,6 +27,7 @@
 | `v0.3.0` | `06dfaf4` |
 | `v0.3.1` | `a955d0a` |
 | `v0.3.2` | `8d3f58e` |
+| `v0.3.3` | 发布提交（`git rev-list -n1 v0.3.3`） |
 
 > 2026-10-18 重写过 git 历史以移除 fixture PII。重写前的 SHA（例如 `e135369`、`9a66664`、`c4b3bc4`）在本地已不可解析；历史文档中的这些 SHA 只应标注为 pre-rewrite 引用。
 
@@ -35,7 +36,7 @@
 ```text
 cargo fmt --all -- --check                     ✅
 cargo clippy --all-targets --all-features -D warnings  ✅
-cargo test --lib                               ✅ 153 passed（分支；v0.3.2 tag 为 140）
+cargo test --lib                               ✅ 153 passed（v0.3.3；v0.3.2 tag 为 140）
 cargo test --all-targets                       ✅ lib 153 + bin 153（同一批测试跑两次）
 cargo build --release --bins                   ✅
 ```
@@ -60,7 +61,8 @@ cargo build --release --bins                   ✅
 - 最新独立审计：`docs/audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md`（对象 `e135369` / `v0.3.1`；pre-rewrite SHA）。
 - 该审计结论是「不构成独立验收通过」，列出 9 个 P1。
 - v0.3.2 修复了其中 P1-1/P1-2/P1-3/P1-6/P1-7/P1-8；P1-9 通过 ADR-0002 与文档更新解决。
-- **v0.3.2 尚无独立审计报告。**
+- **v0.3.2 / v0.3.3 尚无独立审计报告。**
+- v0.3.3 新增的自动登录、预设 DPI 调整与模块拆分尚未经过独立审计；现场只完成一次 live 一键登录与一次 720x1280@320 dry-run。
 - 未关闭项：
   - **P1-4**：release workflow 不绑定 tag 名 / Cargo 版本 / tag 目标；`workflow_dispatch` 可在任意分支运行。
   - **P2-26**：release 不依赖 CI；Python/Node 门禁不在 release workflow 中；CI 在 Python/Node 之前上传 artifact。
@@ -82,7 +84,7 @@ cargo build --release --bins                   ✅
 ```powershell
 git status -sb
 git log --oneline -3
-git rev-list -n1 v0.3.2
+git rev-list -n1 v0.3.3
 git tag --list
 cd rust; cargo test --lib
 ```

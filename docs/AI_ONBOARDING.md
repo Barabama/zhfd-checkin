@@ -51,7 +51,7 @@
 git status -sb
 git log --oneline -5
 git tag --list
-git rev-list -n1 v0.3.2
+git rev-list -n1 v0.3.3
 cd rust
 cargo test --lib          # 预期 153 passed（v0.3.2 tag 为 140）
 ```
@@ -398,7 +398,7 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 ## 13. 审计与未关闭项
 
 - 最新审计：[V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)。
-- v0.3.2 修复了其中大部分 P1，但 **v0.3.2 本身尚未独立审计**。
+- v0.3.2 修复了其中大部分 P1，但 **v0.3.2 / v0.3.3 本身尚未独立审计**；v0.3.3 的自动登录与预设调整同样未审计。
 - 仍未关闭：
   - release workflow 不绑定 tag/版本，`workflow_dispatch` 无 ref 限制；
   - release 不依赖 CI，且不跑 Python/Node；
