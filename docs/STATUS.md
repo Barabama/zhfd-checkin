@@ -9,12 +9,12 @@
 | 项目 | 值 |
 |---|---|
 | 默认分支 | `master` |
-| HEAD（代码合并） | `394b078`（PR #1 squash merge） |
+| HEAD（发布） | `de2cc8d`（`v0.3.3` tag；后续 docs 提交见 `origin/master`） |
 | HEAD 与远端 | 与 `origin/master` 同步；tag 前可能有 docs-only 提交 |
 | Cargo 版本 | `0.3.3` |
-| `v0.3.3` tag commit | 本文件随后的发布提交（`git rev-list -n1 v0.3.3`） |
-| 最新 GitHub Release | `v0.3.3`（由 tag 触发的 release workflow 生成） |
-| Release 资产 | 由 release workflow 生成，名称包含打包 commit 短 SHA |
+| `v0.3.3` tag commit | `de2cc8d` |
+| 最新 GitHub Release | `v0.3.3` |
+| Release 资产 | `zhfd-checkin-windows-x64-v0.3.3-de2cc8df9085.zip` |
 
 > `v0.3.3` 已合并：默认关闭的登录页「一键登录」（[ADR-0004](./adr/ADR-0004-auto-login-opt-in.md)）、LDPlayer 预设对齐、`page`/`foreground`/`auto_login` 分层。Live 一键登录已在 index 0 验证一次；完整签到 live 与独立审计仍未完成。master 行为相对 v0.3.2 新增了上述特征。
 
@@ -27,7 +27,7 @@
 | `v0.3.0` | `06dfaf4` |
 | `v0.3.1` | `a955d0a` |
 | `v0.3.2` | `8d3f58e` |
-| `v0.3.3` | 发布提交（`git rev-list -n1 v0.3.3`） |
+| `v0.3.3` | `de2cc8d` |
 
 > 2026-10-18 重写过 git 历史以移除 fixture PII。重写前的 SHA（例如 `e135369`、`9a66664`、`c4b3bc4`）在本地已不可解析；历史文档中的这些 SHA 只应标注为 pre-rewrite 引用。
 

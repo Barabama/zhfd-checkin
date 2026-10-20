@@ -23,7 +23,7 @@ CLI/GUI 共享业务函数，不把 UI 的按钮/输入当作第二套业务策�
 ## 版本与发布状态
 
 - Cargo package 元数据当前是 `0.3.3`；
-- 已发布 tag：`v0.1.0`（`87658fe`）、`v0.2.0`（`5835e9d`）、`v0.3.0`（`06dfaf4`）、`v0.3.1`（`a955d0a`）、`v0.3.2`（`8d3f58e`）、`v0.3.3`（发布提交，见 `git rev-list -n1 v0.3.3`）；
+- 已发布 tag：`v0.1.0`（`87658fe`）、`v0.2.0`（`5835e9d`）、`v0.3.0`（`06dfaf4`）、`v0.3.1`（`a955d0a`）、`v0.3.2`（`8d3f58e`）、`v0.3.3`（`de2cc8d`）；
 - `v0.3.3` 包含默认关闭的登录页一键登录、LDPlayer 预设对齐和
   `page`/`foreground`/`auto_login` 模块拆分；
 - `v0.3.2` 包含 v0.3.1 之后的计划任务引号、成功日期作用域、数据根目录持久化、
@@ -32,7 +32,8 @@ CLI/GUI 共享业务函数，不把 UI 的按钮/输入当作第二套业务策�
   `zhfd-checkin-windows-x64-v0.3.1-9a666641c872.zip`（资产名保留打包时的旧 commit）；
 - `v0.3.2` 的 GitHub Release 资产为
   `zhfd-checkin-windows-x64-v0.3.2-d63d3b3a38af.zip`；两版资产只含 EXE 与 README；
-- `v0.3.3` 的 GitHub Release 由 tag 触发的 release workflow 生成；资产名包含打包 commit 短 SHA；
+- `v0.3.3` 的 GitHub Release 资产为
+  `zhfd-checkin-windows-x64-v0.3.3-de2cc8df9085.zip`，由 tag 触发的 release workflow 生成；
 - 详细审计与未完成项见
   [V0.3.1 独立审计报告](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)；
 - 本地工作区不等于发布，tag/Release 仍须独立验收与用户明确批准。
