@@ -629,6 +629,20 @@ fn run_result_status(result: &RunResult) -> String {
     }
 }
 
+fn auto_login_status(result: &RunResult) -> Option<&'static str> {
+    if result.auto_login_attempted == Some(true) {
+        return Some(match result.auto_login_succeeded {
+            Some(true) => "已执行一键登录，并确认离开登录页",
+            Some(false) => "已执行一键登录，但未确认成功",
+            None => "已执行一键登录，结果未知",
+        });
+    }
+    if result.auto_login_ready == Some(true) {
+        return Some("dry-run：登录页前置条件满足，未点击");
+    }
+    None
+}
+
 fn explain_error(error: &str) -> &'static str {
     match error {
         "unknown_state" => "视觉状态未能确认；请查看最新日志截图。",
@@ -670,7 +684,26 @@ fn explain_error(error: &str) -> &'static str {
         "success_stale" => "成功页面显示的日期不是今天；不能视为本次签到成功。",
         "success_date_unknown" => "页面未提供可确认的成功日期；请人工核对。",
         "app_start_timeout" => "目标 App 未能进入前台；请手动打开 App 并完成登录。",
-        "login_required" => "需要手动登录；程序不会输入凭据或自动点击登录。",
+        "login_required" => {
+            "需要登录：请手动登录；或显式启用 runtime.allow_auto_login 后重试（仅一键登录，默认关闭）。"
+        }
+        "auto_login_terms_not_accepted" => {
+            "自动登录未获授权代勾选协议；请设置 runtime.accept_login_terms = true，或手动登录。"
+        }
+        "auto_login_consent_not_found" | "auto_login_consent_unconfirmed" => {
+            "无法确认登录页协议复选框；程序未点击登录，请手动登录。"
+        }
+        "auto_login_button_ambiguous" => {
+            "登录页的“一键登录”按钮缺失或不唯一；程序未点击，请手动登录。"
+        }
+        "auto_login_account_mismatch" | "auto_login_account_unknown" => {
+            "登录页账号无法确认或与配置不符；程序未点击登录。"
+        }
+        "auto_login_blocked" => {
+            "登录过程中出现外部窗口/弹窗或 App 离开前台；程序已停止，未继续点击。"
+        }
+        "auto_login_timeout" => "一键登录后未在超时内离开登录页；程序未重试，请人工核对登录状态。",
+        "auto_login_not_confirmed" => "登录后页面证据不可读；程序已停止，未继续签到。",
         "navigation_not_confirmed" => "未能确认进入晚点名签到页；请手动导航后重试。",
         "page_context_changed" => "运行中页面/签到模式发生变化；安全策略已停止自动点击。",
         "hierarchy_unavailable" => "无法读取页面结构；为安全起见没有继续点击。",
@@ -828,7 +861,7 @@ impl GuiApp {
             .default_open(true)
             .show(ui, |ui| {
                 ui.label("设备未连接 / ADB 失败：确认模拟器已启动、配置的实例与 serial 正确，再运行环境诊断。");
-                ui.label("需要登录：在模拟器中手动登录后重新运行；程序不会自动登录。");
+                ui.label("需要登录：默认需在模拟器中手动登录；若已显式开启自动登录，程序会先尝试一次一键登录，失败则停止并提示。");
                 ui.label("检测到弹窗或广告：按提示在模拟器中手动关闭，再重试。程序不会自动关闭、同意或点击弹窗。");
                 ui.label("页面未确认、页面证据冲突或定位超时：停止并查看最新日志/截图；确认页面状态后再决定是否重试，不要反复盲目运行。");
                 ui.label("配置损坏：进入“首次设置 / 配置修复”检查原文件并按需修复；原配置不会被 CLI 静默重置。");
@@ -868,7 +901,7 @@ impl GuiApp {
             });
 
         ui.separator();
-        ui.label("安全边界：未知页面、证据不足或不支持的签到类型会停止；dry-run 不点击。普通 live 仍要求明确确认。外勤 live 还要求在 config.toml 中显式设置 runtime.allow_field_work_live = true；程序不自动登录、不自动同意、不自动关闭广告。");
+        ui.label("安全边界：未知页面、证据不足或不支持的签到类型会停止；dry-run 不点击。普通 live 仍要求明确确认。外勤 live 还要求在 config.toml 中显式设置 runtime.allow_field_work_live = true；登录页默认需手动登录，只有同时开启 allow_auto_login 与 accept_login_terms 才会执行一次一键登录（不输入凭据）。程序不会自动关闭广告。");
         if ui.button("打开安全策略说明").clicked() {
             self.tab = 8;
         }
@@ -1109,7 +1142,7 @@ impl GuiApp {
 
         ui.separator();
         ui.label(
-            "程序不会自动登录、不会输入账号/密码/验证码,也不会自动签到。首次 dry-run 默认只运行一个选中实例。",
+            "默认手动登录：程序不会输入账号/密码/验证码。只有在 config.toml 同时开启 runtime.allow_auto_login 与 runtime.accept_login_terms 时，live 运行才会在登录页执行一次一键登录。首次 dry-run 默认只运行一个选中实例。",
         );
     }
 
@@ -1328,6 +1361,9 @@ impl GuiApp {
                     if result.clicked { "是" } else { "否" }
                 ));
                 ui.label(format!("结果：{}", run_result_status(result)));
+                if let Some(auto_login) = auto_login_status(result) {
+                    ui.label(format!("自动登录：{auto_login}"));
+                }
             });
             if let Some(date) = &result.success_date {
                 ui.label(format!("页面日期：{date}"));
@@ -1546,7 +1582,11 @@ impl GuiApp {
                     ui.label("操作");
                     ui.end_row();
                     for p in ordered_profiles() {
-                        ui.label(p.id);
+                        if profile::is_ldplayer_preset(p.width, p.height, p.density_dpi) {
+                            ui.label(p.id);
+                        } else {
+                            ui.label(format!("{}（历史）", p.id));
+                        }
                         ui.label(format!("{}x{}", p.width, p.height));
                         ui.label(p.density_dpi.to_string());
                         ui.label(p.orientation.as_str());
@@ -2204,6 +2244,87 @@ impl GuiApp {
             }
         }
         ui.label("默认关闭。启用后仍需 --live --confirm、校准 Profile、时间窗口、目标 App 前台、连续 Ready，以及点击前 route/mode/前台二次复核；未知模式和证据冲突仍会停止。 ");
+        ui.separator();
+        ui.label("登录页自动登录（一键登录）");
+        ui.label("高风险：仅在登录页使用 App 记住的上次账号，不输入、不保存账号/密码/验证码。");
+        let mut allow_auto_login = self.store.config.runtime.allow_auto_login;
+        if ui
+            .checkbox(
+                &mut allow_auto_login,
+                "允许 live 运行在登录页执行一次一键登录",
+            )
+            .changed()
+        {
+            self.store.config.runtime.allow_auto_login = allow_auto_login;
+            match self.store.save() {
+                Ok(()) => {
+                    self.status = if allow_auto_login {
+                        "已启用自动登录；仍需单独授权代勾选协议。".into()
+                    } else {
+                        "已关闭自动登录；登录页将恢复为手动登录。".into()
+                    };
+                }
+                Err(error) => {
+                    self.store.config.runtime.allow_auto_login = !allow_auto_login;
+                    self.status = format!("保存自动登录设置失败：{error:#}");
+                }
+            }
+        }
+        let mut accept_login_terms = self.store.config.runtime.accept_login_terms;
+        if ui
+            .checkbox(
+                &mut accept_login_terms,
+                "允许程序在登录页代勾选《用户协议》《隐私协议》（代您作出同意）",
+            )
+            .changed()
+        {
+            self.store.config.runtime.accept_login_terms = accept_login_terms;
+            match self.store.save() {
+                Ok(()) => {
+                    self.status = if accept_login_terms {
+                        "已授权代勾选登录协议；该授权具有法律同意含义。".into()
+                    } else {
+                        "已撤销代勾选协议授权；自动登录将拒绝执行。".into()
+                    };
+                }
+                Err(error) => {
+                    self.store.config.runtime.accept_login_terms = !accept_login_terms;
+                    self.status = format!("保存协议授权失败：{error:#}");
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("期望账号（可留空）：");
+            let previous = self.store.config.runtime.auto_login_account.clone();
+            let mut account = previous.clone();
+            let response = ui.text_edit_singleline(&mut account);
+            if response.changed() {
+                self.store.config.runtime.auto_login_account = account.clone();
+            }
+            if response.lost_focus() {
+                match self.store.save() {
+                    Ok(()) => self.status = "已保存期望账号。".into(),
+                    Err(error) => {
+                        self.store.config.runtime.auto_login_account = previous;
+                        self.status = format!("保存期望账号失败：{error:#}");
+                    }
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("登录后等待秒数（5-120）：");
+            let mut timeout = self.store.config.runtime.auto_login_timeout_seconds;
+            if ui
+                .add(egui::DragValue::new(&mut timeout).range(5..=120))
+                .changed()
+            {
+                self.store.config.runtime.auto_login_timeout_seconds = timeout;
+                if let Err(error) = self.store.save() {
+                    self.status = format!("保存登录超时失败：{error:#}");
+                }
+            }
+        });
+        ui.label("默认关闭。即使开启，仍要求目标 App 前台、无外部窗口、唯一的“一键登录”按钮、账号匹配、协议复选框视觉确认和点击前二次观测；dry-run 永不点击，一次运行最多一次登录点击。");
         ui.separator();
         ui.label("当前配置内容");
         ui.code(toml::to_string_pretty(&self.store.config).unwrap_or_default());

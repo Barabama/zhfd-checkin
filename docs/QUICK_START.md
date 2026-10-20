@@ -60,7 +60,7 @@
 | 结果或现象 | 建议处理 |
 |---|---|
 | `device_setup_failed` / ADB 设备不可用 | 启动模拟器，确认路径、实例 index 和 serial，再回“环境诊断”复查。 |
-| `login_required` | 在模拟器中手动登录，再重新运行。程序不会自动登录。 |
+| `login_required` | 在模拟器中手动登录，再重新运行。默认不会自动登录；只有显式开启 `runtime.allow_auto_login` 与 `runtime.accept_login_terms` 后，live 运行才会尝试一次一键登录。 |
 | `overlay_present` | 根据日志中的包名检查遮挡窗口；在模拟器中手动关闭弹窗/广告后，再重新运行。程序不会自动关闭或点击弹窗。 |
 | `route_candidate_unconfirmed` | 不要让程序猜页面；查看最新截图和层级诊断，手动确认页面后再决定是否重试。 |
 | `route_evidence_conflict` | 截图和页面层级证据不一致；停止自动操作，检查模拟器和日志后再处理。 |

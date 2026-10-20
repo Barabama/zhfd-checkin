@@ -22,7 +22,7 @@ Infrastructure: ADB / LDPlayer / Windows process / TOML / files / image analysis
 Evidence: events.jsonl / result.json / screenshots / reports
 ```
 
-GUI 是应用服务的展示和用户动作入口，不应复制实例发现、视觉策略、Profile 判定或点击授权。实现当前仍将大量编排集中于 `rust/src/main.rs`，分层是持续演进目标，不把目标文档误读成已经拆分完成。
+GUI 是应用服务的展示和用户动作入口，不应复制实例发现、视觉策略、Profile 判定或点击授权。登录页一键登录已拆到 `rust/src/auto_login.rs`，通用页面模型在 `rust/src/page.rs`，前台检查在 `rust/src/foreground.rs`；其余运行编排仍集中于 `rust/src/main.rs`，分层是持续演进目标，不把目标文档误读成已经拆分完成。
 
 ## 当前阶段
 
@@ -34,15 +34,15 @@ GUI 是应用服务的展示和用户动作入口，不应复制实例发现、�
 | 3 GUI 信息架构 | 分组导航、Profile 排序、日志/事件证据浏览已实现 | 小窗口/缩放/长路径/大量日志仍未验收 |
 | 4 工程补齐 | APK ZIP/XML 边界、结果契约、身份保留、port 语义、构建溯源已实现 | CI/release runner 已实际运行；完整设备级验收仍未完成 |
 
-当前 `master` HEAD 为 `v0.3.2` 发布提交（计划任务、成功日期与审计 P1 修复）；已发布 tag `v0.3.1` 对应 `a955d0a`。
-当前状态的独立审计见 [V0.3.1 独立审计报告](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)。
+当前 `master` HEAD 为 `1b1931f`（`v0.3.2` 之后两个 docs-only 提交）；最新发布 tag `v0.3.2` 对应 `8d3f58e`，`v0.3.1` 对应 `a955d0a`。
+当前状态与未关闭项以 [STATUS.md](./STATUS.md) 为准；独立审计见 [V0.3.1 独立审计报告](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)。
 
 ## 当前仍待完成的系统级事项
 
-- 修复 V0.3.1 独立审计中的 P1 项（数据丢失、迁移持久化、任务绝对路径、日期作用域、Setup 门禁、live 目标快照）；
-- 窗口内三实例 dry-run 与真实 live / 外勤 live 验收；
+- 完成 `v0.3.2` 的独立审计（v0.3.1 审计中的 P1-1/2/3/6/7/8 已修复，P1-9 已由 ADR-0002 处理）；
+- release workflow 绑定 tag/版本并依赖 CI（审计 P1-4 / P2-26）；
+- 窗口内三实例 dry-run 与真实 live / 外勤 live 的设备级复验；
 - GUI 低分辨率、高 DPI、窄窗口、长中文路径、迁移中断、计划任务交互黑盒验收；
-- 发布 workflow 的 tag/版本绑定，以及 `v0.3.2` 的 CI 证据；
 - 架构拆分：把 `main.rs` 中的编排抽成应用服务，减少 GUI 对内部函数的直接依赖。
 
 审计历史与精确测试矩阵见 [文档索引](./README.md) 的 audit 链接。

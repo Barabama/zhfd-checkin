@@ -196,6 +196,85 @@ pub fn authorize_page_action(
     }
 }
 
+/// Evidence used to decide whether the one-click login may run.
+///
+/// This is a pure, device-free view of the facts collected from the page so
+/// the policy can be tested with counterexamples instead of a live emulator.
+/// The visual checkbox confirmation is deliberately *not* part of this struct:
+/// it is a separate, post-decision step because it requires a screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoLoginEvidence {
+    pub allow_auto_login: bool,
+    pub accept_login_terms: bool,
+    /// A window owned by another package is visible.
+    pub foreign_package: bool,
+    /// Number of clickable nodes labelled "一键登录".
+    pub login_button_count: usize,
+    /// A "上次使用过的账号" label was found.
+    pub account_present: bool,
+    /// `runtime.auto_login_account` is non-empty.
+    pub expected_account_configured: bool,
+    /// The displayed account equals the configured one.
+    pub account_matches: bool,
+    /// The agreement checkbox node could be located.
+    pub consent_node_present: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoLoginDecision {
+    /// `runtime.allow_auto_login` is off; do not even probe.
+    Disabled,
+    /// The page is not a login page.
+    NotLoginPage,
+    /// Dry-run: all preconditions hold, but nothing may be tapped.
+    Ready,
+    /// Live: all preconditions hold; the login tap may proceed.
+    Authorized,
+    /// A stable `auto_login_*` error code.
+    Refused(&'static str),
+}
+
+/// Authorize the login-page one-click action.
+///
+/// Order matters: the switch is checked first so a disabled config never even
+/// probes; page identity is next so non-login pages are untouched; then every
+/// piece of page evidence must be unambiguous. In dry-run the same gates run,
+/// but the result is [`AutoLoginDecision::Ready`] and the caller must not tap.
+pub fn authorize_auto_login(
+    route: PageRoute,
+    mode: Mode,
+    evidence: &AutoLoginEvidence,
+) -> AutoLoginDecision {
+    if !evidence.allow_auto_login {
+        return AutoLoginDecision::Disabled;
+    }
+    if route != PageRoute::Login {
+        return AutoLoginDecision::NotLoginPage;
+    }
+    if evidence.foreign_package {
+        return AutoLoginDecision::Refused("auto_login_blocked");
+    }
+    if evidence.login_button_count != 1 {
+        return AutoLoginDecision::Refused("auto_login_button_ambiguous");
+    }
+    if !evidence.consent_node_present {
+        return AutoLoginDecision::Refused("auto_login_consent_not_found");
+    }
+    if !evidence.accept_login_terms {
+        return AutoLoginDecision::Refused("auto_login_terms_not_accepted");
+    }
+    if !evidence.account_present {
+        return AutoLoginDecision::Refused("auto_login_account_unknown");
+    }
+    if evidence.expected_account_configured && !evidence.account_matches {
+        return AutoLoginDecision::Refused("auto_login_account_mismatch");
+    }
+    match mode {
+        Mode::DryRun => AutoLoginDecision::Ready,
+        Mode::Live => AutoLoginDecision::Authorized,
+    }
+}
+
 impl Mode {
     pub fn from_config(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -257,6 +336,30 @@ pub struct RunResult {
     pub dry_run_ready: bool,
     #[serde(default)]
     pub field_work_ready: bool,
+    /// One-click login was actually attempted (a login-page tap may have been
+    /// issued). `None` on historical results.
+    #[serde(default)]
+    pub auto_login_attempted: Option<bool>,
+    /// Dry-run only: the login page and every static precondition were present.
+    #[serde(default)]
+    pub auto_login_ready: Option<bool>,
+    /// The page was observed to leave the login page after the tap.
+    #[serde(default)]
+    pub auto_login_succeeded: Option<bool>,
+    /// Method used or proposed; currently always `one_click`.
+    #[serde(default)]
+    pub auto_login_method: Option<String>,
+    /// Whether an expected account was configured for comparison.
+    #[serde(default)]
+    pub auto_login_account_configured: Option<bool>,
+    /// Whether the displayed account matched the configured one. `None` when no
+    /// expected account is configured or no account label was found.
+    #[serde(default)]
+    pub auto_login_account_matched: Option<bool>,
+    /// Number of login-page taps issued (0 or 1). Separate from `clicked`,
+    /// which remains reserved for the check-in control.
+    #[serde(default)]
+    pub auto_login_tap_count: Option<u32>,
     #[serde(default)]
     pub page_route: Option<PageRoute>,
     #[serde(default)]
@@ -311,6 +414,17 @@ pub struct RunResult {
     #[serde(default)]
     pub build_id: Option<String>,
     pub error: Option<String>,
+}
+
+/// Record one stable machine failure on a run result.
+///
+/// Kept here (rather than in the run loop) so every layer that refuses an
+/// action writes the same four fields; `error_stage` names the boundary.
+pub fn set_run_failure(result: &mut RunResult, code: &str, stage: &str, recovery_action: &str) {
+    result.error = Some(code.into());
+    result.error_code = Some(code.into());
+    result.error_stage = Some(stage.into());
+    result.recovery_action = Some(recovery_action.into());
 }
 
 pub fn configured_date(timezone: &str) -> Result<NaiveDate> {
@@ -575,5 +689,104 @@ mod tests {
         assert_eq!(Mode::from_config("dry-run").unwrap(), Mode::DryRun);
         assert_eq!(Mode::from_config("LIVE").unwrap(), Mode::Live);
         assert!(Mode::from_config("sometimes").is_err());
+    }
+
+    fn auto_login_evidence() -> AutoLoginEvidence {
+        AutoLoginEvidence {
+            allow_auto_login: true,
+            accept_login_terms: true,
+            foreign_package: false,
+            login_button_count: 1,
+            account_present: true,
+            expected_account_configured: true,
+            account_matches: true,
+            consent_node_present: true,
+        }
+    }
+
+    #[test]
+    fn auto_login_is_disabled_by_default_and_never_implies_consent() {
+        let mut evidence = auto_login_evidence();
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::Live, &evidence),
+            AutoLoginDecision::Authorized
+        );
+        evidence.allow_auto_login = false;
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::Live, &evidence),
+            AutoLoginDecision::Disabled
+        );
+        // Enabling the login switch alone must not authorize ticking the
+        // agreement checkbox: that needs its own switch.
+        let mut evidence = auto_login_evidence();
+        evidence.accept_login_terms = false;
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::Live, &evidence),
+            AutoLoginDecision::Refused("auto_login_terms_not_accepted")
+        );
+    }
+
+    #[test]
+    fn auto_login_fails_closed_on_every_ambiguous_condition() {
+        let mut evidence = auto_login_evidence();
+        assert_eq!(
+            authorize_auto_login(PageRoute::Checkin, Mode::Live, &evidence),
+            AutoLoginDecision::NotLoginPage
+        );
+        evidence.foreign_package = true;
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::Live, &evidence),
+            AutoLoginDecision::Refused("auto_login_blocked")
+        );
+
+        let mut evidence = auto_login_evidence();
+        evidence.login_button_count = 0;
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::Live, &evidence),
+            AutoLoginDecision::Refused("auto_login_button_ambiguous")
+        );
+        evidence.login_button_count = 2;
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::Live, &evidence),
+            AutoLoginDecision::Refused("auto_login_button_ambiguous")
+        );
+
+        let mut evidence = auto_login_evidence();
+        evidence.consent_node_present = false;
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::Live, &evidence),
+            AutoLoginDecision::Refused("auto_login_consent_not_found")
+        );
+
+        let mut evidence = auto_login_evidence();
+        evidence.account_present = false;
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::Live, &evidence),
+            AutoLoginDecision::Refused("auto_login_account_unknown")
+        );
+
+        let mut evidence = auto_login_evidence();
+        evidence.account_matches = false;
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::Live, &evidence),
+            AutoLoginDecision::Refused("auto_login_account_mismatch")
+        );
+    }
+
+    #[test]
+    fn auto_login_dry_run_is_ready_but_never_authorized() {
+        let evidence = auto_login_evidence();
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::DryRun, &evidence),
+            AutoLoginDecision::Ready
+        );
+        // Without a configured expected account the match check is skipped.
+        let mut unconfigured = evidence;
+        unconfigured.expected_account_configured = false;
+        unconfigured.account_matches = false;
+        assert_eq!(
+            authorize_auto_login(PageRoute::Login, Mode::Live, &unconfigured),
+            AutoLoginDecision::Authorized
+        );
     }
 }

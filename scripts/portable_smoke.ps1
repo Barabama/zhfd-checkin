@@ -71,11 +71,12 @@ try {
         "landscape_1600x900_d240",
         "portrait_900x1600_d240",
         "landscape_1280x720_d240",
-        "portrait_720x1280_d240",
+        "portrait_720x1280_d320",
         "landscape_1920x1080_d280",
-        "portrait_1080x1920_d280",
+        "portrait_1080x1920_d480",
         "landscape_960x540_d160",
-        "portrait_540x960_d160"
+        "portrait_540x960_d240",
+        "portrait_900x1600_d320"
     )) {
         if ($profiles -notmatch [regex]::Escape($id)) {
             throw "Portable profile list is missing: $id"

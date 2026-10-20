@@ -182,6 +182,59 @@ pub fn crop(image: &DynamicImage, button: ButtonBox) -> DynamicImage {
     image.crop_imm(x, y, w, h)
 }
 
+/// The minimum accent-blue pixel count and fraction for a consent checkbox to
+/// count as checked. The unchecked box is white with a light-grey outline, so
+/// the checked state is a large blue fraction at every resolution. The
+/// fraction is the real gate; the absolute floor only rejects a few stray
+/// antialiased pixels. Both are deliberately conservative: an ambiguous crop
+/// must fail closed.
+const CONSENT_ACCENT_MIN_PIXELS: u64 = 4;
+const CONSENT_ACCENT_MIN_FRACTION: f32 = 0.02;
+
+fn is_accent_blue(r: u8, g: u8, b: u8) -> bool {
+    b >= 150 && b as i32 >= r as i32 + 40 && g >= 60
+}
+
+/// Count accent-blue pixels inside `rect` and the total pixels considered.
+///
+/// The rectangle is clamped to the image; an empty or out-of-bounds rectangle
+/// yields `(0, 0)`.
+pub fn accent_pixels(image: &DynamicImage, rect: (u32, u32, u32, u32)) -> (u64, u64) {
+    let (left, top, right, bottom) = rect;
+    let x = left.min(image.width());
+    let y = top.min(image.height());
+    let w = right.min(image.width()).saturating_sub(x);
+    let h = bottom.min(image.height()).saturating_sub(y);
+    if w == 0 || h == 0 {
+        return (0, 0);
+    }
+    let rgb = image.to_rgb8();
+    let mut accent = 0u64;
+    for yy in y..y + h {
+        for xx in x..x + w {
+            let pixel = rgb.get_pixel(xx, yy);
+            if is_accent_blue(pixel[0], pixel[1], pixel[2]) {
+                accent += 1;
+            }
+        }
+    }
+    (accent, (w as u64) * (h as u64))
+}
+
+/// Visual confirmation that a consent checkbox is ticked.
+///
+/// Hierarchy nodes on this App expose no `checked` attribute, so the only
+/// available signal is the accent colour drawn inside the node's bounds. The
+/// caller must treat `false` as "not confirmed" and must not tap login.
+pub fn consent_checkbox_checked(image: &DynamicImage, rect: (u32, u32, u32, u32)) -> bool {
+    let (accent, total) = accent_pixels(image, rect);
+    if total == 0 {
+        return false;
+    }
+    accent >= CONSENT_ACCENT_MIN_PIXELS
+        && (accent as f32 / total as f32) >= CONSENT_ACCENT_MIN_FRACTION
+}
+
 pub fn fallback_button(image: &DynamicImage, profile: &crate::profile::Profile) -> ButtonBox {
     let w = image.width();
     let h = image.height();
@@ -327,5 +380,66 @@ mod tests {
             let actual = classify_button(&image, button).state;
             assert_eq!(actual, expected, "fixture {name}");
         }
+    }
+
+    #[test]
+    fn consent_checkbox_requires_visible_accent() {
+        let rect = (10, 10, 50, 64);
+        // Unchecked: white box with a light-grey outline (observed baseline).
+        let mut unchecked = image::RgbImage::from_pixel(64, 80, image::Rgb([255, 255, 255]));
+        for x in 10..50 {
+            unchecked.put_pixel(x, 10, image::Rgb([233, 233, 233]));
+            unchecked.put_pixel(x, 63, image::Rgb([221, 221, 221]));
+        }
+        let unchecked = DynamicImage::ImageRgb8(unchecked);
+        let (accent, total) = accent_pixels(&unchecked, rect);
+        assert_eq!(total, 40 * 54);
+        assert_eq!(accent, 0);
+        assert!(!consent_checkbox_checked(&unchecked, rect));
+
+        // Checked: a blue tick/fill inside the same bounds.
+        let mut checked = image::RgbImage::from_pixel(64, 80, image::Rgb([255, 255, 255]));
+        for y in 18..58 {
+            for x in 18..42 {
+                checked.put_pixel(x, y, image::Rgb([13, 148, 255]));
+            }
+        }
+        let checked = DynamicImage::ImageRgb8(checked);
+        assert!(consent_checkbox_checked(&checked, rect));
+    }
+
+    #[test]
+    fn consent_checkbox_scales_to_lower_resolution_profiles() {
+        // A 20x28 crop approximates the checkbox at the 540x960@240 preset.
+        // The fraction-based threshold must still accept a proportional tick.
+        let rect = (4, 4, 24, 32);
+        let mut checked = image::RgbImage::from_pixel(32, 40, image::Rgb([255, 255, 255]));
+        for y in 8..28 {
+            for x in 8..20 {
+                checked.put_pixel(x, y, image::Rgb([13, 148, 255]));
+            }
+        }
+        let checked = DynamicImage::ImageRgb8(checked);
+        assert!(consent_checkbox_checked(&checked, rect));
+
+        // A handful of stray blue pixels is below the 2% fraction and must not
+        // be read as checked.
+        let mut sparse = image::RgbImage::from_pixel(32, 40, image::Rgb([255, 255, 255]));
+        for (x, y) in [(10, 10), (11, 10), (10, 11)] {
+            sparse.put_pixel(x, y, image::Rgb([13, 148, 255]));
+        }
+        let sparse = DynamicImage::ImageRgb8(sparse);
+        assert!(!consent_checkbox_checked(&sparse, rect));
+    }
+
+    #[test]
+    fn consent_checkbox_rejects_empty_rect() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            10,
+            10,
+            image::Rgb([13, 148, 255]),
+        ));
+        assert_eq!(accent_pixels(&image, (20, 20, 30, 30)), (0, 0));
+        assert!(!consent_checkbox_checked(&image, (20, 20, 30, 30)));
     }
 }
