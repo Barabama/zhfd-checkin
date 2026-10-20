@@ -39,6 +39,17 @@ unknown_retries = 3
 # default; set true only after confirming the field-work action, device, location,
 # instance, and consequences for the account. See CHECKIN_SAFETY.md.
 allow_field_work_live = false
+# One-click login on the login page is opt-in. It never stores or types a
+# password. See ADR-0004 and docs/CHECKIN_SAFETY.md.
+allow_auto_login = false
+# Separate consent switch: only true lets the program tick the User/Privacy
+# agreement on the login page on the operator's behalf.
+accept_login_terms = false
+# Optional expected "last used account"; empty means no match check.
+# Local-only value: never commit this file.
+auto_login_account = ""
+# Seconds to wait for the login page to disappear, clamped to 5-120.
+auto_login_timeout_seconds = 30
 
 [notifications]
 bark_url = ""
@@ -138,6 +149,24 @@ pub struct RuntimeConfig {
     /// operator decision recorded in the config file.
     #[serde(default)]
     pub allow_field_work_live: bool,
+    /// Opt-in switch for one-click login on the login page. Defaults to
+    /// `false`; older configs without the key stay denied.
+    #[serde(default)]
+    pub allow_auto_login: bool,
+    /// Separate consent switch: when `true`, the program may tick the
+    /// User/Privacy agreement checkbox on the login page before tapping
+    /// one-click login. Kept separate so `allow_auto_login` never implies
+    /// agreement on the operator's behalf.
+    #[serde(default)]
+    pub accept_login_terms: bool,
+    /// Optional expected "last used account" label. Empty means no match
+    /// check. The value is local-only and must never be committed.
+    #[serde(default)]
+    pub auto_login_account: String,
+    /// How long to wait for the login page to disappear after the tap.
+    /// Clamped to 5-120 seconds where it is used.
+    #[serde(default = "default_auto_login_timeout")]
+    pub auto_login_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,6 +201,9 @@ fn default_stable_frames() -> u32 {
 }
 fn default_unknown_retries() -> u32 {
     3
+}
+fn default_auto_login_timeout() -> u64 {
+    30
 }
 
 impl Default for Config {
@@ -829,6 +861,16 @@ mod tests {
         assert!(!config.runtime.allow_field_work_live);
         let legacy: RuntimeConfig = toml::from_str("mode = \"live\"\n").unwrap();
         assert!(!legacy.allow_field_work_live);
+        // Auto-login and consent are separate opt-ins and must both default to
+        // denied; a legacy config lacking the keys must not enable either.
+        assert!(!config.runtime.allow_auto_login);
+        assert!(!config.runtime.accept_login_terms);
+        assert!(config.runtime.auto_login_account.is_empty());
+        assert_eq!(config.runtime.auto_login_timeout_seconds, 30);
+        assert!(!legacy.allow_auto_login);
+        assert!(!legacy.accept_login_terms);
+        assert!(legacy.auto_login_account.is_empty());
+        assert_eq!(legacy.auto_login_timeout_seconds, 30);
         assert_eq!(config.window.start, "21:00");
         assert_eq!(config.window.end, "23:59");
         assert_eq!(config.window.timezone, "Asia/Shanghai");

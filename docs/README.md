@@ -4,21 +4,26 @@
 
 此处是当前用户文档与工程文档的索引。第一次使用建议按顺序阅读：
 
-1. [快速开始](./QUICK_START.md)：从准备环境、首次设置，到首次单实例 dry-run。
-2. GUI 左侧的“快速使用”：在程序内查看分步流程、结果解释和常见故障处理。
-3. [Windows 安装、配置与运维](./OPERATIONS.md)：依赖路径、实例、数据目录、CLI 和计划任务。
-4. [签到安全策略](./CHECKIN_SAFETY.md)：dry-run/live 边界、点击门禁、外勤限制和成功判定。
+1. [当前状态（唯一事实源）](./STATUS.md)：HEAD、tag、Release、CI、审计与未关闭项。
+2. [新 AI 上手手册](./AI_ONBOARDING.md)：安全模型、代码地图、配置语义、陷阱与 recipes。
+3. [快速开始](./QUICK_START.md)：从准备环境、首次设置，到首次单实例 dry-run。
+4. GUI 左侧的“快速使用”：在程序内查看分步流程、结果解释和常见故障处理。
+5. [Windows 安装、配置与运维](./OPERATIONS.md)：依赖路径、实例、数据目录、CLI 和计划任务。
+6. [签到安全策略](./CHECKIN_SAFETY.md)：dry-run/live 边界、点击门禁、外勤限制和成功判定。
 
 ## 当前主题入口
 
 | 文档 | 维护范围 |
 |---|---|
+| [STATUS.md](./STATUS.md) | 当前 HEAD/tag/Release/CI/审计状态；唯一事实源 |
+| [AI_ONBOARDING.md](./AI_ONBOARDING.md) | 新 AI/新维护者上手：架构、门禁、代码地图、错误契约、隐私规则 |
 | [快速开始](./QUICK_START.md) | 新用户首次运行流程、最小安全检查、dry-run 和结果确认 |
 | [OPERATIONS.md](./OPERATIONS.md) | Windows 便携部署、TOML 配置、依赖发现、模拟器/实例/CLI 操作 |
 | [CHECKIN_SAFETY.md](./CHECKIN_SAFETY.md) | 页面路由、签到业务类型、点击门禁、成功日期、证据边界 |
 | [PRODUCT_AND_ARCHITECTURE.md](./PRODUCT_AND_ARCHITECTURE.md) | 产品职责、目标架构、Phase 状态与系统级待办 |
 | [ENGINEERING_AND_RELEASE.md](./ENGINEERING_AND_RELEASE.md) | Cargo 项目布局、代码维护、CI/构建/打包与发布状态 |
-| [adr/](./adr/) | 对冻结决策的修订记录（外勤 opt-in、BACK 回退、迁移持久化） |
+| [adr/](./adr/) | 对冻结决策的修订记录（外勤 opt-in、BACK 回退、迁移持久化、自动登录提议） |
+| [design/](./design/) | 尚未实现的功能设计稿（当前：自动登录/一键登录） |
 | [audits/](./audits/) | 独立审计、修复复核及对应工程记录 |
 | [archive/2026-10-11/](./archive/2026-10-11/) | 历史原件归档 |
 
@@ -47,8 +52,8 @@
 
 ## 当前审计证据
 
-- [V0.3.1 独立审计报告（2026-10-18）](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)：针对 `master` `e135369` / `v0.3.1` `9a66664`。结论为**不构成独立验收通过**，列出 P1（数据丢失、迁移持久化、计划任务路径、日期作用域、Setup 门禁、live 目标快照等）与设备/CI 证据缺口。
-- [v0.3.0 独立审计报告（2026-10-12）](./V0.3.0_INDEPENDENT_AUDIT_REPORT_2026-10-12.md)：针对 `c4b3bc4` 的历史审计，**不代表当前 master**。
+- [V0.3.1 独立审计报告（2026-10-18）](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)：审计对象为 pre-rewrite 的 `e135369` / `v0.3.1`（`9a66664` 为重写前 SHA）。结论为**不构成独立验收通过**，列出 P1（数据丢失、迁移持久化、计划任务路径、日期作用域、Setup 门禁、live 目标快照等）与设备/CI 证据缺口。
+- [v0.3.0 独立审计报告（2026-10-12）](./V0.3.0_INDEPENDENT_AUDIT_REPORT_2026-10-12.md)：审计对象为 pre-rewrite 的 `c4b3bc4`，**不代表当前 master**。
 - [Phase 4 独立审计报告](./audits/PHASE4_INDEPENDENT_AUDIT_REPORT_2026-10-11.md)：更早的 Phase 4 审计与 P2 修复复核，同样属于历史证据。
 - [P2 修复说明](./audits/PHASE4_P2_REMEDIATION_2026-10-11.md)：实现侧变更范围。
 - [审计提示词](./audits/PHASE4_INDEPENDENT_AUDIT_PROMPT_2026-10-10.md)：审计能力、设备安全边界和复核要求。
@@ -61,6 +66,11 @@
 | [ADR-0001](./adr/ADR-0001-field-work-live-opt-in.md) | 外勤签到 live 显式 opt-in（修订 D-08） |
 | [ADR-0002](./adr/ADR-0002-swallowed-back-fallback.md) | BACK 被 App 吞掉时继续使用已确认签到页 |
 | [ADR-0003](./adr/ADR-0003-recorded-data-root.md) | 持久化 GUI 迁移后的数据目录（修订 D-01） |
+| [ADR-0004](./adr/ADR-0004-auto-login-opt-in.md) | 登录页「一键登录」显式 opt-in（已接受，默认关闭） |
+
+## 设计稿
+
+- [自动登录方案设计（2026-10-21）](./design/AUTO_LOGIN_DESIGN_2026-10-21.md)：现场证据、门禁、状态机、配置、结果契约与测试计划。状态为**已实现，待现场 live 验证**。
 
 ## 重复度盘点及归档说明
 

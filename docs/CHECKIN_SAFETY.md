@@ -30,7 +30,27 @@ AND second Ready confirmation AND this run has not tapped
 
 外勤 live 使用外勤页面当前识别出的按钮坐标；按钮必须由本轮截图分类为 Ready，且点击前重新读取 hierarchy/前台包名并确认仍是 `Checkin + FieldWork`。Unsupported、证据冲突或任一门禁不足时停止且不点击。
 
-本工具不自动输入账号、密码、验证码，不自动点击一键登录，不伪造定位或设备身份。遇登录页，要求用户在模拟器手动登录。
+## 登录页与一键登录
+
+默认行为：识别到 `Login` 后以 `login_required` 停止，要求用户在模拟器中手动登录。程序不输入账号、密码、验证码，不伪造定位或设备身份。
+
+可选的自动登录（ADR-0004）只在**同时**满足以下条件时执行一次「一键登录」：
+
+- `runtime.allow_auto_login = true` 且 `runtime.accept_login_terms = true`（后者表示授权程序代勾选《用户协议》《隐私协议》）；
+- `--live --confirm`、目标 App 前台、无外部窗口；
+- `route=Login` 且来自目标包节点；
+- 「一键登录」节点唯一、可点击；同意复选框可定位，点击后经截图确认已勾选；
+- 配置了 `runtime.auto_login_account` 时，页面显示的“上次使用过的账号”必须精确匹配；
+- 点击前重新观测仍是同一登录页、同一账号、无遮挡。
+
+限制与失败语义：
+
+- 只支持一键登录，不处理「其他账户登录」，不输入/保存任何凭据；
+- 登录页选择与点击坐标来自 hierarchy bounds，不依赖 Profile 几何；但 live 仍需目标 Profile 已标定，未标定预设会在启动前以 `uncalibrated_profile` 停止；
+- 一次运行最多一次登录点击，失败不重试；
+- dry-run 永不点击，只写 `auto_login_ready`；
+- 失败使用稳定的 `auto_login_*` 错误码（`terms_not_accepted`、`consent_unconfirmed`、`account_mismatch`、`blocked`、`timeout`、`not_confirmed` 等）；
+- `auto_login_succeeded=true` 只表示已离开登录页，不代表签到成功；`clicked` 仍只表示签到按钮被点击。
 
 ## 旧签到页刷新（stale page refresh）
 

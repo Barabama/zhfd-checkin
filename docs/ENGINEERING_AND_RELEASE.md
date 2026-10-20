@@ -1,6 +1,8 @@
 # 工程构建、版本与发布流程
 
-更新时间：2026-10-11（Asia/Shanghai）
+更新时间：2026-10-20（Asia/Shanghai）
+
+> 当前 HEAD/tag/Release/CI/审计状态以 [STATUS.md](./STATUS.md) 为准；本文件只维护工程流程。
 
 ## 代码布局
 
@@ -18,14 +20,23 @@ CLI/GUI 共享业务函数，不把 UI 的按钮/输入当作第二套业务策�
 ## 版本与发布状态
 
 - Cargo package 元数据当前是 `0.3.2`；
-- 已发布 tag：`v0.1.0`（`87658fe`）、`v0.2.0`（`5835e9d`）、`v0.3.0`（`06dfaf4`）、`v0.3.1`（`a955d0a`）；
+- 已发布 tag：`v0.1.0`（`87658fe`）、`v0.2.0`（`5835e9d`）、`v0.3.0`（`06dfaf4`）、`v0.3.1`（`a955d0a`）、`v0.3.2`（`8d3f58e`）；
 - `v0.3.2` 包含 v0.3.1 之后的计划任务引号、成功日期作用域、数据根目录持久化、
   Repair 保存保护、Setup 门禁和 live 目标快照修复；
 - `v0.3.1` 的 GitHub Release 与 CI 已成功运行，发布资产为
-  `zhfd-checkin-windows-x64-v0.3.1-9a666641c872.zip`；
+  `zhfd-checkin-windows-x64-v0.3.1-9a666641c872.zip`（资产名保留打包时的旧 commit）；
+- `v0.3.2` 的 GitHub Release 资产为
+  `zhfd-checkin-windows-x64-v0.3.2-d63d3b3a38af.zip`；两版资产只含 EXE 与 README；
 - 详细审计与未完成项见
   [V0.3.1 独立审计报告](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)；
 - 本地工作区不等于发布，tag/Release 仍须独立验收与用户明确批准。
+
+### 发布流程已知缺口
+
+- release workflow 不校验 tag 名与 Cargo 版本一致，`workflow_dispatch` 可在任意分支运行；
+- release workflow 不运行 Python / Node 门禁；
+- CI 在 Python / Node 之前上传 artifact；后续门禁失败时 artifact 仍可下载；
+- 打 tag 前必须 bump `rust/Cargo.toml`，否则资产名会使用旧版本号。
 
 ## 本地构建入口
 
