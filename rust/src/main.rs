@@ -1,6 +1,8 @@
 mod adb;
 mod apk;
 mod auto_login;
+mod cli;
+mod commands;
 mod config;
 mod discovery;
 mod domain;
@@ -14,7 +16,11 @@ mod profile;
 mod vision;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use cli::{
+    AppCommand, Cli, CliConfigCommand, CommandKind, InstanceCommand, LoginArgs, ProfileCommand,
+    UiCommand,
+};
+use commands::{ConfigRequest, InstanceTargetArgs, RunPolicy, RunRequest, RunSource, TaskRequest};
 use config::ConfigStore;
 use domain::{
     CheckinMode, CheckinState, ConsecutiveUnknown, ExitCode, Mode, PageRoute, RunResult, RunStatus,
@@ -68,220 +74,6 @@ fn build_id_for(version: &str, commit: &str, dirty: Option<bool>) -> String {
     }
 }
 
-#[derive(Parser, Debug)]
-#[command(
-    name="zhfd-checkin",
-    version=VERSION,
-    about="智汇福大 LDPlayer 自动签到控制器",
-    after_help = "首次使用（只读，不点击）：\n  zhfd-checkin.exe about\n  zhfd-checkin.exe diagnose --instance-index 0\n  zhfd-checkin.exe run --dry-run --instance-index 0\n\n无子命令将启动 GUI；脚本必须显式传子命令。\nlive 会真实点击签到按钮，必须同时传 --live --confirm；dry-run 永不点击签到按钮。"
-)]
-struct Cli {
-    #[arg(
-        long,
-        global = true,
-        value_name = "PATH",
-        help = "显式指定 config.toml；其父目录即为 data root"
-    )]
-    config: Option<PathBuf>,
-    #[command(subcommand)]
-    command: Option<CommandKind>,
-}
-
-#[derive(Subcommand, Debug)]
-enum CommandKind {
-    /// 只读环境与设备诊断（不点击、不修改配置）
-    Diagnose {
-        #[command(flatten)]
-        target: InstanceTargetArgs,
-    },
-    /// 生成默认脱敏的诊断报告（reports/diagnostic-*.json）
-    Report,
-    /// Profile 查询、检测与同步
-    Profile {
-        #[command(subcommand)]
-        command: ProfileCommand,
-    },
-    /// 运行签到状态机（默认跟随 runtime.mode；live 必须 --confirm）
-    Run(RunArgs),
-    /// APK 安装
-    App {
-        #[command(subcommand)]
-        command: AppCommand,
-    },
-    /// 配置查询与打开（show 默认脱敏）
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
-    },
-    /// 版本与构建来源
-    About,
-    /// 打开 GUI（无子命令时也会进入这里）
-    Gui,
-    /// 实例列表
-    Instance {
-        #[command(subcommand)]
-        command: InstanceCommand,
-    },
-    /// Windows 计划任务
-    Task {
-        #[command(subcommand)]
-        command: TaskCommand,
-    },
-    /// 原始 UI hierarchy（可能含账号/姓名等 PII）
-    Ui {
-        #[command(subcommand)]
-        command: UiCommand,
-    },
-    /// 离线图片分类（无需配置）
-    Vision {
-        #[arg(long, value_name = "FILE", help = "要分类的本地截图路径")]
-        image: PathBuf,
-    },
-}
-#[derive(Subcommand, Debug)]
-enum ProfileCommand {
-    /// 列出内置 Profile
-    List,
-    /// 检测当前实例的分辨率/DPI 并匹配 Profile
-    Detect {
-        #[command(flatten)]
-        target: InstanceTargetArgs,
-    },
-    /// 修改模拟器分辨率/DPI 并重启实例（危险，必须 --confirm）
-    Sync {
-        #[arg(
-            long,
-            value_name = "ID",
-            help = "要同步的 Profile ID，例如 portrait_900x1600_d320"
-        )]
-        id: String,
-        #[arg(long, required = true, help = "显式确认修改分辨率/DPI 并重启实例")]
-        confirm: bool,
-        #[command(flatten)]
-        target: InstanceTargetArgs,
-    },
-}
-#[derive(Subcommand, Debug)]
-enum AppCommand {
-    /// 安装 APK 到目标实例（可能自动启动模拟器并写入配置）
-    Install {
-        #[arg(long, value_name = "APK", help = "APK 文件路径")]
-        apk: PathBuf,
-        #[command(flatten)]
-        target: InstanceTargetArgs,
-    },
-}
-#[derive(Subcommand, Debug)]
-enum ConfigCommand {
-    /// 输出解析后的配置路径、数据根与来源
-    Path,
-    /// 输出配置（账号与通知地址默认脱敏）
-    Show,
-    /// 用系统编辑器打开明文配置文件
-    Open,
-}
-#[derive(Subcommand, Debug)]
-enum InstanceCommand {
-    /// 列出 LDPlayer 与配置中的实例
-    List,
-}
-
-#[derive(Args, Debug, Clone, Default)]
-struct InstanceTargetArgs {
-    #[arg(long, help = "选择 LDPlayer 实例 index；默认使用 config.toml")]
-    instance_index: Option<u32>,
-    #[arg(
-        long,
-        help = "显式指定 ADB serial；与 --instance-index 同时使用时必须指向同一实例"
-    )]
-    serial: Option<String>,
-}
-
-#[derive(Subcommand, Debug)]
-enum TaskCommand {
-    /// 创建每日计划任务（默认 dry-run；live 需 --confirm）
-    Create {
-        #[arg(
-            long,
-            default_value = "ZHFD-AutoCheckin",
-            help = "Windows 计划任务名称"
-        )]
-        name: String,
-        #[arg(
-            long,
-            requires = "confirm",
-            help = "让计划任务执行真实签到（高风险；必须同时传 --confirm）"
-        )]
-        live: bool,
-        #[arg(long, requires = "live", help = "显式授权 live 计划任务")]
-        confirm: bool,
-        #[arg(
-            long,
-            conflicts_with_all = ["instance_index", "serial"],
-            help = "依次运行配置中 enabled 的所有实例（不能与实例选择器组合）"
-        )]
-        all_instances: bool,
-        #[command(flatten)]
-        target: InstanceTargetArgs,
-    },
-    /// 删除计划任务
-    Delete {
-        #[arg(
-            long,
-            default_value = "ZHFD-AutoCheckin",
-            help = "Windows 计划任务名称"
-        )]
-        name: String,
-    },
-    /// 查询计划任务
-    Query {
-        #[arg(
-            long,
-            default_value = "ZHFD-AutoCheckin",
-            help = "Windows 计划任务名称"
-        )]
-        name: String,
-    },
-}
-#[derive(Subcommand, Debug)]
-enum UiCommand {
-    /// dump 当前 UI hierarchy（可能含账号/姓名等 PII）
-    Dump {
-        #[command(flatten)]
-        target: InstanceTargetArgs,
-    },
-}
-#[derive(Args, Debug, Clone)]
-struct RunArgs {
-    #[arg(
-        long,
-        conflicts_with = "live",
-        help = "只观察，不点击签到按钮（首次推荐）"
-    )]
-    dry_run: bool,
-    #[arg(
-        long,
-        requires = "confirm",
-        help = "真实签到模式；必须同时传 --confirm（危险）"
-    )]
-    live: bool,
-    #[arg(
-        long,
-        requires = "live",
-        conflicts_with = "dry_run",
-        help = "显式授权真实点击；只能与 --live 一起使用"
-    )]
-    confirm: bool,
-    #[arg(
-        long,
-        conflicts_with_all = ["instance_index", "serial"],
-        help = "依次运行配置中 enabled 的所有实例（不能与实例选择器组合）"
-    )]
-    all_instances: bool,
-    #[command(flatten)]
-    target: InstanceTargetArgs,
-}
-
 /// CLI entry point. `pub` on purpose: the library target shares this file via
 /// `include!`, and a private `main` would make every CLI-only function look
 /// dead there -- which is what previously forced `#[allow(dead_code)]` blankets
@@ -289,7 +81,7 @@ struct RunArgs {
 pub fn main() {
     // Parse first so a malformed command line still produces a clap usage error
     // instead of being flattened into the generic config failure path.
-    let cli = Cli::parse();
+    let cli = Cli::parse_args();
     let code = match run_cli(cli) {
         Ok(code) => code as i32,
         Err(error) => {
@@ -317,9 +109,9 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             command: ProfileCommand::List,
         } => profile_list(),
         CommandKind::Config {
-            command: ConfigCommand::Path,
+            command: CliConfigCommand::Path,
         } => config_path_command(config_path.as_deref()),
-        CommandKind::Task { command } => task_command(command, config_path.as_deref()),
+        CommandKind::Task { command } => task_command(command.into(), config_path.as_deref()),
         command => {
             let store = load_store_for_cli(config_path.as_deref())?;
             match command {
@@ -330,11 +122,12 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 CommandKind::Profile { command } => profile_command(&store, command),
                 CommandKind::Instance { command } => instance_command(&store, command),
                 CommandKind::Ui { command } => ui_command(&store, command),
-                CommandKind::Config { command } => config_command(&store, command),
-                CommandKind::Diagnose { target } => diagnose(&store, &target),
+                CommandKind::Config { command } => config_command(&store, command.into()),
+                CommandKind::Diagnose { target } => diagnose(&store, &target.into()),
                 CommandKind::Report => write_report(&store),
                 CommandKind::App { command } => app_command(&store, command),
-                CommandKind::Run(args) => run(&store, args),
+                CommandKind::Run(args) => run(&store, args.into_request(), RunSource::Cli),
+                CommandKind::Login(args) => login_command(&store, args),
             }
         }
     }
@@ -355,6 +148,14 @@ fn load_store_for_cli(config_path: Option<&Path>) -> Result<ConfigStore> {
             error
         )
     })
+}
+
+/// Report a device/ADB failure at a command boundary and return the stable
+/// device exit code instead of letting it fall through to the generic
+/// config/unknown code.
+fn reported_device_failure(error: anyhow::Error) -> ExitCode {
+    eprintln!("错误: {error:#}");
+    ExitCode::DeviceFailure
 }
 
 /// Best-effort display path for a config that failed to load: the explicit
@@ -718,15 +519,15 @@ fn config_path_command(explicit: Option<&Path>) -> Result<ExitCode> {
     Ok(ExitCode::Ok)
 }
 
-fn config_command(store: &ConfigStore, command: ConfigCommand) -> Result<ExitCode> {
+fn config_command(store: &ConfigStore, command: ConfigRequest) -> Result<ExitCode> {
     match command {
-        ConfigCommand::Path => {
+        ConfigRequest::Path => {
             println!("path={}", store.path.display());
             println!("root={}", store.root.display());
             println!("origin={}", store.origin.as_str());
             println!("created_default={}", store.created_default);
         }
-        ConfigCommand::Show => {
+        ConfigRequest::Show => {
             // Redacted by default: this output is commonly pasted into issues.
             // Use `config open` (or the config file itself) when the operator
             // needs the raw values.
@@ -736,7 +537,7 @@ fn config_command(store: &ConfigStore, command: ConfigCommand) -> Result<ExitCod
                 toml::to_string_pretty(&store.config.redacted_for_display())?
             );
         }
-        ConfigCommand::Open => {
+        ConfigRequest::Open => {
             #[cfg(windows)]
             {
                 process::command("cmd")
@@ -772,7 +573,11 @@ fn profile_command(store: &ConfigStore, command: ProfileCommand) -> Result<ExitC
     match command {
         ProfileCommand::List => return profile_list(),
         ProfileCommand::Detect { target } => {
-            let (_, device, info) = runtime_with_target(store, false, Some(&target))?;
+            let target: InstanceTargetArgs = target.into();
+            let (_, device, info) = match runtime_with_target(store, false, Some(&target)) {
+                Ok(value) => value,
+                Err(error) => return Ok(reported_device_failure(error)),
+            };
             print_device(&device.serial, &info);
             match profile::find_profile(info.width, info.height, info.density_dpi) {
                 Some(p) => println!("profile={}", p.id),
@@ -784,6 +589,7 @@ fn profile_command(store: &ConfigStore, command: ProfileCommand) -> Result<ExitC
             confirm,
             target,
         } => {
+            let target: InstanceTargetArgs = target.into();
             sync_profile(store, &id, confirm, &target)?;
         }
     }
@@ -1131,7 +937,10 @@ fn diagnose(store: &ConfigStore, instance_target: &InstanceTargetArgs) -> Result
             instance.dpi
         );
     }
-    let (_, device, info) = runtime_with_target(store, false, Some(instance_target))?;
+    let (_, device, info) = match runtime_with_target(store, false, Some(instance_target)) {
+        Ok(value) => value,
+        Err(error) => return Ok(reported_device_failure(error)),
+    };
     print_device(&device.serial, &info);
     if let Some(profile) = profile::find_profile(info.width, info.height, info.density_dpi) {
         println!("profile={} calibrated={}", profile.id, profile.calibrated);
@@ -1196,9 +1005,21 @@ pub(crate) fn installed_app_version(
 
 fn app_command(store: &ConfigStore, command: AppCommand) -> Result<ExitCode> {
     match command {
-        AppCommand::Install { apk, target } => {
+        AppCommand::Install {
+            apk,
+            confirm,
+            target,
+        } => {
+            // clap already requires --confirm; keep a runtime guard so a future
+            // refactor cannot bypass the acknowledgement.
+            if !confirm {
+                bail!("安装 APK 会写入配置并可能重启实例，请指定 --confirm");
+            }
             println!("安装 APK: {}", apk.display());
-            let result = install_apk(store, &apk, &target)?;
+            let result = match install_apk(store, &apk, &target.into()) {
+                Ok(value) => value,
+                Err(error) => return Ok(reported_device_failure(error)),
+            };
             println!("{}", result.install_output);
             println!("安装后包校验: {} {}", result.package_name, result.version);
             Ok(ExitCode::Ok)
@@ -1249,17 +1070,23 @@ fn cli_executable_path(current_exe: &std::path::Path) -> std::path::PathBuf {
     current_exe.to_path_buf()
 }
 
-fn task_command(command: TaskCommand, config_path: Option<&Path>) -> Result<ExitCode> {
+fn task_command(command: TaskRequest, config_path: Option<&Path>) -> Result<ExitCode> {
     match command {
-        TaskCommand::Create {
+        TaskRequest::Create {
             name,
+            dry_run,
             live,
             confirm,
             all_instances,
             target,
         } => {
+            // clap already enforces these; the runtime guards stay so a
+            // programmatic caller cannot skip them.
             if live && !confirm {
                 bail!("正式计划任务必须同时指定 --live --confirm");
+            }
+            if live && dry_run {
+                bail!("--dry-run 与 --live 不能同时用于计划任务");
             }
             let current_exe = std::env::current_exe().context("无法取得 EXE 路径")?;
             let exe = cli_executable_path(&current_exe);
@@ -1298,9 +1125,16 @@ fn task_command(command: TaskCommand, config_path: Option<&Path>) -> Result<Exit
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
-            println!("已创建计划任务 {}: {}", name, task_run);
+            let mode_label = if live { "live" } else { "dry-run" };
+            println!(
+                "已创建计划任务 {}（模式: {}；时间: 每天 {}）: {}",
+                name, mode_label, start, task_run
+            );
         }
-        TaskCommand::Delete { name } => {
+        TaskRequest::Delete { name, confirm } => {
+            if !confirm {
+                bail!("删除计划任务不可恢复，请指定 --confirm");
+            }
             let output = process::command("schtasks.exe")
                 .args(["/Delete", "/TN", &name, "/F"])
                 .output()
@@ -1313,7 +1147,7 @@ fn task_command(command: TaskCommand, config_path: Option<&Path>) -> Result<Exit
             }
             println!("已删除计划任务 {}", name);
         }
-        TaskCommand::Query { name } => {
+        TaskRequest::Query { name } => {
             let output = process::command("schtasks.exe")
                 .args(["/Query", "/TN", &name, "/FO", "LIST", "/V"])
                 .output()
@@ -1352,7 +1186,10 @@ pub(crate) fn dump_ui_hierarchy(
 
 fn ui_command(store: &ConfigStore, command: UiCommand) -> Result<ExitCode> {
     match command {
-        UiCommand::Dump { target } => println!("{}", dump_ui_hierarchy(store, &target)?),
+        UiCommand::Dump { target } => match dump_ui_hierarchy(store, &target.into()) {
+            Ok(xml) => println!("{}", xml),
+            Err(error) => return Ok(reported_device_failure(error)),
+        },
     }
     Ok(ExitCode::Ok)
 }
@@ -1390,6 +1227,7 @@ fn new_run_result(mode: Mode, log: &RunLog, target: &InstanceTargetArgs) -> RunR
         auto_login_account_configured: None,
         auto_login_account_matched: None,
         auto_login_tap_count: None,
+        login_only: None,
         page_route: None,
         checkin_mode: None,
         checkin_state: None,
@@ -1421,33 +1259,92 @@ fn log_id(log: &RunLog) -> String {
         .unwrap_or_default()
 }
 
-fn run_mode(store: &ConfigStore, args: &RunArgs) -> Result<Mode> {
-    if args.live {
-        Ok(Mode::Live)
-    } else if args.dry_run {
-        Ok(Mode::DryRun)
-    } else {
-        Mode::from_config(&store.config.runtime.mode)
+fn run(store: &ConfigStore, request: RunRequest, source: RunSource) -> Result<ExitCode> {
+    let policy = request.resolve(Mode::from_config(&store.config.runtime.mode)?, source);
+    if policy.all_instances {
+        return run_all_instances(store, &policy);
     }
+    let json = policy.json;
+    let (code, result) = run_single(store, &policy)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print_run_summary(&result);
+    }
+    Ok(code)
 }
 
-fn run(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
-    if args.all_instances {
-        return run_all_instances(store, args);
+/// Human-readable outcome for one run.
+///
+/// The structured contract stays in `result.json`; this is only the console
+/// view, so a first-time user sees the status, the reason, and the next action
+/// without reading a long JSON document.
+fn print_run_summary(result: &RunResult) {
+    let status = if result.login_only == Some(true) {
+        match (result.auto_login_succeeded, result.auto_login_ready) {
+            (Some(true), _) => "login succeeded（已确认离开登录页）",
+            (_, Some(true)) => "login ready（前置条件满足，未点击）",
+            _ if result.error_code.is_none() => "login: already logged in",
+            _ => "login failed",
+        }
+    } else if result.success {
+        "success（已确认签到成功）"
+    } else if result.dry_run_ready {
+        "dry-run ready（观察到可签到，未点击）"
+    } else if result.field_work_ready {
+        "field-work ready（仅观察，未点击）"
+    } else if result.blocked_by.is_some() {
+        "blocked"
+    } else if result.error_code.is_some() {
+        "failed"
+    } else {
+        "running"
+    };
+    println!("状态: {status}（{}）", result.mode);
+    println!(
+        "页面: {} / {} / {}",
+        result
+            .page_route
+            .map(|route| route.as_str())
+            .unwrap_or("unknown"),
+        result
+            .checkin_mode
+            .map(|mode| mode.as_str())
+            .unwrap_or("unknown"),
+        result
+            .checkin_state
+            .map(|state| state.as_str())
+            .unwrap_or("unknown"),
+    );
+    println!(
+        "点击: {}；登录点击: {}",
+        if result.clicked { "是" } else { "否" },
+        result.auto_login_tap_count.unwrap_or(0)
+    );
+    if let Some(code) = &result.error_code {
+        println!("错误码: {code}");
     }
-    let (code, result) = run_single(store, &args)?;
-    println!("结果: {}", serde_json::to_string_pretty(&result)?);
-    Ok(code)
+    if let Some(recovery) = &result.recovery_action {
+        println!("下一步: {recovery}");
+    }
+    if let Some(path) = result.artifact_paths.first() {
+        println!("结果文件: {path}");
+    }
+    println!("完整 JSON: 重新运行并加 --json，或读取上面的 result.json");
 }
 
 /// Execute one instance run and return both the exit code and the converged
 /// result, so the batch layer can reference the real per-instance `result.json`
 /// instead of re-deriving an identity for it.
-fn run_single(store: &ConfigStore, args: &RunArgs) -> Result<(ExitCode, RunResult)> {
-    let mode = run_mode(store, args)?;
-    let log = RunLog::new(&store.root)?;
-    let mut result = new_run_result(mode, &log, &args.target);
-    seed_result_identity(store, &args.target, &mut result);
+fn run_single(store: &ConfigStore, policy: &RunPolicy) -> Result<(ExitCode, RunResult)> {
+    let mode = policy.mode;
+    let log = if policy.json {
+        RunLog::new(&store.root)?.quiet()
+    } else {
+        RunLog::new(&store.root)?
+    };
+    let mut result = new_run_result(mode, &log, &policy.target);
+    seed_result_identity(store, &policy.target, &mut result);
     // Provenance travels with the run itself, not only with the final result, so
     // a run can be attributed to the exact binary even when it never finishes
     // (FR-014). `git_dirty` is emitted separately because a dirty build is not
@@ -1456,13 +1353,14 @@ fn run_single(store: &ConfigStore, args: &RunArgs) -> Result<(ExitCode, RunResul
         "start",
         serde_json::json!({
             "mode": mode.as_str(),
+            "source": policy.source.as_str(),
             "app_version": VERSION,
             "git_commit": GIT_COMMIT,
             "git_dirty": git_dirty(),
             "build_id": build_id(),
         }),
     )?;
-    if mode == Mode::Live && !args.confirm {
+    if mode == Mode::Live && !policy.explicit_confirmation {
         set_run_failure(
             &mut result,
             "live_confirmation_required",
@@ -1473,7 +1371,7 @@ fn run_single(store: &ConfigStore, args: &RunArgs) -> Result<(ExitCode, RunResul
         return Ok((ExitCode::BusinessFailure, result));
     }
 
-    let execution = run_inner(store, args, mode, &log, &mut result);
+    let execution = run_inner(store, policy, &log, &mut result);
     let code = match execution {
         Ok(code) => code,
         Err(error) => {
@@ -1504,11 +1402,19 @@ fn run_single(store: &ConfigStore, args: &RunArgs) -> Result<(ExitCode, RunResul
 fn finalize_run(log: &RunLog, result: &mut RunResult) -> Result<()> {
     result.finished_at = Some(chrono::Local::now().to_rfc3339());
     if result.status.as_deref() != Some(RunStatus::Blocked.as_str()) {
-        let status = if result.success || result.dry_run_ready || result.field_work_ready {
-            RunStatus::Success
-        } else {
-            RunStatus::Failed
-        };
+        // A login-only action succeeds when it either completed the tap, only
+        // confirmed the login preconditions (probe-only), or found the App
+        // already past the login page. Any refusal sets `error_code`, so the
+        // absence of one is the signal; `clicked` stays check-in-only.
+        let login_only_ok = result.login_only == Some(true)
+            && result.error_code.is_none()
+            && result.auto_login_succeeded != Some(false);
+        let status =
+            if result.success || result.dry_run_ready || result.field_work_ready || login_only_ok {
+                RunStatus::Success
+            } else {
+                RunStatus::Failed
+            };
         result.status = Some(status.as_str().into());
     }
     if result.error_code.is_none() {
@@ -1535,15 +1441,15 @@ fn finalize_run(log: &RunLog, result: &mut RunResult) -> Result<()> {
 /// result and a run-level `summary.json` records the shared blocker. Phase 2
 /// runs each instance independently, continues past instance-specific
 /// failures, and writes the aggregate summary.
-fn run_all_instances(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
-    if args.target.instance_index.is_some() || args.target.serial.is_some() {
+fn run_all_instances(store: &ConfigStore, policy: &RunPolicy) -> Result<ExitCode> {
+    if policy.target.instance_index.is_some() || policy.target.serial.is_some() {
         bail!("--all-instances 不能与 --instance-index 或 --serial 同时使用");
     }
     let configured = store.config.emulator.effective_instances();
     if configured.is_empty() {
         bail!("没有启用的 LDPlayer 实例");
     }
-    let mode = run_mode(store, &args)?;
+    let mode = policy.mode;
     // The batch identity owns the summary directory; every per-instance result
     // stays in its own log directory and is referenced from the summary.
     let batch_id = logger::new_batch_id();
@@ -1556,6 +1462,7 @@ fn run_all_instances(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
         // result so the instance identity is never lost to the shared blocker.
         for instance in &configured {
             let log = RunLog::new(&store.root)?;
+            let log = if policy.json { log.quiet() } else { log };
             let mut result = blocked_instance_result(mode, &log, instance, &error_text);
             log.event(
                 "blocked",
@@ -1585,7 +1492,7 @@ fn run_all_instances(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
 
     let mut overall = ExitCode::Ok;
     for configured_instance in &configured {
-        let mut per_instance = args.clone();
+        let mut per_instance = policy.clone();
         per_instance.all_instances = false;
         per_instance.target = InstanceTargetArgs {
             instance_index: Some(configured_instance.instance_index),
@@ -1608,7 +1515,11 @@ fn run_all_instances(store: &ConfigStore, args: RunArgs) -> Result<ExitCode> {
         // the remaining instances would never run and no summary would exist.
         match run_single(store, &per_instance) {
             Ok((code, result)) => {
-                println!("结果: {}", serde_json::to_string_pretty(&result)?);
+                if policy.json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    print_run_summary(&result);
+                }
                 if code as i32 > overall as i32 {
                     overall = code;
                 }
@@ -1762,17 +1673,157 @@ fn instance_summary_entry(
     })
 }
 
+fn login_command(store: &ConfigStore, args: LoginArgs) -> Result<ExitCode> {
+    // No `--confirm-login` means "probe only": the same gates run, but the
+    // policy stays in DryRun and nothing is tapped.
+    let mode = if args.confirm_login {
+        Mode::Live
+    } else {
+        Mode::DryRun
+    };
+    let log = if args.json {
+        RunLog::new(&store.root)?.quiet()
+    } else {
+        RunLog::new(&store.root)?
+    };
+    let target: InstanceTargetArgs = args.target.clone().into();
+    let mut result = new_run_result(mode, &log, &target);
+    result.login_only = Some(true);
+    seed_result_identity(store, &target, &mut result);
+    log.event(
+        "start",
+        serde_json::json!({
+            "mode": mode.as_str(),
+            "action": "login_only",
+            "app_version": VERSION,
+            "git_commit": GIT_COMMIT,
+            "git_dirty": git_dirty(),
+            "build_id": build_id(),
+        }),
+    )?;
+
+    let code = login_inner(store, &args, mode, &log, &mut result)?;
+    finalize_run(&log, &mut result)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print_run_summary(&result);
+    }
+    Ok(code)
+}
+
+fn login_inner(
+    store: &ConfigStore,
+    args: &LoginArgs,
+    mode: Mode,
+    log: &RunLog,
+    result: &mut RunResult,
+) -> Result<ExitCode> {
+    // With `--json`, stdout must stay a single machine-readable document; the
+    // human-facing notes below go to stderr instead.
+    let note = |text: &str| {
+        if args.json {
+            eprintln!("{text}");
+        } else {
+            println!("{text}");
+        }
+    };
+    result.error_stage = Some("device_setup".into());
+    let target: InstanceTargetArgs = args.target.clone().into();
+    let (_ld, device, info) =
+        match runtime_with_target_recording(store, true, Some(&target), Some(result)) {
+            Ok(value) => value,
+            Err(error) => return Ok(reported_device_failure(error)),
+        };
+
+    // Profile detection is informational here: login taps use hierarchy bounds,
+    // so an unknown or uncalibrated profile must not block session setup.
+    result.error_stage = Some("profile_detection".into());
+    result.screen_width = Some(info.width);
+    result.screen_height = Some(info.height);
+    result.density_dpi = Some(info.density_dpi);
+    if let Some(profile) = profile::find_profile(info.width, info.height, info.density_dpi) {
+        result.profile_id = Some(profile.id.to_string());
+    } else {
+        log.event(
+            "profile_unknown",
+            serde_json::json!({"width":info.width,"height":info.height,"dpi":info.density_dpi}),
+        )?;
+    }
+
+    result.error_stage = Some("app_launch".into());
+    launch_package_if_needed(&device, store, log)?;
+    result.error_stage = Some("app_foreground".into());
+    if wait_for_package(
+        &device,
+        &store.config.app.package_name,
+        Duration::from_secs(store.config.runtime.startup_timeout_seconds),
+    )
+    .is_err()
+    {
+        set_run_failure(
+            result,
+            "app_start_timeout",
+            "app_foreground",
+            "请在模拟器中手动打开目标 App 后重新运行。",
+        );
+        return Ok(ExitCode::Timeout);
+    }
+    thread::sleep(Duration::from_millis(800));
+    log_foreground_snapshot(&device, log, "after_wait_for_package", result)?;
+
+    result.error_stage = Some("auto_login".into());
+    let attempt = auto_login::login_only(
+        &device,
+        log,
+        result,
+        store,
+        mode,
+        &store.config.app.package_name,
+    )?;
+    let code = match attempt {
+        auto_login::LoginAttempt::Disabled => {
+            set_run_failure(
+                result,
+                "auto_login_disabled",
+                "auto_login",
+                "自动登录未启用；请先设置 runtime.allow_auto_login = true。",
+            );
+            ExitCode::BusinessFailure
+        }
+        auto_login::LoginAttempt::AlreadyLoggedIn => {
+            // Already past the login page: success with no tap.
+            note("当前已登录（页面不是登录页）；未执行任何点击。");
+            ExitCode::Ok
+        }
+        auto_login::LoginAttempt::NotLoginPage => {
+            set_run_failure(
+                result,
+                "not_login_page",
+                "auto_login",
+                "当前不是登录页（可能已登录）；无需执行 login。",
+            );
+            ExitCode::BusinessFailure
+        }
+        auto_login::LoginAttempt::Ready => {
+            note("登录页前置条件满足；未传 --confirm-login，因此没有点击。");
+            ExitCode::Ok
+        }
+        auto_login::LoginAttempt::Succeeded => ExitCode::Ok,
+        auto_login::LoginAttempt::Refused(code) => auto_login::exit_code_for(code),
+    };
+    Ok(code)
+}
+
 fn run_inner(
     store: &ConfigStore,
-    args: &RunArgs,
-    mode: Mode,
+    policy: &RunPolicy,
     log: &RunLog,
     result: &mut RunResult,
 ) -> Result<ExitCode> {
     run_inner_with_device(
         store,
-        args,
-        mode,
+        policy,
         log,
         result,
         |store, launch, target, result| {
@@ -1938,6 +1989,10 @@ fn describe_route_failure(route: PageRoute) -> (&'static str, &'static str) {
             "stale_page_refresh_unconfirmed",
             "启动时停留在旧的签到页，返回后页面层级无法读取；请手动返回首页后重新运行。",
         ),
+        PageRoute::AppRestartDialog => (
+            "app_restart_dialog",
+            "检测到 App 的“是否重启App / 当前 App 可能被界面劫持”安全弹窗；程序未点击。请在模拟器中点击“取消”或“重启App”，并检查是否有悬浮窗/录屏/辅助功能后重新运行。",
+        ),
         PageRoute::AppLeftForeground => (
             "target_app_not_foreground",
             "启动时停留在旧的签到页，返回后目标 App 已离开前台（可能退到了桌面）；程序未执行点击。请手动把 App 的普通签到页切回前台后重新运行。",
@@ -2102,8 +2157,7 @@ fn is_date_or_status_label(label: &str) -> bool {
 }
 fn run_inner_with_device<F>(
     store: &ConfigStore,
-    args: &RunArgs,
-    mode: Mode,
+    policy: &RunPolicy,
     log: &RunLog,
     result: &mut RunResult,
     runtime_provider: F,
@@ -2116,10 +2170,11 @@ where
         &mut RunResult,
     ) -> Result<(ldplayer::LdPlayer, adb::AdbDevice, adb::DeviceInfo)>,
 {
+    let mode = policy.mode;
     result.error_stage = Some("device_setup".into());
-    let (ld, device, info) = runtime_provider(store, true, &args.target, result)?;
+    let (ld, device, info) = runtime_provider(store, true, &policy.target, result)?;
     result.serial = device.serial.clone();
-    let selected = resolve_instance_target(&ld, store, Some(&args.target))?;
+    let selected = resolve_instance_target(&ld, store, Some(&policy.target))?;
     result.instance_index = Some(selected.index);
     result.instance_name = Some(selected.name);
 
@@ -2155,10 +2210,7 @@ where
     }
 
     result.error_stage = Some("app_launch".into());
-    device.launch_package(
-        &store.config.app.package_name,
-        &store.config.app.activity_name,
-    )?;
+    launch_package_if_needed(&device, store, log)?;
     result.error_stage = Some("app_foreground".into());
     if wait_for_package(
         &device,
@@ -2749,7 +2801,7 @@ where
                         checkin_mode: confirmed_mode,
                         allow_field_work: store.config.runtime.allow_field_work_live,
                         mode,
-                        explicit_confirmation: args.confirm,
+                        explicit_confirmation: policy.explicit_confirmation,
                         profile_calibrated: profile.calibrated,
                         foreground_matches,
                         within_window: policy_window,
@@ -2969,6 +3021,30 @@ fn connect_adb_device(adb_path: &Path, serial: &str, timeout: Duration) -> Resul
         }
         thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Launch the target App only when it is not already the foreground package.
+///
+/// `am start` restarts the existing activity even when the App is already on
+/// screen. The App's own anti-hijack prompt can appear after such a restart
+/// (observed on 2026-10-21 as "是否重启App / 当前 App 可能被界面劫持"), so a
+/// no-op launch avoids one known trigger without skipping the foreground wait.
+fn launch_package_if_needed(
+    device: &adb::AdbDevice,
+    store: &ConfigStore,
+    log: &RunLog,
+) -> Result<()> {
+    let package = &store.config.app.package_name;
+    match device.current_package() {
+        Ok(current) if current == *package => {
+            log.event(
+                "app_launch_skipped",
+                serde_json::json!({"package": package, "reason": "already_foreground"}),
+            )?;
+        }
+        _ => device.launch_package(package, &store.config.app.activity_name)?,
+    }
+    Ok(())
 }
 
 fn wait_for_package(device: &adb::AdbDevice, package: &str, timeout: Duration) -> Result<()> {
@@ -3551,6 +3627,12 @@ fn unconfirmed_route_for(
     if route == PageRoute::RouteCandidateUnconfirmed {
         return route;
     }
+    // The anti-hijack prompt shows the old check-in page behind it, so a
+    // detected control in the screenshot must not turn it into a generic
+    // evidence conflict; the dialog itself is the finding.
+    if route == PageRoute::AppRestartDialog {
+        return route;
+    }
     match visual_candidate(image, profile) {
         VisualCandidate::Detected(state) if state != vision::ButtonState::Unknown => {
             PageRoute::RouteEvidenceConflict
@@ -3589,7 +3671,9 @@ fn stale_refresh_route(
         // rather than inventing a navigation result.
         None => PageRoute::StalePageRefreshUnconfirmed,
         Some(_) => {
-            if fresh_route == PageRoute::RouteCandidateUnconfirmed {
+            if fresh_route == PageRoute::AppRestartDialog {
+                PageRoute::AppRestartDialog
+            } else if fresh_route == PageRoute::RouteCandidateUnconfirmed {
                 PageRoute::StalePageRefreshUnconfirmed
             } else {
                 PageRoute::StalePageRefreshFailed
@@ -4105,6 +4189,126 @@ mod tests {
     }
 
     #[test]
+    fn app_install_and_task_delete_require_an_explicit_confirm_flag() {
+        assert!(
+            super::Cli::try_parse_from(["zhfd-checkin", "app", "install", "--apk", "app.apk",])
+                .is_err(),
+            "app install 必须在 clap 层要求 --confirm"
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "zhfd-checkin",
+                "app",
+                "install",
+                "--apk",
+                "app.apk",
+                "--confirm",
+            ])
+            .is_ok()
+        );
+        assert!(
+            super::Cli::try_parse_from(["zhfd-checkin", "task", "delete"]).is_err(),
+            "task delete 必须在 clap 层要求 --confirm"
+        );
+        assert!(
+            super::Cli::try_parse_from(["zhfd-checkin", "task", "delete", "--confirm"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn task_create_accepts_dry_run_and_rejects_a_mode_conflict() {
+        assert!(
+            super::Cli::try_parse_from(["zhfd-checkin", "task", "create", "--dry-run"]).is_ok()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "zhfd-checkin",
+                "task",
+                "create",
+                "--dry-run",
+                "--live",
+                "--confirm",
+            ])
+            .is_err(),
+            "--dry-run 与 --live 不能同时用于计划任务"
+        );
+    }
+
+    #[test]
+    fn run_json_flag_and_top_level_aliases_parse() {
+        assert!(super::Cli::try_parse_from(["zhfd-checkin", "run", "--dry-run", "--json"]).is_ok());
+        assert!(super::Cli::try_parse_from(["zhfd-checkin", "doctor"]).is_ok());
+        assert!(
+            super::Cli::try_parse_from(
+                ["zhfd-checkin", "analyze-image", "--image", "fixture.png",]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn login_command_parses_and_has_no_profile_requirement() {
+        let cli = super::Cli::try_parse_from(["zhfd-checkin", "login"]).expect("login");
+        match cli.command {
+            Some(super::CommandKind::Login(args)) => {
+                assert!(!args.confirm_login);
+                assert!(!args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let cli = super::Cli::try_parse_from([
+            "zhfd-checkin",
+            "login",
+            "--confirm-login",
+            "--instance-index",
+            "0",
+        ])
+        .expect("login --confirm-login");
+        match cli.command {
+            Some(super::CommandKind::Login(args)) => {
+                assert!(args.confirm_login);
+                assert_eq!(args.target.instance_index, Some(0));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn login_only_results_converge_to_success_only_when_login_succeeded() {
+        let root = temp_root("login-only-finalize");
+        let log = RunLog::new(&root).unwrap();
+
+        let mut probe = new_run_result(Mode::DryRun, &log, &super::InstanceTargetArgs::default());
+        probe.login_only = Some(true);
+        probe.auto_login_ready = Some(true);
+        finalize_run(&log, &mut probe).unwrap();
+        assert_eq!(probe.status.as_deref(), Some(RunStatus::Success.as_str()));
+        assert!(!probe.clicked);
+
+        // A refused login-only action carries an error code and stays failed.
+        let mut refused = new_run_result(Mode::Live, &log, &super::InstanceTargetArgs::default());
+        refused.login_only = Some(true);
+        refused.auto_login_attempted = Some(false);
+        set_run_failure(&mut refused, "auto_login_disabled", "auto_login", "未启用");
+        finalize_run(&log, &mut refused).unwrap();
+        assert_eq!(refused.status.as_deref(), Some(RunStatus::Failed.as_str()));
+
+        let mut logged_in = new_run_result(Mode::Live, &log, &super::InstanceTargetArgs::default());
+        logged_in.login_only = Some(true);
+        logged_in.auto_login_attempted = Some(true);
+        logged_in.auto_login_succeeded = Some(true);
+        logged_in.auto_login_tap_count = Some(1);
+        finalize_run(&log, &mut logged_in).unwrap();
+        assert_eq!(
+            logged_in.status.as_deref(),
+            Some(RunStatus::Success.as_str())
+        );
+        // A login tap is never reported as a check-in tap.
+        assert!(!logged_in.clicked);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn profile_sync_requires_an_explicit_confirm_flag() {
         assert!(
             super::Cli::try_parse_from([
@@ -4164,7 +4368,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(super::CommandKind::Config {
-                command: super::ConfigCommand::Path
+                command: super::CliConfigCommand::Path
             })
         ));
     }
@@ -4614,6 +4818,26 @@ mod tests {
             find_clickable_labeled_bounds(&page(malformed_then_valid), "晚点名签到", 100),
             Some((20, 220))
         );
+    }
+
+    #[test]
+    fn app_restart_dialog_outranks_checkin_and_login_markers() {
+        let dialog = page(
+            r#"
+            <node text="晚点名签到"/>
+            <node text="签到成功"/>
+            <node text="是否重启App"/>
+            <node text="当前 App 可能被界面劫持"/>
+            <node text="取消"/>
+            <node text="重启App"/>
+            "#,
+        );
+        assert_eq!(detect_page_route(&dialog), PageRoute::AppRestartDialog);
+        assert_eq!(
+            PageRoute::AppRestartDialog.error_code(),
+            Some("app_restart_dialog")
+        );
+        assert_eq!(PageRoute::AppRestartDialog.as_str(), "app_restart_dialog");
     }
 
     #[test]

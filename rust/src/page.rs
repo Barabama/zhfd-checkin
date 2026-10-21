@@ -251,6 +251,15 @@ pub(crate) fn detect_checkin_mode(view: &PageView) -> CheckinMode {
 
 pub(crate) fn detect_page_route(view: &PageView) -> PageRoute {
     let xml = &view.scoped_text;
+    // The App's anti-hijack prompt must be recognized before any page marker:
+    // its background still shows the old check-in page, and nothing in the
+    // dialog may be tapped automatically.
+    if xml.contains("是否重启App")
+        || xml.contains("当前 App 可能被界面劫持")
+        || (xml.contains("重启App") && xml.contains("取消"))
+    {
+        return PageRoute::AppRestartDialog;
+    }
     if xml.contains("一键登录") || xml.contains("其他账户登录") {
         return PageRoute::Login;
     }

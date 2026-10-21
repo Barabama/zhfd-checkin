@@ -319,7 +319,7 @@ zhfd-checkin [--config PATH] <command>
 
 ---
 
-## 9. Remediation（2026-10-21，Phase 1 已实现）
+## 9. Remediation（2026-10-21，Phase 1 + Phase 2a 已实现）
 
 | 发现 | 状态 | 变更 |
 |---|---|---|
@@ -330,6 +330,11 @@ zhfd-checkin [--config PATH] <command>
 | P2-1 配置预加载 | **已修复（Phase 1 范围）** | `vision`、`profile list`、`task query/delete` 不再加载配置；新增 `config path`，用 `ConfigStore::resolve_path` 在**不解析、不创建**配置的情况下输出 resolved path/root/origin/exists，因此损坏配置时也可用 |
 | P2-5 `--all-instances` 帮助 | **已修复** | 帮助改为“配置中 enabled 的实例（不能与实例选择器组合）” |
 | P2-13 CLI 测试 | **部分修复** | 新增 mode/confirm/批处理互斥、profile sync confirm、help about、config path、损坏配置下 profile list 的解析/行为测试 |
-| P2-2/P2-6/P2-7/P2-8/P2-9/P2-10/P2-11/P2-12、P3 | **未修复** | 留待 Phase 2/3：mode 默认统一、app install/task delete 确认、命令改名、typed command 层、handler 输出拆分、GUI clap 解耦、退出码分类 |
+| P2-6 变更型命令确认 | **已修复（Phase 2a）** | `app install` 与 `task delete` 在 clap 层要求 `--confirm`；GUI 的删除按钮显式传 `confirm: true` |
+| P2-2 `task create` mode | **部分修复（Phase 2a）** | 新增显式 `--dry-run`（与 `--live` 互斥），创建后打印解析后的 mode 和触发时间；默认仍是 dry-run，不跟随 `runtime.mode` |
+| P2-7 输出/别名 | **部分修复（Phase 2a）** | `run` 默认输出人类可读摘要（状态/页面/点击/错误/下一步/结果文件），`--json` 输出纯 JSON；新增 `doctor`（diagnose alias）与 `analyze-image`（vision alias） |
+| P2-8 命令语法 | **部分修复** | 顶层仅新增两个 alias；`app`/`instance`/`ui` 单子命令分组仍在，留待 Phase 3 |
+| DRY-01（V0.3.3 审计） | **已修复（Phase 2b）** | 新增一级 `login [--confirm-login]`：无 confirm 只探测、零 tap；有 confirm 最多一次协议 + 一次登录，不进入签到、不要求 Profile 标定；见 ADR-0005。2026-10-21 现场验证：index 0（720x1280@320，未标定）login `status=success`、`tap_count=1`、`clicked=false`，随后 `run --dry-run` 观察到 `checkin/ordinary/ready` |
+| P2-9/P2-10/P2-11/P2-12、P3 | **未修复** | 留待 Phase 3：typed command 层、handler 输出拆分、GUI clap 解耦、退出码分类、命令改名 |
 
 > 本节是审计后的 remediation 记录，不改变上文的时点结论。Phase 1 未修改 `guarded_tap` / `authorize_*` 门禁顺序。

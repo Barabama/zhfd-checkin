@@ -32,6 +32,10 @@ pub enum PageRoute {
     /// carried no page-identity markers, or the foreground package could not be
     /// read at all.
     StalePageRefreshUnconfirmed,
+    /// The App's own "是否重启App / 当前 App 可能被界面劫持" security prompt is
+    /// on screen. It is a blocking dialog with no check-in action; the run must
+    /// stop without tapping it.
+    AppRestartDialog,
     /// After the stale-page refresh BACK, the target App was no longer the
     /// foreground package (for example the BACK dropped the App to the
     /// Launcher). The run stops here with no further navigation or tap; the
@@ -56,6 +60,7 @@ impl PageRoute {
             Self::RouteEvidenceConflict => "route_evidence_conflict",
             Self::StalePageRefreshFailed => "stale_page_refresh_failed",
             Self::StalePageRefreshUnconfirmed => "stale_page_refresh_unconfirmed",
+            Self::AppRestartDialog => "app_restart_dialog",
             Self::AppLeftForeground => "app_left_foreground",
         }
     }
@@ -71,6 +76,7 @@ impl PageRoute {
             Self::RouteEvidenceConflict => Some("route_evidence_conflict"),
             Self::StalePageRefreshFailed => Some("stale_page_refresh_failed"),
             Self::StalePageRefreshUnconfirmed => Some("stale_page_refresh_unconfirmed"),
+            Self::AppRestartDialog => Some("app_restart_dialog"),
             // Reuses the FR-013 code that already names this exact condition
             // (target App no longer foreground) instead of inventing a synonym.
             Self::AppLeftForeground => Some("target_app_not_foreground"),
@@ -360,6 +366,10 @@ pub struct RunResult {
     /// which remains reserved for the check-in control.
     #[serde(default)]
     pub auto_login_tap_count: Option<u32>,
+    /// `true` for a standalone `login` action (session setup, no check-in).
+    /// `None` on ordinary `run` results and on historical results.
+    #[serde(default)]
+    pub login_only: Option<bool>,
     #[serde(default)]
     pub page_route: Option<PageRoute>,
     #[serde(default)]

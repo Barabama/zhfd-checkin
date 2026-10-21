@@ -17,6 +17,9 @@ pub struct RunLog {
     /// read must carry a unique id across the whole run, not just within one
     /// navigation stage (requirement FR-011).
     observations: AtomicUsize,
+    /// Whether events are also echoed to stdout. Scripts that request `--json`
+    /// get a single machine-readable document instead of an event stream.
+    echo_events: bool,
 }
 
 pub struct SyncLog {
@@ -145,6 +148,7 @@ impl RunLog {
             events: dir.join("events.jsonl"),
             dir,
             observations: AtomicUsize::new(0),
+            echo_events: true,
         })
     }
 
@@ -163,8 +167,19 @@ impl RunLog {
             .append(true)
             .open(&self.events)?;
         writeln!(f, "{}", line)?;
-        println!("{}", line);
+        if self.echo_events {
+            println!("{}", line);
+        }
         Ok(())
+    }
+
+    /// Suppress the stdout event echo; `events.jsonl` is still written.
+    ///
+    /// Used by `--json` so stdout carries exactly one machine-readable
+    /// document instead of an event stream followed by JSON.
+    pub fn quiet(mut self) -> Self {
+        self.echo_events = false;
+        self
     }
     pub fn save_bytes(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         let p = self.dir.join("screenshots").join(name);
@@ -709,6 +724,7 @@ mod tests {
             auto_login_account_configured: None,
             auto_login_account_matched: None,
             auto_login_tap_count: None,
+            login_only: None,
             page_route: Some(crate::domain::PageRoute::Unknown),
             checkin_mode: Some(crate::domain::CheckinMode::Unsupported),
             checkin_state: Some(crate::domain::CheckinState::Unknown),
@@ -783,6 +799,7 @@ mod tests {
             auto_login_account_configured: None,
             auto_login_account_matched: None,
             auto_login_tap_count: None,
+            login_only: None,
             page_route: None,
             checkin_mode: None,
             checkin_state: None,
@@ -851,6 +868,7 @@ mod tests {
             auto_login_account_configured: None,
             auto_login_account_matched: None,
             auto_login_tap_count: None,
+            login_only: None,
             page_route: Some(crate::domain::PageRoute::Checkin),
             checkin_mode: Some(crate::domain::CheckinMode::Ordinary),
             checkin_state: Some(crate::domain::CheckinState::Ready),

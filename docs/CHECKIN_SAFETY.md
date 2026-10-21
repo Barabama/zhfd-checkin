@@ -46,11 +46,35 @@ AND second Ready confirmation AND this run has not tapped
 限制与失败语义：
 
 - 只支持一键登录，不处理「其他账户登录」，不输入/保存任何凭据；
-- 登录页选择与点击坐标来自 hierarchy bounds，不依赖 Profile 几何；但 live 仍需目标 Profile 已标定，未标定预设会在启动前以 `uncalibrated_profile` 停止；
+- 登录页选择与点击坐标来自 hierarchy bounds，不依赖 Profile 几何；
 - 一次运行最多一次登录点击，失败不重试；
 - dry-run 永不点击，只写 `auto_login_ready`；
 - 失败使用稳定的 `auto_login_*` 错误码（`terms_not_accepted`、`consent_unconfirmed`、`account_mismatch`、`blocked`、`timeout`、`not_confirmed` 等）；
 - `auto_login_succeeded=true` 只表示已离开登录页，不代表签到成功；`clicked` 仍只表示签到按钮被点击。
+
+### 独立 login 命令（ADR-0005）
+
+`zhfd-checkin login [--confirm-login] [--json] [target]` 是**会话建立**动作，与签到分离：
+
+- 无 `--confirm-login` → 只探测登录页，写 `auto_login_ready`，零 tap；
+- 有 `--confirm-login` → 最多一次协议复选框点击 + 一次登录点击，完成后退出；
+- **不进入** `locate_or_navigate`、**不调用** `guarded_tap`、不读取或点击签到控件；
+- **不要求 Profile 标定**（坐标来自 hierarchy bounds）；`allow_auto_login` + `accept_login_terms` 仍必须开启；
+- `result.login_only=true`，`auto_login_tap_count` 记录登录点击，`clicked=false`；
+- 失败使用同一组 `auto_login_*` 错误码；`not_login_page` 表示当前不是登录页。
+
+`run` 的 live 自动登录仍可能在启动前被 `uncalibrated_profile` 拦截；这是签到 Profile 门禁，不是 login 命令的门禁。
+
+## App 安全弹窗（是否重启App）
+
+2026-10-21 现场发现 App 会弹出「是否重启App / 当前 App 可能被界面劫持」的安全弹窗，背景仍是旧的签到页。该弹窗没有签到身份标记，旧版本会报 `route_candidate_unconfirmed`，无法判断原因。
+
+现在：
+
+- 识别到 `是否重启App`、`当前 App 可能被界面劫持`，或同时出现 `重启App` + `取消`，路由记为 `app_restart_dialog`；
+- 程序**不点击**弹窗中的任何按钮，保存 `navigation_result.png`，返回 `error_code=app_restart_dialog`；
+- `recovery_action` 提示手动点击「取消」或「重启App」，并检查悬浮窗/录屏/辅助功能；
+- 启动时若目标 App 已在前台，不再重复发送 `am start`（事件 `app_launch_skipped`），减少 activity 重启触发该弹窗的概率。
 
 ## 旧签到页刷新（stale page refresh）
 

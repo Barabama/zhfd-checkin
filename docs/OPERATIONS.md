@@ -51,9 +51,14 @@ zhfd-checkin.exe instance list
 zhfd-checkin.exe profile list
 zhfd-checkin.exe profile detect --instance-index 0
 zhfd-checkin.exe ui dump --instance-index 0   # 原始 hierarchy 可能含 PII
+zhfd-checkin.exe login --instance-index 0     # 只探测登录页，零 tap
 ```
 
 在自动发现与设备目标确认前，不要运行 `--all-instances`。`run --dry-run` 可能启动 App、导航或等待设备，但不应执行签到 tap；它仍属于设备动态操作，应由用户/审计者在目标环境决定。`--all-instances` 只运行配置中 enabled 的实例，且不能与 `--instance-index`/`--serial` 组合。
+
+`run` 默认输出人类可读摘要；脚本解析请加 `--json`。变更型命令 `app install`、`task delete`、`profile sync`、`task create --live`、`run --live` 都要求显式 `--confirm`（clap 层 exit 2）。
+
+`login` 是独立的会话建立命令：`login` 只探测；`login --confirm-login` 最多执行一次协议勾选 + 一次一键登录，不进入签到导航、不要求 Profile 标定。
 
 ## 多实例与 TCP serial
 
