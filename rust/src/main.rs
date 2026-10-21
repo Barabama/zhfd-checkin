@@ -69,13 +69,18 @@ fn build_id_for(version: &str, commit: &str, dirty: Option<bool>) -> String {
 }
 
 #[derive(Parser, Debug)]
-#[command(name="zhfd-checkin", version=VERSION, about="智汇福大 LDPlayer 自动签到控制器")]
+#[command(
+    name="zhfd-checkin",
+    version=VERSION,
+    about="智汇福大 LDPlayer 自动签到控制器",
+    after_help = "首次使用（只读，不点击）：\n  zhfd-checkin.exe about\n  zhfd-checkin.exe diagnose --instance-index 0\n  zhfd-checkin.exe run --dry-run --instance-index 0\n\n无子命令将启动 GUI；脚本必须显式传子命令。\nlive 会真实点击签到按钮，必须同时传 --live --confirm；dry-run 永不点击签到按钮。"
+)]
 struct Cli {
     #[arg(
         long,
         global = true,
         value_name = "PATH",
-        help = "显式指定 config.toml;其父目录即为 data root"
+        help = "显式指定 config.toml；其父目录即为 data root"
     )]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -84,54 +89,73 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CommandKind {
+    /// 只读环境与设备诊断（不点击、不修改配置）
     Diagnose {
         #[command(flatten)]
         target: InstanceTargetArgs,
     },
+    /// 生成默认脱敏的诊断报告（reports/diagnostic-*.json）
     Report,
+    /// Profile 查询、检测与同步
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    /// 运行签到状态机（默认跟随 runtime.mode；live 必须 --confirm）
     Run(RunArgs),
+    /// APK 安装
     App {
         #[command(subcommand)]
         command: AppCommand,
     },
+    /// 配置查询与打开（show 默认脱敏）
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// 版本与构建来源
     About,
+    /// 打开 GUI（无子命令时也会进入这里）
     Gui,
+    /// 实例列表
     Instance {
         #[command(subcommand)]
         command: InstanceCommand,
     },
+    /// Windows 计划任务
     Task {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// 原始 UI hierarchy（可能含账号/姓名等 PII）
     Ui {
         #[command(subcommand)]
         command: UiCommand,
     },
+    /// 离线图片分类（无需配置）
     Vision {
-        #[arg(long)]
+        #[arg(long, value_name = "FILE", help = "要分类的本地截图路径")]
         image: PathBuf,
     },
 }
 #[derive(Subcommand, Debug)]
 enum ProfileCommand {
+    /// 列出内置 Profile
     List,
+    /// 检测当前实例的分辨率/DPI 并匹配 Profile
     Detect {
         #[command(flatten)]
         target: InstanceTargetArgs,
     },
+    /// 修改模拟器分辨率/DPI 并重启实例（危险，必须 --confirm）
     Sync {
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "ID",
+            help = "要同步的 Profile ID，例如 portrait_900x1600_d320"
+        )]
         id: String,
-        #[arg(long)]
+        #[arg(long, required = true, help = "显式确认修改分辨率/DPI 并重启实例")]
         confirm: bool,
         #[command(flatten)]
         target: InstanceTargetArgs,
@@ -139,8 +163,9 @@ enum ProfileCommand {
 }
 #[derive(Subcommand, Debug)]
 enum AppCommand {
+    /// 安装 APK 到目标实例（可能自动启动模拟器并写入配置）
     Install {
-        #[arg(long)]
+        #[arg(long, value_name = "APK", help = "APK 文件路径")]
         apk: PathBuf,
         #[command(flatten)]
         target: InstanceTargetArgs,
@@ -148,11 +173,16 @@ enum AppCommand {
 }
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
+    /// 输出解析后的配置路径、数据根与来源
+    Path,
+    /// 输出配置（账号与通知地址默认脱敏）
     Show,
+    /// 用系统编辑器打开明文配置文件
     Open,
 }
 #[derive(Subcommand, Debug)]
 enum InstanceCommand {
+    /// 列出 LDPlayer 与配置中的实例
     List,
 }
 
@@ -160,35 +190,62 @@ enum InstanceCommand {
 struct InstanceTargetArgs {
     #[arg(long, help = "选择 LDPlayer 实例 index；默认使用 config.toml")]
     instance_index: Option<u32>,
-    #[arg(long, help = "显式指定 ADB serial；覆盖实例 index 推导值")]
+    #[arg(
+        long,
+        help = "显式指定 ADB serial；与 --instance-index 同时使用时必须指向同一实例"
+    )]
     serial: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
 enum TaskCommand {
+    /// 创建每日计划任务（默认 dry-run；live 需 --confirm）
     Create {
-        #[arg(long, default_value = "ZHFD-AutoCheckin")]
+        #[arg(
+            long,
+            default_value = "ZHFD-AutoCheckin",
+            help = "Windows 计划任务名称"
+        )]
         name: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            requires = "confirm",
+            help = "让计划任务执行真实签到（高风险；必须同时传 --confirm）"
+        )]
         live: bool,
-        #[arg(long, requires = "live")]
+        #[arg(long, requires = "live", help = "显式授权 live 计划任务")]
         confirm: bool,
-        #[arg(long, help = "让计划任务依次运行所有已发现实例")]
+        #[arg(
+            long,
+            conflicts_with_all = ["instance_index", "serial"],
+            help = "依次运行配置中 enabled 的所有实例（不能与实例选择器组合）"
+        )]
         all_instances: bool,
         #[command(flatten)]
         target: InstanceTargetArgs,
     },
+    /// 删除计划任务
     Delete {
-        #[arg(long, default_value = "ZHFD-AutoCheckin")]
+        #[arg(
+            long,
+            default_value = "ZHFD-AutoCheckin",
+            help = "Windows 计划任务名称"
+        )]
         name: String,
     },
+    /// 查询计划任务
     Query {
-        #[arg(long, default_value = "ZHFD-AutoCheckin")]
+        #[arg(
+            long,
+            default_value = "ZHFD-AutoCheckin",
+            help = "Windows 计划任务名称"
+        )]
         name: String,
     },
 }
 #[derive(Subcommand, Debug)]
 enum UiCommand {
+    /// dump 当前 UI hierarchy（可能含账号/姓名等 PII）
     Dump {
         #[command(flatten)]
         target: InstanceTargetArgs,
@@ -196,13 +253,30 @@ enum UiCommand {
 }
 #[derive(Args, Debug, Clone)]
 struct RunArgs {
-    #[arg(long, conflicts_with = "live")]
+    #[arg(
+        long,
+        conflicts_with = "live",
+        help = "只观察，不点击签到按钮（首次推荐）"
+    )]
     dry_run: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        requires = "confirm",
+        help = "真实签到模式；必须同时传 --confirm（危险）"
+    )]
     live: bool,
-    #[arg(long, requires = "live")]
+    #[arg(
+        long,
+        requires = "live",
+        conflicts_with = "dry_run",
+        help = "显式授权真实点击；只能与 --live 一起使用"
+    )]
     confirm: bool,
-    #[arg(long, help = "依次运行所有已发现的 LDPlayer 实例")]
+    #[arg(
+        long,
+        conflicts_with_all = ["instance_index", "serial"],
+        help = "依次运行配置中 enabled 的所有实例（不能与实例选择器组合）"
+    )]
     all_instances: bool,
     #[command(flatten)]
     target: InstanceTargetArgs,
@@ -236,16 +310,27 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
         // `gui` must never be blocked by a broken config: the GUI is the only
         // Repair entry point, so it launches and shows the recovery page itself.
         CommandKind::Gui => launch_gui_companion(config_path.as_deref()),
+        // Pure local commands do not need a config and must stay usable while
+        // the config is damaged (troubleshooting/repair path).
+        CommandKind::Vision { image } => analyze_image(&image),
+        CommandKind::Profile {
+            command: ProfileCommand::List,
+        } => profile_list(),
+        CommandKind::Config {
+            command: ConfigCommand::Path,
+        } => config_path_command(config_path.as_deref()),
+        CommandKind::Task { command } => task_command(command, config_path.as_deref()),
         command => {
             let store = load_store_for_cli(config_path.as_deref())?;
             match command {
-                CommandKind::About | CommandKind::Gui => unreachable!(),
-                CommandKind::Instance { command } => instance_command(&store, command),
-                CommandKind::Task { command } => task_command(command, config_path.as_deref()),
-                CommandKind::Ui { command } => ui_command(&store, command),
-                CommandKind::Vision { image } => analyze_image(&image),
-                CommandKind::Config { command } => config_command(&store, command),
+                CommandKind::About
+                | CommandKind::Gui
+                | CommandKind::Vision { .. }
+                | CommandKind::Task { .. } => unreachable!(),
                 CommandKind::Profile { command } => profile_command(&store, command),
+                CommandKind::Instance { command } => instance_command(&store, command),
+                CommandKind::Ui { command } => ui_command(&store, command),
+                CommandKind::Config { command } => config_command(&store, command),
                 CommandKind::Diagnose { target } => diagnose(&store, &target),
                 CommandKind::Report => write_report(&store),
                 CommandKind::App { command } => app_command(&store, command),
@@ -622,8 +707,25 @@ fn print_about() {
     println!("GUI: eframe/egui + rfd");
 }
 
+fn config_path_command(explicit: Option<&Path>) -> Result<ExitCode> {
+    let (path, origin, exists) = ConfigStore::resolve_path(explicit)?;
+    println!("path={}", path.display());
+    if let Some(root) = path.parent() {
+        println!("root={}", root.display());
+    }
+    println!("origin={}", origin.as_str());
+    println!("exists={}", exists);
+    Ok(ExitCode::Ok)
+}
+
 fn config_command(store: &ConfigStore, command: ConfigCommand) -> Result<ExitCode> {
     match command {
+        ConfigCommand::Path => {
+            println!("path={}", store.path.display());
+            println!("root={}", store.root.display());
+            println!("origin={}", store.origin.as_str());
+            println!("created_default={}", store.created_default);
+        }
         ConfigCommand::Show => {
             // Redacted by default: this output is commonly pasted into issues.
             // Use `config open` (or the config file itself) when the operator
@@ -651,21 +753,24 @@ fn config_command(store: &ConfigStore, command: ConfigCommand) -> Result<ExitCod
     Ok(ExitCode::Ok)
 }
 
+fn profile_list() -> Result<ExitCode> {
+    for p in profile::PROFILES {
+        println!(
+            "{} {}x{}@{} {} calibrated={}",
+            p.id,
+            p.width,
+            p.height,
+            p.density_dpi,
+            p.orientation.as_str(),
+            p.calibrated
+        );
+    }
+    Ok(ExitCode::Ok)
+}
+
 fn profile_command(store: &ConfigStore, command: ProfileCommand) -> Result<ExitCode> {
     match command {
-        ProfileCommand::List => {
-            for p in profile::PROFILES {
-                println!(
-                    "{} {}x{}@{} {} calibrated={}",
-                    p.id,
-                    p.width,
-                    p.height,
-                    p.density_dpi,
-                    p.orientation.as_str(),
-                    p.calibrated
-                );
-            }
-        }
+        ProfileCommand::List => return profile_list(),
         ProfileCommand::Detect { target } => {
             let (_, device, info) = runtime_with_target(store, false, Some(&target))?;
             print_device(&device.serial, &info);
@@ -3577,6 +3682,7 @@ mod tests {
     };
     use anyhow::Result;
     // `Parser` provides `try_parse_from`, used by the CLI argument tests.
+    use clap::CommandFactory;
     use clap::Parser;
     use std::{
         cell::{Cell, RefCell},
@@ -3937,6 +4043,164 @@ mod tests {
         // Without the flag the default path-selection chain applies.
         let cli = super::Cli::try_parse_from(["zhfd-checkin", "run", "--dry-run"]).unwrap();
         assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn run_rejects_conflicting_mode_and_batch_selectors() {
+        for args in [
+            vec!["zhfd-checkin", "run", "--dry-run", "--confirm"],
+            vec![
+                "zhfd-checkin",
+                "run",
+                "--all-instances",
+                "--instance-index",
+                "0",
+            ],
+            vec![
+                "zhfd-checkin",
+                "run",
+                "--all-instances",
+                "--serial",
+                "127.0.0.1:5555",
+            ],
+        ] {
+            assert!(
+                super::Cli::try_parse_from(&args).is_err(),
+                "应拒绝冲突参数: {args:?}"
+            );
+        }
+        assert!(super::Cli::try_parse_from(["zhfd-checkin", "run", "--dry-run"]).is_ok());
+        assert!(super::Cli::try_parse_from(["zhfd-checkin", "run", "--live", "--confirm"]).is_ok());
+    }
+
+    #[test]
+    fn task_create_rejects_batch_selector_combination() {
+        for args in [
+            vec![
+                "zhfd-checkin",
+                "task",
+                "create",
+                "--all-instances",
+                "--instance-index",
+                "0",
+            ],
+            vec![
+                "zhfd-checkin",
+                "task",
+                "create",
+                "--all-instances",
+                "--serial",
+                "127.0.0.1:5555",
+            ],
+        ] {
+            assert!(
+                super::Cli::try_parse_from(&args).is_err(),
+                "计划任务不能同时指定 --all-instances 与实例选择器: {args:?}"
+            );
+        }
+        assert!(
+            super::Cli::try_parse_from(["zhfd-checkin", "task", "create", "--all-instances"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn profile_sync_requires_an_explicit_confirm_flag() {
+        assert!(
+            super::Cli::try_parse_from([
+                "zhfd-checkin",
+                "profile",
+                "sync",
+                "--id",
+                "portrait_900x1600_d320",
+            ])
+            .is_err(),
+            "profile sync 必须在 clap 层要求 --confirm"
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "zhfd-checkin",
+                "profile",
+                "sync",
+                "--id",
+                "portrait_900x1600_d320",
+                "--confirm",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn every_top_level_command_has_help_about_and_run_mode_help() {
+        let mut command = super::Cli::command();
+        command.build();
+        for subcommand in command.get_subcommands() {
+            if subcommand.get_name() == "help" {
+                continue;
+            }
+            assert!(
+                subcommand.get_about().is_some(),
+                "子命令 {} 缺少 about",
+                subcommand.get_name()
+            );
+        }
+        let run = command
+            .find_subcommand_mut("run")
+            .expect("run subcommand must exist");
+        run.build();
+        for id in ["dry_run", "live", "confirm", "all_instances"] {
+            let arg = run
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap_or_else(|| panic!("run 缺少参数 {id}"));
+            assert!(arg.get_help().is_some(), "run --{id} 缺少 help");
+        }
+    }
+
+    #[test]
+    fn config_path_subcommand_parses() {
+        let cli =
+            super::Cli::try_parse_from(["zhfd-checkin", "config", "path"]).expect("config path");
+        assert!(matches!(
+            cli.command,
+            Some(super::CommandKind::Config {
+                command: super::ConfigCommand::Path
+            })
+        ));
+    }
+
+    #[test]
+    fn config_path_works_with_a_damaged_config() {
+        let root = temp_root("cli-config-path-damaged");
+        let path = root.join("config.toml");
+        fs::write(&path, "this is not toml").unwrap();
+        let cli = super::Cli::try_parse_from([
+            "zhfd-checkin",
+            "--config",
+            path.to_str().unwrap(),
+            "config",
+            "path",
+        ])
+        .unwrap();
+        assert!(super::run_cli(cli).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn profile_list_does_not_require_a_valid_config() {
+        let root = temp_root("cli-profile-list-no-config");
+        let path = root.join("config.toml");
+        fs::write(&path, "this is not toml").unwrap();
+        let cli = super::Cli::try_parse_from([
+            "zhfd-checkin",
+            "--config",
+            path.to_str().unwrap(),
+            "profile",
+            "list",
+        ])
+        .unwrap();
+        assert!(super::run_cli(cli).is_ok());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

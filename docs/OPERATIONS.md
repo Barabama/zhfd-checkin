@@ -44,15 +44,16 @@ enabled = true
 
 ```powershell
 zhfd-checkin.exe about
-zhfd-checkin.exe config show
+zhfd-checkin.exe config path
+zhfd-checkin.exe config show        # 账号与通知地址默认脱敏
 zhfd-checkin.exe diagnose --instance-index 0
 zhfd-checkin.exe instance list
 zhfd-checkin.exe profile list
 zhfd-checkin.exe profile detect --instance-index 0
-zhfd-checkin.exe ui dump --instance-index 0
+zhfd-checkin.exe ui dump --instance-index 0   # 原始 hierarchy 可能含 PII
 ```
 
-在自动发现与设备目标确认前，不要运行 `--all-instances`。`run --dry-run` 可能启动 App、导航或等待设备，但不应执行签到 tap；它仍属于设备动态操作，应由用户/审计者在目标环境决定。
+在自动发现与设备目标确认前，不要运行 `--all-instances`。`run --dry-run` 可能启动 App、导航或等待设备，但不应执行签到 tap；它仍属于设备动态操作，应由用户/审计者在目标环境决定。`--all-instances` 只运行配置中 enabled 的实例，且不能与 `--instance-index`/`--serial` 组合。
 
 ## 多实例与 TCP serial
 

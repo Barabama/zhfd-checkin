@@ -270,7 +270,47 @@ pub enum ConfigOrigin {
     Recorded,
 }
 
+impl ConfigOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Portable => "portable",
+            Self::LocalAppData => "local_app_data",
+            Self::Recorded => "recorded",
+        }
+    }
+}
+
 impl ConfigStore {
+    /// Resolve the config path, origin and existence without parsing or
+    /// creating the file. Used by `config path` so troubleshooting works even
+    /// when the config is damaged.
+    pub fn resolve_path(explicit: Option<&Path>) -> Result<(PathBuf, ConfigOrigin, bool)> {
+        if let Some(path) = explicit {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                env::current_dir()?.join(path)
+            };
+            let exists = path.is_file();
+            return Ok((path, ConfigOrigin::Explicit, exists));
+        }
+        let recorded = read_recorded_root();
+        let portable = exe_root()?.join("config.toml");
+        let local = local_app_data_root().map(|root| root.join("config.toml"));
+        let (path, origin) = if let Some(recorded) = recorded {
+            (recorded, ConfigOrigin::Recorded)
+        } else if portable.is_file() {
+            (portable, ConfigOrigin::Portable)
+        } else if let Some(local) = local.filter(|path| path.is_file()) {
+            (local, ConfigOrigin::LocalAppData)
+        } else {
+            (portable, ConfigOrigin::Portable)
+        };
+        let exists = path.is_file();
+        Ok((path, origin, exists))
+    }
+
     pub fn load_with_config_path(config_path: Option<&Path>) -> Result<Self> {
         if let Some(path) = config_path {
             let path = if path.is_absolute() {

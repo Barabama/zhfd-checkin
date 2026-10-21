@@ -316,3 +316,20 @@ zhfd-checkin [--config PATH] <command>
 - 行号以审计时工作树为准，函数名比行号稳定。
 - 未覆盖 GUI 黑盒交互、真实设备上的命令组合、发布资产中的 CLI 行为。
 - 未评估 helper/补全（shell completion）、本地化框架等非核心项。
+
+---
+
+## 9. Remediation（2026-10-21，Phase 1 已实现）
+
+| 发现 | 状态 | 变更 |
+|---|---|---|
+| P1-1 计划任务组合 | **已修复** | `run` 与 `task create` 的 `--all-instances` 在 clap 层与 `--instance-index`/`--serial` 互斥；解析测试覆盖 |
+| P1-2 help 不可发现 | **已修复** | 所有一级命令/子命令/关键 flag 补中文 help；顶层 `after_help` 写首次使用路径、无子命令启动 GUI、live/dry-run 安全契约 |
+| P2-3 `--dry-run --confirm` | **已修复** | `--confirm` 与 `--dry-run` 互斥；`--live` 与 `--confirm` 互相 requires（clap exit 2） |
+| P2-4 运行期参数错误 | **部分修复** | `run --live`、`task create --live`、`profile sync --id` 缺少确认时改为 clap exit 2；设备/ADB 错误仍统一 exit 4（未改） |
+| P2-1 配置预加载 | **已修复（Phase 1 范围）** | `vision`、`profile list`、`task query/delete` 不再加载配置；新增 `config path`，用 `ConfigStore::resolve_path` 在**不解析、不创建**配置的情况下输出 resolved path/root/origin/exists，因此损坏配置时也可用 |
+| P2-5 `--all-instances` 帮助 | **已修复** | 帮助改为“配置中 enabled 的实例（不能与实例选择器组合）” |
+| P2-13 CLI 测试 | **部分修复** | 新增 mode/confirm/批处理互斥、profile sync confirm、help about、config path、损坏配置下 profile list 的解析/行为测试 |
+| P2-2/P2-6/P2-7/P2-8/P2-9/P2-10/P2-11/P2-12、P3 | **未修复** | 留待 Phase 2/3：mode 默认统一、app install/task delete 确认、命令改名、typed command 层、handler 输出拆分、GUI clap 解耦、退出码分类 |
+
+> 本节是审计后的 remediation 记录，不改变上文的时点结论。Phase 1 未修改 `guarded_tap` / `authorize_*` 门禁顺序。

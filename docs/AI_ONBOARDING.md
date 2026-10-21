@@ -341,9 +341,10 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 | `run` 的 stdout | 不是纯 JSON；解析 `<data-root>/logs/.../result.json` |
 | `stable_frames = 0` | 配置校验会拒绝；即使绕过，`authorize_click` 也拒绝 0 帧 |
 | `location_timeout_seconds` | 实际被钳制到 1–120 秒 |
-| `task create --all-instances --serial X` | 运行期必然失败；不要组合 |
-| `task query/delete`、`vision` | 也会先加载配置；损坏配置时退 4 |
-| `--confirm` | 只能与 `--live` 一起用；与 `--dry-run` 冲突 |
+| `task create --all-instances --serial X` / `--instance-index N` | clap 解析层拒绝（exit 2）；`--all-instances` 不能与实例选择器组合 |
+| `task query/delete`、`vision`、`profile list` | 不再加载配置；损坏配置下仍可用（`task create` 仍需要配置） |
+| `run --live` / `task create --live` / `profile sync --id X` | clap 要求显式 `--confirm`（exit 2）；live 缺少 confirm 的运行期检查仍保留 |
+| `--confirm` | 只能与 `--live` 一起用；与 `--dry-run` 冲突（clap 层拒绝） |
 | GUI live 确认 | 只快照 path/root/index/all-instances，不比较配置内容 |
 | dry-run | 仍会启动 App、导航、等待定位 |
 | `ldplayer_reported_port` | 不是 ADB serial；serial 用 `127.0.0.1:{5555+2*index}` |
@@ -414,6 +415,7 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 
 ```powershell
 zhfd-checkin.exe about
+zhfd-checkin.exe config path
 zhfd-checkin.exe config show
 zhfd-checkin.exe instance list
 zhfd-checkin.exe diagnose --instance-index 0
