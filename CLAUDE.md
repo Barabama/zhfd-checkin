@@ -36,7 +36,7 @@ git tag --list
 cd rust; cargo test --lib
 ```
 
-当前基线：Cargo `0.3.4`，最新 tag `v0.3.3`（`v0.3.4` 发布准备中），`cargo test --lib` 161 passed。HEAD 可能比 tag 多 docs-only 提交。
+当前基线：Cargo `0.3.4`，最新 tag `v0.3.4`，`cargo test --lib` 161 passed。HEAD 可能比 tag 多 docs-only 提交。
 
 ## 环境
 

@@ -9,12 +9,12 @@
 | 项目 | 值 |
 |---|---|
 | 默认分支 | `master` |
-| HEAD（发布） | `cc4cfbb`（PR #2 squash merge；`v0.3.4` tag 指向随后的 docs 提交） |
+| HEAD（发布） | `3437b1f`（`v0.3.4` tag；后续 docs 提交见 `origin/master`） |
 | HEAD 与远端 | 与 `origin/master` 同步 |
 | Cargo 版本 | `0.3.4` |
-| `v0.3.4` tag commit | 待发布（本文件随后的 docs 提交，`git rev-list -n1 v0.3.4`） |
-| 最新 GitHub Release | `v0.3.4`（待 release workflow 生成） |
-| Release 资产 | 待 release workflow 生成 |
+| `v0.3.4` tag commit | `3437b1f` |
+| 最新 GitHub Release | `v0.3.4` |
+| Release 资产 | `zhfd-checkin-windows-x64-v0.3.4-3437b1f257dd.zip` |
 
 > `v0.3.4` 已合并（PR #2）：诊断报告/GUI/`config show`/备份的账号 PII 脱敏、`.gitignore` 补齐、旧备份清理；CLI Phase 1（help、clap 约束、配置懒加载、`config path`、解析测试）。一键登录行为不变；dry-run 登录缺口与 login-only 留待后续版本。
 
@@ -30,7 +30,7 @@
 | `v0.3.1` | `a955d0a` |
 | `v0.3.2` | `8d3f58e` |
 | `v0.3.3` | `de2cc8d` |
-| `v0.3.4` | 待发布（`git rev-list -n1 v0.3.4`） |
+| `v0.3.4` | `3437b1f` |
 
 > 2026-10-18 重写过 git 历史以移除 fixture PII。重写前的 SHA（例如 `e135369`、`9a66664`、`c4b3bc4`）在本地已不可解析；历史文档中的这些 SHA 只应标注为 pre-rewrite 引用。
 
