@@ -9,14 +9,14 @@
 | 项目 | 值 |
 |---|---|
 | 默认分支 | `master` |
-| HEAD（发布） | `3437b1f`（`v0.3.4` tag；`v0.3.5` 在 `feat/cli-phase2` 准备中） |
-| HEAD 与远端 | `feat/cli-phase2` 尚未推送；`master` 与 `origin/master` 同步 |
+| HEAD（发布） | `c60918c`（`v0.3.5` tag） |
+| HEAD 与远端 | 与 `origin/master` 同步 |
 | Cargo 版本 | `0.3.5` |
-| `v0.3.5` tag commit | 待发布（`git rev-list -n1 v0.3.5`） |
-| 最新 GitHub Release | `v0.3.4`（`v0.3.5` 待发布） |
-| Release 资产 | `zhfd-checkin-windows-x64-v0.3.4-3437b1f257dd.zip` |
+| `v0.3.5` tag commit | `c60918c` |
+| 最新 GitHub Release | `v0.3.5` |
+| Release 资产 | `zhfd-checkin-windows-x64-v0.3.5-c60918c14b28.zip` |
 
-> `v0.3.5` 准备内容：Phase 2a（变更型命令确认、run 摘要/`--json`、alias）、Phase 2b（独立 `login --confirm-login`，ADR-0005）、Phase 3a（`commands.rs`/`cli.rs`、`RunPolicy`、GUI 去 clap、设备退出码）、以及 App「是否重启App / 界面劫持」弹窗识别（`app_restart_dialog`，不自动点击）。
+> `v0.3.5` 已发布（PR #3）：Phase 2a（变更型命令确认、run 摘要/`--json`、alias）、Phase 2b（独立 `login --confirm-login`，ADR-0005）、Phase 3a（`commands.rs`/`cli.rs`、`RunPolicy`、GUI 去 clap、设备退出码）、以及 App「是否重启App / 界面劫持」弹窗识别（`app_restart_dialog`，不自动点击）。
 
 > `v0.3.4` 已合并（PR #2）：诊断报告/GUI/`config show`/备份的账号 PII 脱敏、`.gitignore` 补齐、旧备份清理；CLI Phase 1（help、clap 约束、配置懒加载、`config path`、解析测试）。一键登录行为不变；dry-run 登录缺口与 login-only 留待后续版本。
 
@@ -33,7 +33,7 @@
 | `v0.3.2` | `8d3f58e` |
 | `v0.3.3` | `de2cc8d` |
 | `v0.3.4` | `3437b1f` |
-| `v0.3.5` | 待发布（`git rev-list -n1 v0.3.5`） |
+| `v0.3.5` | `c60918c` |
 
 > 2026-10-18 重写过 git 历史以移除 fixture PII。重写前的 SHA（例如 `e135369`、`9a66664`、`c4b3bc4`）在本地已不可解析；历史文档中的这些 SHA 只应标注为 pre-rewrite 引用。
 
