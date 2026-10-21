@@ -1,6 +1,6 @@
 # 工程构建、版本与发布流程
 
-更新时间：2026-10-20（Asia/Shanghai）
+更新时间：2026-10-21（Asia/Shanghai）
 
 > 当前 HEAD/tag/Release/CI/审计状态以 [STATUS.md](./STATUS.md) 为准；本文件只维护工程流程。
 

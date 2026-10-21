@@ -1,12 +1,12 @@
 # Windows 安装、配置与运维
 
-更新时间：2026-10-18（Asia/Shanghai）
+更新时间：2026-10-21（Asia/Shanghai）
 
 > 第一次使用请先阅读 [QUICK_START.md](./QUICK_START.md)；本文件用于补充路径、实例、CLI、数据目录和长期运维细节。
 
 ## 便携部署
 
-发布包包含 CLI 与 GUI 两个 EXE。首次运行在 EXE 同目录创建 `config.toml`、`logs/`、`captures/`、`reports/`、`backups/`。当前 Cargo package 元数据为 `0.3.2`；源码工作区构建不等同正式发布包。
+发布包包含 CLI 与 GUI 两个 EXE。首次运行在 EXE 同目录创建 `config.toml`、`logs/`、`captures/`、`reports/`、`backups/`。当前版本以 [STATUS.md](./STATUS.md) 为准；源码工作区构建不等同正式发布包。
 
 配置默认跟随 EXE 所在目录，因此推荐将整个目录放在可写位置，而不是 `Program Files` 只读目录。便携包不应包含用户 config、日志、截图或模拟器状态。
 

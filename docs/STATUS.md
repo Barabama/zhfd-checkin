@@ -62,7 +62,9 @@ cargo build --release --bins                   ✅
 - 该审计结论是「不构成独立验收通过」，列出 9 个 P1。
 - v0.3.2 修复了其中 P1-1/P1-2/P1-3/P1-6/P1-7/P1-8；P1-9 通过 ADR-0002 与文档更新解决。
 - **v0.3.2 / v0.3.3 尚无独立审计报告。**
-- v0.3.3 新增的自动登录、预设 DPI 调整与模块拆分尚未经过独立审计；现场只完成一次 live 一键登录与一次 720x1280@320 dry-run。
+- 2026-10-21 AI 审计：[V0.3.3 AI 审计报告](./audits/V0.3.3_AUDIT_REPORT_2026-10-21.md)（对象 `de2cc8d` / HEAD `27f5649`）。确认：诊断报告导出 `auto_login_account` 明文（P1）、dry-run 不能完成一键登录且无 login-only 通道（P1，设计取舍）、release workflow 仍不绑定 tag/版本（P1-4）；另有 GUI/备份/忽略规则等 P2 PII 路径。**AI 辅助，不构成独立验收。**
+- 2026-10-21 CLI 设计审计：[CLI 命令面设计审计](./audits/CLI_DESIGN_AUDIT_2026-10-21.md)。结论：最大嵌套 2 层、结构已扁平，但 help 可发现性、CLI/GUI/状态机耦合、`task create --all-instances` 参数组合仍需改进；列为 P1/P2，未改代码。**AI 辅助，不构成独立验收。**
+- v0.3.3 的自动登录、预设 DPI 调整与模块拆分仍未独立审计；现场只完成一次 live 一键登录（900x1600@320）与一次 720x1280@320 dry-run，且该 live 证据早于最终 pre-tap/dialog 改动（见 AI 审计 EVID-01）。
 - 未关闭项：
   - **P1-4**：release workflow 不绑定 tag 名 / Cargo 版本 / tag 目标；`workflow_dispatch` 可在任意分支运行。
   - **P2-26**：release 不依赖 CI；Python/Node 门禁不在 release workflow 中；CI 在 Python/Node 之前上传 artifact。
