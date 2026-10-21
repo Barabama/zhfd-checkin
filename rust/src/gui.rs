@@ -1,10 +1,12 @@
+use crate::commands::{
+    ConfigRequest, InstanceTargetArgs, RequestedMode, RunRequest, RunSource, TaskRequest,
+};
 use crate::config::ConfigStore;
 use crate::domain::RunResult;
 use crate::{
-    ConfigCommand, InstanceTargetArgs, RunArgs, TaskCommand, analyze_image_file,
-    dependency_diagnostics, diagnose, dump_ui_hierarchy, inspect_apk_metadata, install_apk,
-    installed_app_version, list_instance_summaries, run, runtime_with_target, sync_profile,
-    task_command, validate_dependency_selection,
+    analyze_image_file, dependency_diagnostics, diagnose, dump_ui_hierarchy, inspect_apk_metadata,
+    install_apk, installed_app_version, list_instance_summaries, run, runtime_with_target,
+    sync_profile, task_command, validate_dependency_selection,
 };
 use crate::{config, logger, profile};
 use eframe::egui;
@@ -368,13 +370,18 @@ impl GuiApp {
         self.start_background_job(label, move || {
             match run(
                 &store,
-                RunArgs {
-                    dry_run: !live,
-                    live,
-                    confirm: live,
+                RunRequest {
+                    requested_mode: if live {
+                        RequestedMode::Live
+                    } else {
+                        RequestedMode::DryRun
+                    },
+                    explicit_confirmation: live,
                     all_instances,
+                    json: true,
                     target,
                 },
+                RunSource::Gui,
             ) {
                 Ok(code) => format!("完成，退出码 {:?}", code),
                 Err(error) => format!("失败: {:#}", error),
@@ -688,6 +695,9 @@ fn explain_error(error: &str) -> &'static str {
         "success_stale" => "成功页面显示的日期不是今天；不能视为本次签到成功。",
         "success_date_unknown" => "页面未提供可确认的成功日期；请人工核对。",
         "app_start_timeout" => "目标 App 未能进入前台；请手动打开 App 并完成登录。",
+        "app_restart_dialog" => {
+            "检测到 App 的“是否重启App / 当前 App 可能被界面劫持”安全弹窗；程序未点击。请在模拟器中点击“取消”或“重启App”，并检查是否有悬浮窗/录屏/辅助功能后重试。"
+        }
         "login_required" => {
             "需要登录：请手动登录；或显式启用 runtime.allow_auto_login 后重试（仅一键登录，默认关闭）。"
         }
@@ -1717,7 +1727,7 @@ impl GuiApp {
                 let name = self.task_name.clone();
                 let config_path = self.store.path.clone();
                 self.start_background_job("计划任务查询", move || {
-                    match task_command(TaskCommand::Query { name }, Some(&config_path)) {
+                    match task_command(TaskRequest::Query { name }, Some(&config_path)) {
                         Ok(code) => format!("完成，退出码 {:?}", code),
                         Err(error) => format!("失败: {:#}", error),
                     }
@@ -1734,8 +1744,9 @@ impl GuiApp {
                 } else {
                     self.start_background_job("创建 dry-run 计划任务", move || {
                         match task_command(
-                            TaskCommand::Create {
+                            TaskRequest::Create {
                                 name,
+                                dry_run: true,
                                 live: false,
                                 confirm: false,
                                 all_instances,
@@ -1753,7 +1764,13 @@ impl GuiApp {
                 let name = self.task_name.clone();
                 let config_path = self.store.path.clone();
                 self.start_background_job("删除计划任务", move || {
-                    match task_command(TaskCommand::Delete { name }, Some(&config_path)) {
+                    match task_command(
+                        TaskRequest::Delete {
+                            name,
+                            confirm: true,
+                        },
+                        Some(&config_path),
+                    ) {
                         Ok(code) => format!("完成，退出码 {:?}", code),
                         Err(error) => format!("失败: {:#}", error),
                     }
@@ -1773,8 +1790,9 @@ impl GuiApp {
                 let config_path = self.store.path.clone();
                 self.start_background_job("创建 live 计划任务", move || {
                     match task_command(
-                        TaskCommand::Create {
+                        TaskRequest::Create {
                             name,
+                            dry_run: false,
                             live: true,
                             confirm: true,
                             all_instances,
@@ -2197,7 +2215,7 @@ impl GuiApp {
                 }
             }
             if ui.button("打开 config.toml").clicked() {
-                match crate::config_command(&self.store, ConfigCommand::Open) {
+                match crate::config_command(&self.store, ConfigRequest::Open) {
                     Ok(_) => self.status = "已打开 config.toml".into(),
                     Err(error) => self.status = format!("打开配置失败: {error:#}"),
                 }

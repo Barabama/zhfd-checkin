@@ -107,7 +107,28 @@ fn account_from_label(labels: &str) -> Option<String> {
     }
 }
 
-/// Optional login-page step.
+/// Outcome of one login-page attempt.
+///
+/// Both callers (the `run` state machine and the standalone `login` command)
+/// interpret the same evidence; keeping the outcome explicit avoids
+/// duplicating the gate chain or the tap sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginAttempt {
+    /// `runtime.allow_auto_login` is off; nothing was probed.
+    Disabled,
+    /// The App is already past the login page (Home/Services/Checkin).
+    AlreadyLoggedIn,
+    /// The page is neither the login page nor a known post-login page.
+    NotLoginPage,
+    /// dry-run: every gate passed, but nothing was tapped.
+    Ready,
+    /// The single login tap was issued and the page left the login page.
+    Succeeded,
+    /// Refused with a stable `auto_login_*` code; the result carries it.
+    Refused(&'static str),
+}
+
+/// Optional login-page step for the `run` state machine.
 ///
 /// Returns `Ok(Some(code))` when the run must stop, and `Ok(None)` when the
 /// caller should continue into the normal navigation/check-in flow.
@@ -125,6 +146,57 @@ pub(crate) fn auto_login_if_required(
         // extra hierarchy dumps.
         return Ok(None);
     }
+    match attempt_login(device, log, result, mode, runtime, target_package)? {
+        LoginAttempt::Disabled
+        | LoginAttempt::AlreadyLoggedIn
+        | LoginAttempt::NotLoginPage
+        | LoginAttempt::Ready
+        | LoginAttempt::Succeeded => Ok(None),
+        LoginAttempt::Refused(code) => {
+            if mode == Mode::DryRun {
+                // Dry-run is observational: record the refusal but leave the
+                // historical `login_required` outcome to the navigation step.
+                Ok(None)
+            } else {
+                Ok(Some(auto_login_exit_code(code)))
+            }
+        }
+    }
+}
+
+/// One-click login as a standalone action (`zhfd-checkin login`).
+///
+/// This never navigates and never touches the check-in control: it is a
+/// session-setup action, not a check-in action. Profile calibration is not
+/// required because every tap target comes from the hierarchy's own bounds.
+///
+/// `mode` is `Live` only after the caller received the explicit
+/// `--confirm-login` acknowledgement; without it the same gates run in
+/// `DryRun` and nothing is tapped.
+pub(crate) fn login_only(
+    device: &adb::AdbDevice,
+    log: &RunLog,
+    result: &mut RunResult,
+    store: &ConfigStore,
+    mode: Mode,
+    target_package: &str,
+) -> Result<LoginAttempt> {
+    let runtime = &store.config.runtime;
+    if !runtime.allow_auto_login {
+        return Ok(LoginAttempt::Disabled);
+    }
+    attempt_login(device, log, result, mode, runtime, target_package)
+}
+
+/// Probe the page, run every login gate, and (only when authorized) tap once.
+fn attempt_login(
+    device: &adb::AdbDevice,
+    log: &RunLog,
+    result: &mut RunResult,
+    mode: Mode,
+    runtime: &RuntimeConfig,
+    target_package: &str,
+) -> Result<LoginAttempt> {
     result.auto_login_attempted = Some(false);
     result.auto_login_tap_count = Some(0);
 
@@ -136,7 +208,15 @@ pub(crate) fn auto_login_if_required(
         target_package,
     )?;
     if observation.route != PageRoute::Login {
-        return Ok(None);
+        // A post-login page means there is nothing to do; anything else is a
+        // page the login action cannot act on.
+        return Ok(match observation.route {
+            PageRoute::Home | PageRoute::Services | PageRoute::Checkin => {
+                result.auto_login_ready = Some(false);
+                LoginAttempt::AlreadyLoggedIn
+            }
+            _ => LoginAttempt::NotLoginPage,
+        });
     }
     result.auto_login_method = Some("one_click".into());
 
@@ -176,32 +256,32 @@ pub(crate) fn auto_login_if_required(
     )?;
 
     match authorize_auto_login(observation.route, mode, &evidence) {
-        AutoLoginDecision::Disabled | AutoLoginDecision::NotLoginPage => Ok(None),
+        AutoLoginDecision::Disabled => Ok(LoginAttempt::Disabled),
+        AutoLoginDecision::NotLoginPage => Ok(LoginAttempt::NotLoginPage),
         AutoLoginDecision::Ready => {
             result.auto_login_ready = Some(true);
             log.event(
                 "auto_login_ready",
                 serde_json::json!({"method": "one_click", "clicked": false}),
             )?;
-            Ok(None)
+            Ok(LoginAttempt::Ready)
         }
         AutoLoginDecision::Refused(code) => {
-            // Dry-run is observational: record the refusal but leave the
-            // historical `login_required` outcome to the navigation step.
-            if mode == Mode::DryRun {
-                result.auto_login_ready = Some(false);
-                log.event(
-                    "auto_login_refused",
-                    serde_json::json!({"reason": code, "mode": "dry-run", "clicked": false}),
-                )?;
-                return Ok(None);
-            }
+            result.auto_login_ready = Some(false);
             log.event(
                 "auto_login_refused",
-                serde_json::json!({"reason": code, "clicked": false}),
+                serde_json::json!({
+                    "reason": code,
+                    "mode": mode.as_str(),
+                    "clicked": false,
+                }),
             )?;
-            set_run_failure(result, code, "auto_login", auto_login_recovery(code));
-            Ok(Some(auto_login_exit_code(code)))
+            // Dry-run stays observational; only an authorized mode records the
+            // refusal as the run's terminal failure.
+            if mode != Mode::DryRun {
+                set_run_failure(result, code, "auto_login", auto_login_recovery(code));
+            }
+            Ok(LoginAttempt::Refused(code))
         }
         AutoLoginDecision::Authorized => {
             perform_one_click_login(device, log, result, &observation, runtime, target_package)
@@ -221,20 +301,12 @@ fn perform_one_click_login(
     observation: &PageObservation,
     runtime: &RuntimeConfig,
     target_package: &str,
-) -> Result<Option<ExitCode>> {
+) -> Result<LoginAttempt> {
     if observation.view.login_buttons().len() != 1 {
-        return refuse_auto_login(
-            result,
-            "auto_login_button_ambiguous",
-            ExitCode::BusinessFailure,
-        );
+        return refuse_auto_login(result, "auto_login_button_ambiguous");
     }
     let Some(checkbox) = observation.view.consent_checkbox() else {
-        return refuse_auto_login(
-            result,
-            "auto_login_consent_not_found",
-            ExitCode::BusinessFailure,
-        );
+        return refuse_auto_login(result, "auto_login_consent_not_found");
     };
     let checkbox_bounds = checkbox.bounds;
     let checkbox_center = checkbox.center;
@@ -272,11 +344,7 @@ fn perform_one_click_login(
                 "auto_login_consent",
                 serde_json::json!({"action": "unconfirmed", "clicked": true}),
             )?;
-            return refuse_auto_login(
-                result,
-                "auto_login_consent_unconfirmed",
-                ExitCode::BusinessFailure,
-            );
+            return refuse_auto_login(result, "auto_login_consent_unconfirmed");
         }
     }
 
@@ -290,32 +358,24 @@ fn perform_one_click_login(
         target_package,
     )?;
     if recheck.route != PageRoute::Login || recheck.foreign_package.is_some() {
-        return refuse_auto_login(result, "auto_login_not_confirmed", ExitCode::VisionFailure);
+        return refuse_auto_login(result, "auto_login_not_confirmed");
     }
     let buttons = recheck.view.login_buttons();
     let Some(recheck_checkbox) = recheck.view.consent_checkbox() else {
-        return refuse_auto_login(result, "auto_login_not_confirmed", ExitCode::VisionFailure);
+        return refuse_auto_login(result, "auto_login_not_confirmed");
     };
     if buttons.len() != 1 {
-        return refuse_auto_login(result, "auto_login_not_confirmed", ExitCode::VisionFailure);
+        return refuse_auto_login(result, "auto_login_not_confirmed");
     }
     if recheck.view.last_used_account() != account_before {
-        return refuse_auto_login(
-            result,
-            "auto_login_account_mismatch",
-            ExitCode::BusinessFailure,
-        );
+        return refuse_auto_login(result, "auto_login_account_mismatch");
     }
     let login_center_now = buttons[0].center;
     let bytes = device.screenshot()?;
     log.save_bytes("auto_login_pre_tap.png", &bytes)?;
     let image = vision::decode(&bytes)?;
     if !vision::consent_checkbox_checked(&image, recheck_checkbox.bounds.as_rect()) {
-        return refuse_auto_login(
-            result,
-            "auto_login_consent_unconfirmed",
-            ExitCode::BusinessFailure,
-        );
+        return refuse_auto_login(result, "auto_login_consent_unconfirmed");
     }
 
     // 4. The single login tap of this run.
@@ -347,7 +407,7 @@ fn perform_one_click_login(
             Some(package) if package == target_package => {}
             Some(_) => {
                 log.save_bytes("auto_login_blocked.png", &device.screenshot()?)?;
-                return refuse_auto_login(result, "auto_login_blocked", ExitCode::BusinessFailure);
+                return refuse_auto_login(result, "auto_login_blocked");
             }
             // A failed query is not "still foreground"; keep observing until
             // the timeout instead of treating it as success.
@@ -365,11 +425,11 @@ fn perform_one_click_login(
         }
         if observed.foreign_package.is_some() {
             log.save_bytes("auto_login_blocked.png", &device.screenshot()?)?;
-            return refuse_auto_login(result, "auto_login_blocked", ExitCode::BusinessFailure);
+            return refuse_auto_login(result, "auto_login_blocked");
         }
         if has_login_dialog(&observed.view) {
             log.save_bytes("auto_login_blocked.png", &device.screenshot()?)?;
-            return refuse_auto_login(result, "auto_login_blocked", ExitCode::BusinessFailure);
+            return refuse_auto_login(result, "auto_login_blocked");
         }
         match observed.route {
             route @ (PageRoute::Home | PageRoute::Services | PageRoute::Checkin) => {
@@ -392,7 +452,7 @@ fn perform_one_click_login(
                         "clicked": true,
                     }),
                 )?;
-                return Ok(None);
+                return Ok(LoginAttempt::Succeeded);
             }
             _ => {
                 confirmed_route = None;
@@ -401,10 +461,10 @@ fn perform_one_click_login(
         if started.elapsed() >= timeout {
             result.auto_login_succeeded = Some(false);
             log.save_bytes("auto_login_timeout.png", &device.screenshot()?)?;
-            let (code, exit) = if saw_readable {
-                ("auto_login_timeout", ExitCode::Timeout)
+            let code = if saw_readable {
+                "auto_login_timeout"
             } else {
-                ("auto_login_not_confirmed", ExitCode::VisionFailure)
+                "auto_login_not_confirmed"
             };
             log.event(
                 "auto_login_result",
@@ -416,7 +476,7 @@ fn perform_one_click_login(
                 }),
             )?;
             set_run_failure(result, code, "auto_login", auto_login_recovery(code));
-            return Ok(Some(exit));
+            return Ok(LoginAttempt::Refused(code));
         }
     }
 }
@@ -466,14 +526,15 @@ fn auto_login_exit_code(code: &str) -> ExitCode {
     }
 }
 
-fn refuse_auto_login(
-    result: &mut RunResult,
-    code: &'static str,
-    exit: ExitCode,
-) -> Result<Option<ExitCode>> {
+/// Exit code for a stable `auto_login_*` failure code.
+pub(crate) fn exit_code_for(code: &str) -> ExitCode {
+    auto_login_exit_code(code)
+}
+
+fn refuse_auto_login(result: &mut RunResult, code: &'static str) -> Result<LoginAttempt> {
     result.auto_login_succeeded = Some(false);
     set_run_failure(result, code, "auto_login", auto_login_recovery(code));
-    Ok(Some(exit))
+    Ok(LoginAttempt::Refused(code))
 }
 
 #[cfg(test)]

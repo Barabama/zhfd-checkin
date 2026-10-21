@@ -51,9 +51,9 @@
 git status -sb
 git log --oneline -5
 git tag --list
-git rev-list -n1 v0.3.4
+git rev-list -n1 v0.3.5
 cd rust
-cargo test --lib          # 预期 161 passed（v0.3.2 tag 为 140）
+cargo test --lib          # 预期 167 passed（v0.3.2 tag 为 140）
 ```
 
 在看代码之前，先确认你不在一个脏工作区、没有待发布的本地改动。
@@ -101,7 +101,14 @@ run_inner_with_device (main.rs:1975)
 5. 找到同意复选框，并**视觉确认**勾选成功；
 6. 配置了 `runtime.auto_login_account` 时，页面显示的“上次使用过的账号”必须精确匹配。
 
-不输入账号/密码/验证码，不保存凭据，不处理「其他账户登录」；一次运行最多一次登录点击，失败不重试。dry-run 只输出 `auto_login_ready`，永不点击。实现见 [auto_login.rs](../rust/src/auto_login.rs) 的 `auto_login_if_required` / `perform_one_click_login` 与 [domain.rs](../rust/src/domain.rs) 的 `authorize_auto_login`，决策记录见 [ADR-0004](./adr/ADR-0004-auto-login-opt-in.md)。
+不输入账号/密码/验证码，不保存凭据，不处理「其他账户登录」；一次运行最多一次登录点击，失败不重试。dry-run 只输出 `auto_login_ready`，永不点击。实现见 [auto_login.rs](../rust/src/auto_login.rs) 的 `auto_login_if_required` / `perform_one_click_login` / `login_only` 与 [domain.rs](../rust/src/domain.rs) 的 `authorize_auto_login`，决策记录见 [ADR-0004](./adr/ADR-0004-auto-login-opt-in.md) 与 [ADR-0005](./adr/ADR-0005-login-session-setup.md)。
+
+**独立 login 命令（ADR-0005）**：`zhfd-checkin login [--confirm-login] [--json] [target]`。它是会话建立动作，不进入 `locate_or_navigate`、不调用 `guarded_tap`：
+
+- 无 `--confirm-login`：只探测，写 `auto_login_ready`，零 tap；
+- 有 `--confirm-login`：最多一次协议复选框点击 + 一次登录点击；
+- 不要求 Profile 已标定（坐标来自 hierarchy bounds），但 `allow_auto_login` + `accept_login_terms` 仍然必须开启；
+- `result.login_only=true`，`clicked` 仍只表示签到按钮被点击。
 
 ### 4.4 成功判定
 
@@ -213,7 +220,7 @@ CLI 与 GUI **共享** `main.rs` 的业务函数：`run`、`diagnose`、`task_co
 | 前台检查 | `log_foreground_snapshot` / `foreground_check` foreground.rs | FR-013 前台包观测与分类 |
 | 点击门禁 | `guarded_tap` main.rs:2745 | route/mode + click policy |
 | 日期解析 | `extract_hierarchy_date` main.rs:1916 | 成功日期与冲突规则 |
-| 测试 | main.rs / page.rs / auto_login.rs 测试模块 | 约 161 个测试 |
+| 测试 | main.rs / page.rs / auto_login.rs 测试模块 | 约 167 个测试 |
 
 **高风险区域**：`run_inner_with_device` 与 `locate_or_navigate`。不要盲格式化、移动或重排；先读对应测试，再改。
 
@@ -249,7 +256,7 @@ pwsh -NoProfile -File scripts/portable_smoke.ps1 `
   -FixturePath "$PWD/autojs6/fixtures/ready.png"
 ```
 
-`cargo test --lib` = 161 passed。`cargo test --all-targets` 会在 lib 与 bin 各跑一次。
+`cargo test --lib` = 167 passed。`cargo test --all-targets` 会在 lib 与 bin 各跑一次。
 
 ### 8.3 构建溯源
 
@@ -344,6 +351,9 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 | `task create --all-instances --serial X` / `--instance-index N` | clap 解析层拒绝（exit 2）；`--all-instances` 不能与实例选择器组合 |
 | `task query/delete`、`vision`、`profile list` | 不再加载配置；损坏配置下仍可用（`task create` 仍需要配置） |
 | `run --live` / `task create --live` / `profile sync --id X` | clap 要求显式 `--confirm`（exit 2）；live 缺少 confirm 的运行期检查仍保留 |
+| `app install` / `task delete` | 也会在 clap 层要求 `--confirm`（exit 2） |
+| `run` 输出 | 默认是人类可读摘要；脚本要纯 JSON 请加 `--json` |
+| App 弹出「是否重启App / 当前 App 可能被界面劫持」 | 路由 `app_restart_dialog`；程序不点击；手动取消/重启 App，并检查悬浮窗/录屏/辅助功能 |
 | `--confirm` | 只能与 `--live` 一起用；与 `--dry-run` 冲突（clap 层拒绝） |
 | GUI live 确认 | 只快照 path/root/index/all-instances，不比较配置内容 |
 | dry-run | 仍会启动 App、导航、等待定位 |
@@ -400,7 +410,7 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 ## 13. 审计与未关闭项
 
 - 最新审计：[V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)。
-- v0.3.2 修复了其中大部分 P1，但 **v0.3.2 / v0.3.3 / v0.3.4 本身尚未独立审计**；v0.3.3 的自动登录与预设调整同样未审计。
+- v0.3.2 修复了其中大部分 P1，但 **v0.3.2 / v0.3.3 / v0.3.4 / v0.3.5 本身尚未独立审计**；v0.3.3 的自动登录与预设调整同样未审计。
 - 仍未关闭：
   - release workflow 不绑定 tag/版本，`workflow_dispatch` 无 ref 限制；
   - release 不依赖 CI，且不跑 Python/Node；
@@ -418,9 +428,13 @@ zhfd-checkin.exe about
 zhfd-checkin.exe config path
 zhfd-checkin.exe config show
 zhfd-checkin.exe instance list
-zhfd-checkin.exe diagnose --instance-index 0
+zhfd-checkin.exe diagnose --instance-index 0   # alias: doctor
 zhfd-checkin.exe run --dry-run --instance-index 0
+zhfd-checkin.exe run --dry-run --json --instance-index 0
+zhfd-checkin.exe analyze-image --image .\ready.png   # alias: vision
 ```
+
+`run` 默认输出人类可读摘要（状态/页面/点击/错误/下一步/结果文件）；`--json` 输出纯 JSON。`app install`、`task delete`、`profile sync`、`task create --live`、`run --live` 都需要显式 `--confirm`。
 
 ### 修改点击安全逻辑
 
@@ -457,7 +471,7 @@ zhfd-checkin.exe run --dry-run --instance-index 0
 
 - [ ] 读 `docs/STATUS.md` 与本文；
 - [ ] `git status -sb` 确认工作区干净；
-- [ ] `cargo test --lib` 确认 161 passed（v0.3.2 tag 为 140）；
+- [ ] `cargo test --lib` 确认 167 passed（v0.3.2 tag 为 140）；
 - [ ] 找到 `guarded_tap`、`authorize_click`、`run_inner_with_device`；
 - [ ] 确认自己没有运行任何 live/设备命令；
 - [ ] 明确本次任务是否触及 Frozen 决策（若是，先写 ADR）。

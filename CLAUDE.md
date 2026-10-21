@@ -36,7 +36,7 @@ git tag --list
 cd rust; cargo test --lib
 ```
 
-当前基线：Cargo `0.3.4`，最新 tag `v0.3.4`，`cargo test --lib` 161 passed。HEAD 可能比 tag 多 docs-only 提交。
+当前基线：Cargo `0.3.5`，最新 tag `v0.3.4`（`v0.3.5` 发布准备中），`cargo test --lib` 167 passed。HEAD 可能比 tag 多 docs-only 提交。
 
 ## 环境
 
@@ -50,7 +50,7 @@ cd rust; cargo test --lib
 cd rust
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib                 # 161 tests
+cargo test --lib                 # 167 tests
 cargo build --release --bins     # 必须 --bins：CLI 与 GUI 一起
 ```
 
