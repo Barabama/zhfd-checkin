@@ -1,6 +1,6 @@
 # 新 AI 上手手册
 
-- 最后核对：2026-10-20
+- 最后核对：2026-10-21
 - 适用对象：第一次接触本仓库的 AI 编码代理或新维护者
 - 当前状态数字以 [STATUS.md](./STATUS.md) 为准；本文件讲稳定的结构与规则。
 
@@ -51,9 +51,9 @@
 git status -sb
 git log --oneline -5
 git tag --list
-git rev-list -n1 v0.3.3
+git rev-list -n1 v0.3.4
 cd rust
-cargo test --lib          # 预期 153 passed（v0.3.2 tag 为 140）
+cargo test --lib          # 预期 161 passed（v0.3.2 tag 为 140）
 ```
 
 在看代码之前，先确认你不在一个脏工作区、没有待发布的本地改动。
@@ -213,7 +213,7 @@ CLI 与 GUI **共享** `main.rs` 的业务函数：`run`、`diagnose`、`task_co
 | 前台检查 | `log_foreground_snapshot` / `foreground_check` foreground.rs | FR-013 前台包观测与分类 |
 | 点击门禁 | `guarded_tap` main.rs:2745 | route/mode + click policy |
 | 日期解析 | `extract_hierarchy_date` main.rs:1916 | 成功日期与冲突规则 |
-| 测试 | main.rs / page.rs / auto_login.rs 测试模块 | 约 153 个测试（分支） |
+| 测试 | main.rs / page.rs / auto_login.rs 测试模块 | 约 161 个测试 |
 
 **高风险区域**：`run_inner_with_device` 与 `locate_or_navigate`。不要盲格式化、移动或重排；先读对应测试，再改。
 
@@ -249,7 +249,7 @@ pwsh -NoProfile -File scripts/portable_smoke.ps1 `
   -FixturePath "$PWD/autojs6/fixtures/ready.png"
 ```
 
-`cargo test --lib` = 153 passed（分支）。`cargo test --all-targets` 会在 lib 与 bin 各跑一次。
+`cargo test --lib` = 161 passed。`cargo test --all-targets` 会在 lib 与 bin 各跑一次。
 
 ### 8.3 构建溯源
 
@@ -314,6 +314,7 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 - 两开关必须同时为 true；`allow_auto_login` 不隐含协议同意。
 - 不输入、不保存账号密码；只支持一键登录，不处理「其他账户登录」。
 - `auto_login_account` 是本机 PII，config 已在 `.gitignore` 中；不要提交、不要写进文档或日志。
+- 配置备份（`backups/config.toml.bak.*`）会把 `auto_login_account` 与 `bark_url` 写成 `<redacted>`；从备份恢复后需要重新填写账号。`config show` 与诊断报告默认脱敏，GUI 输入框默认掩码。
 - 登录页截图可能包含账号，日志目录不得提交。
 
 ### 9.4 LDPlayer 预设与 Profile
@@ -340,9 +341,10 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 | `run` 的 stdout | 不是纯 JSON；解析 `<data-root>/logs/.../result.json` |
 | `stable_frames = 0` | 配置校验会拒绝；即使绕过，`authorize_click` 也拒绝 0 帧 |
 | `location_timeout_seconds` | 实际被钳制到 1–120 秒 |
-| `task create --all-instances --serial X` | 运行期必然失败；不要组合 |
-| `task query/delete`、`vision` | 也会先加载配置；损坏配置时退 4 |
-| `--confirm` | 只能与 `--live` 一起用；与 `--dry-run` 冲突 |
+| `task create --all-instances --serial X` / `--instance-index N` | clap 解析层拒绝（exit 2）；`--all-instances` 不能与实例选择器组合 |
+| `task query/delete`、`vision`、`profile list` | 不再加载配置；损坏配置下仍可用（`task create` 仍需要配置） |
+| `run --live` / `task create --live` / `profile sync --id X` | clap 要求显式 `--confirm`（exit 2）；live 缺少 confirm 的运行期检查仍保留 |
+| `--confirm` | 只能与 `--live` 一起用；与 `--dry-run` 冲突（clap 层拒绝） |
 | GUI live 确认 | 只快照 path/root/index/all-instances，不比较配置内容 |
 | dry-run | 仍会启动 App、导航、等待定位 |
 | `ldplayer_reported_port` | 不是 ADB serial；serial 用 `127.0.0.1:{5555+2*index}` |
@@ -398,7 +400,7 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 ## 13. 审计与未关闭项
 
 - 最新审计：[V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)。
-- v0.3.2 修复了其中大部分 P1，但 **v0.3.2 / v0.3.3 本身尚未独立审计**；v0.3.3 的自动登录与预设调整同样未审计。
+- v0.3.2 修复了其中大部分 P1，但 **v0.3.2 / v0.3.3 / v0.3.4 本身尚未独立审计**；v0.3.3 的自动登录与预设调整同样未审计。
 - 仍未关闭：
   - release workflow 不绑定 tag/版本，`workflow_dispatch` 无 ref 限制；
   - release 不依赖 CI，且不跑 Python/Node；
@@ -413,6 +415,7 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 
 ```powershell
 zhfd-checkin.exe about
+zhfd-checkin.exe config path
 zhfd-checkin.exe config show
 zhfd-checkin.exe instance list
 zhfd-checkin.exe diagnose --instance-index 0
@@ -454,7 +457,7 @@ zhfd-checkin.exe run --dry-run --instance-index 0
 
 - [ ] 读 `docs/STATUS.md` 与本文；
 - [ ] `git status -sb` 确认工作区干净；
-- [ ] `cargo test --lib` 确认 153 passed（v0.3.2 tag 为 140）；
+- [ ] `cargo test --lib` 确认 161 passed（v0.3.2 tag 为 140）；
 - [ ] 找到 `guarded_tap`、`authorize_click`、`run_inner_with_device`；
 - [ ] 确认自己没有运行任何 live/设备命令；
 - [ ] 明确本次任务是否触及 Frozen 决策（若是，先写 ADR）。

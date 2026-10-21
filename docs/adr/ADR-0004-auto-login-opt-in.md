@@ -1,6 +1,6 @@
 # ADR-0004：登录页「一键登录」显式 opt-in
 
-- 状态：**已接受（2026-10-21 用户批准，待实现）**
+- 状态：**已接受并实现（v0.3.3）**；现场完整签到 live 与独立审计仍未完成
 - 提议日期：2026-10-21
 - 分支：`feat/auto-login`
 - 影响决策：`docs/V0.3.0_DECISIONS.md`「实施边界」；`docs/V0.3.0_FIRST_RUN_AND_RECOVERY_REQUIREMENTS.md` §10

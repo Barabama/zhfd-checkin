@@ -18,6 +18,17 @@ data/
 logs/
 *.log
 
+# 本地运行配置与备份（便携模式可能在任意目录创建；含账号 PII / 通知地址）
+config.toml
+**/config.toml
+config.toml.bak.*
+**/config.toml.bak.*
+backups/
+**/backups/
+reports/
+**/reports/
+**/captures/
+
 # 大文件归档
 *.zip
 *.vdi

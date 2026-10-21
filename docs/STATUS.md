@@ -9,12 +9,14 @@
 | 项目 | 值 |
 |---|---|
 | 默认分支 | `master` |
-| HEAD（发布） | `de2cc8d`（`v0.3.3` tag；后续 docs 提交见 `origin/master`） |
-| HEAD 与远端 | 与 `origin/master` 同步；tag 前可能有 docs-only 提交 |
-| Cargo 版本 | `0.3.3` |
-| `v0.3.3` tag commit | `de2cc8d` |
-| 最新 GitHub Release | `v0.3.3` |
+| HEAD（发布） | `de2cc8d`（`v0.3.3` tag；`v0.3.4` 在 `fix` 分支准备中） |
+| HEAD 与远端 | `master` 与 `origin/master` 同步；`fix` 分支尚未推送 |
+| Cargo 版本 | `0.3.4` |
+| `v0.3.4` tag commit | 待发布（`git rev-list -n1 v0.3.4`） |
+| 最新 GitHub Release | `v0.3.3`（`v0.3.4` 待发布） |
 | Release 资产 | `zhfd-checkin-windows-x64-v0.3.3-de2cc8df9085.zip` |
+
+> `v0.3.4` 准备内容：诊断报告/GUI/`config show`/备份的账号 PII 脱敏、`.gitignore` 补齐、旧备份清理；CLI Phase 1（help、clap 约束、配置懒加载、`config path`、解析测试）。一键登录行为不变；dry-run 登录缺口与 login-only 留待后续版本。
 
 > `v0.3.3` 已合并：默认关闭的登录页「一键登录」（[ADR-0004](./adr/ADR-0004-auto-login-opt-in.md)）、LDPlayer 预设对齐、`page`/`foreground`/`auto_login` 分层。Live 一键登录已在 index 0 验证一次；完整签到 live 与独立审计仍未完成。master 行为相对 v0.3.2 新增了上述特征。
 
@@ -28,6 +30,7 @@
 | `v0.3.1` | `a955d0a` |
 | `v0.3.2` | `8d3f58e` |
 | `v0.3.3` | `de2cc8d` |
+| `v0.3.4` | 待发布（`git rev-list -n1 v0.3.4`） |
 
 > 2026-10-18 重写过 git 历史以移除 fixture PII。重写前的 SHA（例如 `e135369`、`9a66664`、`c4b3bc4`）在本地已不可解析；历史文档中的这些 SHA 只应标注为 pre-rewrite 引用。
 
@@ -36,8 +39,8 @@
 ```text
 cargo fmt --all -- --check                     ✅
 cargo clippy --all-targets --all-features -D warnings  ✅
-cargo test --lib                               ✅ 153 passed（v0.3.3；v0.3.2 tag 为 140）
-cargo test --all-targets                       ✅ lib 153 + bin 153（同一批测试跑两次）
+cargo test --lib                               ✅ 161 passed（v0.3.4；v0.3.2 tag 为 140）
+cargo test --all-targets                       ✅ lib 161 + bin 161（同一批测试跑两次）
 cargo build --release --bins                   ✅
 ```
 
@@ -61,8 +64,11 @@ cargo build --release --bins                   ✅
 - 最新独立审计：`docs/audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md`（对象 `e135369` / `v0.3.1`；pre-rewrite SHA）。
 - 该审计结论是「不构成独立验收通过」，列出 9 个 P1。
 - v0.3.2 修复了其中 P1-1/P1-2/P1-3/P1-6/P1-7/P1-8；P1-9 通过 ADR-0002 与文档更新解决。
-- **v0.3.2 / v0.3.3 尚无独立审计报告。**
-- v0.3.3 新增的自动登录、预设 DPI 调整与模块拆分尚未经过独立审计；现场只完成一次 live 一键登录与一次 720x1280@320 dry-run。
+- **v0.3.2 / v0.3.3 / v0.3.4 尚无独立审计报告。**
+- v0.3.4 的 PII 脱敏与 CLI Phase 1 未独立审计；AI 审计与 remediation 记录见 [CLI 设计审计](./audits/CLI_DESIGN_AUDIT_2026-10-21.md) 与 [V0.3.3 AI 审计报告](./audits/V0.3.3_AUDIT_REPORT_2026-10-21.md)。
+- 2026-10-21 AI 审计：[V0.3.3 AI 审计报告](./audits/V0.3.3_AUDIT_REPORT_2026-10-21.md)（对象 `de2cc8d` / HEAD `27f5649`）。确认：诊断报告导出 `auto_login_account` 明文（P1）、dry-run 不能完成一键登录且无 login-only 通道（P1，设计取舍）、release workflow 仍不绑定 tag/版本（P1-4）；另有 GUI/备份/忽略规则等 P2 PII 路径。**AI 辅助，不构成独立验收。**
+- 2026-10-21 CLI 设计审计：[CLI 命令面设计审计](./audits/CLI_DESIGN_AUDIT_2026-10-21.md)。结论：最大嵌套 2 层、结构已扁平，但 help 可发现性、CLI/GUI/状态机耦合、`task create --all-instances` 参数组合仍需改进；列为 P1/P2，未改代码。**AI 辅助，不构成独立验收。**
+- v0.3.3 的自动登录、预设 DPI 调整与模块拆分仍未独立审计；现场只完成一次 live 一键登录（900x1600@320）与一次 720x1280@320 dry-run，且该 live 证据早于最终 pre-tap/dialog 改动（见 AI 审计 EVID-01）。
 - 未关闭项：
   - **P1-4**：release workflow 不绑定 tag 名 / Cargo 版本 / tag 目标；`workflow_dispatch` 可在任意分支运行。
   - **P2-26**：release 不依赖 CI；Python/Node 门禁不在 release workflow 中；CI 在 Python/Node 之前上传 artifact。
