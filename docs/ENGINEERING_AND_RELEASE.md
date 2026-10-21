@@ -23,7 +23,7 @@ CLI/GUI 共享业务函数，不把 UI 的按钮/输入当作第二套业务策�
 ## 版本与发布状态
 
 - Cargo package 元数据当前是 `0.3.4`；
-- 已发布 tag：`v0.1.0`（`87658fe`）、`v0.2.0`（`5835e9d`）、`v0.3.0`（`06dfaf4`）、`v0.3.1`（`a955d0a`）、`v0.3.2`（`8d3f58e`）、`v0.3.3`（`de2cc8d`）；`v0.3.4` 在 `fix` 分支准备中；
+- 已发布 tag：`v0.1.0`（`87658fe`）、`v0.2.0`（`5835e9d`）、`v0.3.0`（`06dfaf4`）、`v0.3.1`（`a955d0a`）、`v0.3.2`（`8d3f58e`）、`v0.3.3`（`de2cc8d`）；`v0.3.4` 已合并（PR #2），待 tag/Release；
 - `v0.3.4` 包含账号 PII 脱敏（诊断报告/GUI/`config show`/配置备份）、`.gitignore` 补齐，以及 CLI Phase 1（help、clap 约束、配置懒加载、`config path`、解析测试）；
 - `v0.3.3` 包含默认关闭的登录页一键登录、LDPlayer 预设对齐和
   `page`/`foreground`/`auto_login` 模块拆分；

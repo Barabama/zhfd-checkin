@@ -9,14 +9,14 @@
 | 项目 | 值 |
 |---|---|
 | 默认分支 | `master` |
-| HEAD（发布） | `de2cc8d`（`v0.3.3` tag；`v0.3.4` 在 `fix` 分支准备中） |
-| HEAD 与远端 | `master` 与 `origin/master` 同步；`fix` 分支尚未推送 |
+| HEAD（发布） | `cc4cfbb`（PR #2 squash merge；`v0.3.4` tag 指向随后的 docs 提交） |
+| HEAD 与远端 | 与 `origin/master` 同步 |
 | Cargo 版本 | `0.3.4` |
-| `v0.3.4` tag commit | 待发布（`git rev-list -n1 v0.3.4`） |
-| 最新 GitHub Release | `v0.3.3`（`v0.3.4` 待发布） |
-| Release 资产 | `zhfd-checkin-windows-x64-v0.3.3-de2cc8df9085.zip` |
+| `v0.3.4` tag commit | 待发布（本文件随后的 docs 提交，`git rev-list -n1 v0.3.4`） |
+| 最新 GitHub Release | `v0.3.4`（待 release workflow 生成） |
+| Release 资产 | 待 release workflow 生成 |
 
-> `v0.3.4` 准备内容：诊断报告/GUI/`config show`/备份的账号 PII 脱敏、`.gitignore` 补齐、旧备份清理；CLI Phase 1（help、clap 约束、配置懒加载、`config path`、解析测试）。一键登录行为不变；dry-run 登录缺口与 login-only 留待后续版本。
+> `v0.3.4` 已合并（PR #2）：诊断报告/GUI/`config show`/备份的账号 PII 脱敏、`.gitignore` 补齐、旧备份清理；CLI Phase 1（help、clap 约束、配置懒加载、`config path`、解析测试）。一键登录行为不变；dry-run 登录缺口与 login-only 留待后续版本。
 
 > `v0.3.3` 已合并：默认关闭的登录页「一键登录」（[ADR-0004](./adr/ADR-0004-auto-login-opt-in.md)）、LDPlayer 预设对齐、`page`/`foreground`/`auto_login` 分层。Live 一键登录已在 index 0 验证一次；完整签到 live 与独立审计仍未完成。master 行为相对 v0.3.2 新增了上述特征。
 
