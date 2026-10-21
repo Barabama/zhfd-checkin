@@ -84,7 +84,8 @@ cargo build --release --bins                   ✅
 - `location_timeout_seconds` 会被静默钳制在 1–120 秒。
 - `stable_frames = 0` 会被配置校验拒绝；即使绕过校验，`authorize_click` 也会拒绝 0 帧，而不是“立即点击”。
 - 完全关机的 LDPlayer 实例可能不出现在 `ldconsole list2`，`--all-instances` 会报 `LDPlayer 实例不存在`；建议运行前先启动实例。
-- `task create --all-instances` 与 `--instance-index`/`--serial` 的组合在运行时会失败；不要这样创建。
+- `task create --all-instances` 与 `--instance-index`/`--serial` 的组合现在由 clap 在解析层拒绝（exit 2）；`--all-instances` 只运行配置中 enabled 的实例。
+- App 若弹出「是否重启App / 当前 App 可能被界面劫持」，运行以 `app_restart_dialog` 停止；程序不点击弹窗，需要人工取消/重启 App 并检查悬浮窗/录屏/辅助功能。
 - 自动登录的点击坐标来自 hierarchy bounds，不依赖 Profile 几何；但 live 运行仍要求 Profile 已标定。当前仅 `portrait_900x1600_d320`（原 900x1600 生产实例）与历史 `portrait_900x1600_d240` 已标定；LDPlayer 预设 1080x1920@480、720x1280@320、540x960@240 仍是占位几何，live 会在 `uncalibrated_profile` 停止，dry-run 可探测登录页。
 - dry-run 不是离线预览：它会启动 App、导航、读取页面并等待定位，只是不点击签到按钮。
 

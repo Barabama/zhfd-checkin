@@ -65,10 +65,18 @@ foreground    = cn.edu.fzu.fdxypa
 
 ## 5. 部署检查
 
-- [ ] 将 0.3.5 EXE 覆盖到 `F:\zhfd-checkin-windows-x64\`
-- [ ] `zhfd-checkin.exe about` 确认 `0.3.5` 与干净构建
-- [ ] `task query` 确认动作仍指向该 EXE 与 `config.toml`
-- [ ] 在下次 21:00 前做一次 `run --dry-run --instance-index 0`
+- [x] 将 0.3.5 CLI EXE 覆盖到 `F:\zhfd-checkin-windows-x64\`
+- [x] `zhfd-checkin.exe about` 确认 `0.3.5-c60918c14b28`、clean
+- [x] `task query` 确认动作仍指向该 EXE 与 `config.toml`
+- [ ] 在下次 21:00 前做一次 `run --dry-run --instance-index 0`（2026-10-21 22:48 复核时 LDPlayer 实例处于 stopped，dry-run 在 device_setup 以 `LDPlayer 实例不存在: 0` 停止，未进入新代码路径）
 - [ ] 若再出现 `app_restart_dialog`，人工点击「取消/重启App」后重跑，并采集截图/层级
+
+### 部署记录（2026-10-21 22:47）
+
+- 远程 CLI 已更新为 `0.3.5-c60918c14b28`，`git_dirty=false`。
+- 远程 GUI `zhfd-checkin-gui.exe` 因文件被占用（Permission denied）未更新；CLI/计划任务不受影响。旧 GUI 备份保存在本机临时目录。
+- 远程 `instance list` 显示 index 0/1 均 `running=false`；通过 SSH 执行 `ldconsole launch --index 0` 未能在非交互会话中启动模拟器，因此未完成 dry-run 复核。
+- 远程计划任务动作未改变，仍为：
+  `"F:\zhfd-checkin-windows-x64\zhfd-checkin.exe" run --live --confirm --config "F:\zhfd-checkin-windows-x64\config.toml" --instance-index 0`
 
 > 本记录不包含真实账号、姓名、班级或定位信息；远程日志只保存在本机临时目录，未提交。
