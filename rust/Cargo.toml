@@ -1,6 +1,6 @@
 [package]
 name = "zhfd-checkin"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 description = "智汇福大 LDPlayer 自动签到控制器"
 license = "MIT"

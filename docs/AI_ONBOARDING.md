@@ -51,9 +51,9 @@
 git status -sb
 git log --oneline -5
 git tag --list
-git rev-list -n1 v0.3.3
+git rev-list -n1 v0.3.4
 cd rust
-cargo test --lib          # 预期 153 passed（v0.3.2 tag 为 140）
+cargo test --lib          # 预期 161 passed（v0.3.2 tag 为 140）
 ```
 
 在看代码之前，先确认你不在一个脏工作区、没有待发布的本地改动。
@@ -213,7 +213,7 @@ CLI 与 GUI **共享** `main.rs` 的业务函数：`run`、`diagnose`、`task_co
 | 前台检查 | `log_foreground_snapshot` / `foreground_check` foreground.rs | FR-013 前台包观测与分类 |
 | 点击门禁 | `guarded_tap` main.rs:2745 | route/mode + click policy |
 | 日期解析 | `extract_hierarchy_date` main.rs:1916 | 成功日期与冲突规则 |
-| 测试 | main.rs / page.rs / auto_login.rs 测试模块 | 约 153 个测试（分支） |
+| 测试 | main.rs / page.rs / auto_login.rs 测试模块 | 约 161 个测试 |
 
 **高风险区域**：`run_inner_with_device` 与 `locate_or_navigate`。不要盲格式化、移动或重排；先读对应测试，再改。
 
@@ -249,7 +249,7 @@ pwsh -NoProfile -File scripts/portable_smoke.ps1 `
   -FixturePath "$PWD/autojs6/fixtures/ready.png"
 ```
 
-`cargo test --lib` = 153 passed（分支）。`cargo test --all-targets` 会在 lib 与 bin 各跑一次。
+`cargo test --lib` = 161 passed。`cargo test --all-targets` 会在 lib 与 bin 各跑一次。
 
 ### 8.3 构建溯源
 
@@ -400,7 +400,7 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 ## 13. 审计与未关闭项
 
 - 最新审计：[V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)。
-- v0.3.2 修复了其中大部分 P1，但 **v0.3.2 / v0.3.3 本身尚未独立审计**；v0.3.3 的自动登录与预设调整同样未审计。
+- v0.3.2 修复了其中大部分 P1，但 **v0.3.2 / v0.3.3 / v0.3.4 本身尚未独立审计**；v0.3.3 的自动登录与预设调整同样未审计。
 - 仍未关闭：
   - release workflow 不绑定 tag/版本，`workflow_dispatch` 无 ref 限制；
   - release 不依赖 CI，且不跑 Python/Node；
@@ -457,7 +457,7 @@ zhfd-checkin.exe run --dry-run --instance-index 0
 
 - [ ] 读 `docs/STATUS.md` 与本文；
 - [ ] `git status -sb` 确认工作区干净；
-- [ ] `cargo test --lib` 确认 153 passed（v0.3.2 tag 为 140）；
+- [ ] `cargo test --lib` 确认 161 passed（v0.3.2 tag 为 140）；
 - [ ] 找到 `guarded_tap`、`authorize_click`、`run_inner_with_device`；
 - [ ] 确认自己没有运行任何 live/设备命令；
 - [ ] 明确本次任务是否触及 Frozen 决策（若是，先写 ADR）。
