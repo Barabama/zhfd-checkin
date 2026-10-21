@@ -625,10 +625,13 @@ fn print_about() {
 fn config_command(store: &ConfigStore, command: ConfigCommand) -> Result<ExitCode> {
     match command {
         ConfigCommand::Show => {
+            // Redacted by default: this output is commonly pasted into issues.
+            // Use `config open` (or the config file itself) when the operator
+            // needs the raw values.
             println!(
                 "配置文件: {}\n{}",
                 store.path.display(),
-                toml::to_string_pretty(&store.config)?
+                toml::to_string_pretty(&store.config.redacted_for_display())?
             );
         }
         ConfigCommand::Open => {

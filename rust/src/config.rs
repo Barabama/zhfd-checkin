@@ -231,6 +231,22 @@ impl Config {
         }
         Ok(())
     }
+
+    /// A copy safe for screens, logs, and shareable diagnostic output.
+    ///
+    /// The on-disk config keeps the real values; only display/export copies are
+    /// redacted. `auto_login_account` is PII (student account) and `bark_url`
+    /// can embed a webhook token.
+    pub fn redacted_for_display(&self) -> Self {
+        let mut redacted = self.clone();
+        if !redacted.runtime.auto_login_account.is_empty() {
+            redacted.runtime.auto_login_account = "<redacted>".into();
+        }
+        if !redacted.notifications.bark_url.is_empty() {
+            redacted.notifications.bark_url = "<redacted>".into();
+        }
+        redacted
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -768,9 +784,54 @@ fn create_config_backup(root: &Path, path: &Path) -> Result<PathBuf> {
         backup = backup_dir.join(format!("config.toml.bak.{}-{}", stamp, suffix));
         suffix += 1;
     }
-    fs::copy(path, &backup)
-        .with_context(|| format!("备份配置失败: {} -> {}", path.display(), backup.display()))?;
+    // Backups are long-lived copies outside the config screen. Keep the
+    // structural content for recovery, but never persist the account or the
+    // notification webhook token. A damaged/non-UTF-8 file falls back to a raw
+    // copy so Repair can still recover it.
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            fs::write(&backup, redact_sensitive_config_text(&text)).with_context(|| {
+                format!("备份配置失败: {} -> {}", path.display(), backup.display())
+            })?;
+        }
+        Err(_) => {
+            fs::copy(path, &backup).with_context(|| {
+                format!("备份配置失败: {} -> {}", path.display(), backup.display())
+            })?;
+        }
+    }
     Ok(backup)
+}
+
+/// Replace the values of PII/secret keys in a TOML document while keeping the
+/// rest of the file byte-for-byte usable for recovery.
+fn redact_sensitive_config_text(text: &str) -> String {
+    const SENSITIVE_KEYS: [&str; 2] = ["auto_login_account", "bark_url"];
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        let mut redacted = false;
+        for key in SENSITIVE_KEYS {
+            if let Some(rest) = trimmed.strip_prefix(key)
+                && rest.trim_start().starts_with('=')
+            {
+                out.push_str(indent);
+                out.push_str(key);
+                out.push_str(" = \"<redacted>\"");
+                redacted = true;
+                break;
+            }
+        }
+        if !redacted {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 fn prune_config_backups(root: &Path) -> Result<()> {
@@ -999,6 +1060,22 @@ mod tests {
     }
 
     #[test]
+    fn display_copy_redacts_account_and_notification_url() {
+        let mut config = Config::default();
+        config.runtime.auto_login_account = "123456789".into();
+        config.notifications.bark_url = "https://example.invalid/secret".into();
+        let redacted = config.redacted_for_display();
+        assert_eq!(redacted.runtime.auto_login_account, "<redacted>");
+        assert_eq!(redacted.notifications.bark_url, "<redacted>");
+        // The real config must keep the values; only the display copy changes.
+        assert_eq!(config.runtime.auto_login_account, "123456789");
+        assert_eq!(
+            config.notifications.bark_url,
+            "https://example.invalid/secret"
+        );
+    }
+
+    #[test]
     fn save_candidate_is_atomic_and_keeps_only_recent_backups() {
         let root = std::env::temp_dir().join(format!("zhfd-config-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -1012,6 +1089,9 @@ mod tests {
             created_default: false,
             recovery_error: None,
         };
+        store.save().unwrap();
+        store.config.runtime.auto_login_account = "123456789".into();
+        store.config.notifications.bark_url = "https://example.invalid/secret".into();
         store.save().unwrap();
         for index in 0..7 {
             let mut candidate = store.config.clone();
@@ -1029,12 +1109,34 @@ mod tests {
             })
             .count();
         assert_eq!(backups, 5);
+        let mut saw_redaction = false;
+        for entry in fs::read_dir(root.join("backups")).unwrap().flatten() {
+            let text = fs::read_to_string(entry.path()).unwrap();
+            assert!(
+                !text.contains("123456789"),
+                "backup leaked the account: {}",
+                entry.path().display()
+            );
+            assert!(
+                !text.contains("https://example.invalid/secret"),
+                "backup leaked the webhook URL: {}",
+                entry.path().display()
+            );
+            saw_redaction |= text.contains("<redacted>");
+        }
+        assert!(saw_redaction, "expected at least one redacted backup");
         assert_eq!(
-            toml::from_str::<Config>(&fs::read_to_string(path).unwrap())
+            toml::from_str::<Config>(&fs::read_to_string(&path).unwrap())
                 .unwrap()
                 .runtime
                 .stable_frames,
             7
+        );
+        // The active config keeps the real values; only backups are redacted.
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("auto_login_account = \"123456789\"")
         );
         let _ = fs::remove_dir_all(root);
     }

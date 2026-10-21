@@ -96,6 +96,9 @@ struct GuiApp {
     migration_target: String,
     /// Third click confirms "restore safe defaults"; the first two only arm it.
     confirm_reset_defaults: bool,
+    /// Reveal the expected account only on explicit request; the default is a
+    /// masked field because the value is PII.
+    show_auto_login_account: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -224,6 +227,7 @@ impl GuiApp {
             setup_validation: None,
             migration_target,
             confirm_reset_defaults: false,
+            show_auto_login_account: false,
         }
     }
 
@@ -2297,7 +2301,15 @@ impl GuiApp {
             ui.label("期望账号（可留空）：");
             let previous = self.store.config.runtime.auto_login_account.clone();
             let mut account = previous.clone();
-            let response = ui.text_edit_singleline(&mut account);
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut account)
+                    .password(!self.show_auto_login_account)
+                    .hint_text(if previous.is_empty() {
+                        "未设置"
+                    } else {
+                        "已设置（默认隐藏）"
+                    }),
+            );
             if response.changed() {
                 self.store.config.runtime.auto_login_account = account.clone();
             }
@@ -2310,6 +2322,7 @@ impl GuiApp {
                     }
                 }
             }
+            ui.checkbox(&mut self.show_auto_login_account, "显示明文");
         });
         ui.horizontal(|ui| {
             ui.label("登录后等待秒数（5-120）：");
@@ -2326,8 +2339,10 @@ impl GuiApp {
         });
         ui.label("默认关闭。即使开启，仍要求目标 App 前台、无外部窗口、唯一的“一键登录”按钮、账号匹配、协议复选框视觉确认和点击前二次观测；dry-run 永不点击，一次运行最多一次登录点击。");
         ui.separator();
-        ui.label("当前配置内容");
-        ui.code(toml::to_string_pretty(&self.store.config).unwrap_or_default());
+        ui.label("当前配置内容（账号与通知地址已脱敏；明文请用“打开配置所在目录”查看）");
+        ui.code(
+            toml::to_string_pretty(&self.store.config.redacted_for_display()).unwrap_or_default(),
+        );
     }
 
     fn dependency_candidate_selector(

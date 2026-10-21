@@ -1,6 +1,6 @@
 # 新 AI 上手手册
 
-- 最后核对：2026-10-20
+- 最后核对：2026-10-21
 - 适用对象：第一次接触本仓库的 AI 编码代理或新维护者
 - 当前状态数字以 [STATUS.md](./STATUS.md) 为准；本文件讲稳定的结构与规则。
 
@@ -314,6 +314,7 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 - 两开关必须同时为 true；`allow_auto_login` 不隐含协议同意。
 - 不输入、不保存账号密码；只支持一键登录，不处理「其他账户登录」。
 - `auto_login_account` 是本机 PII，config 已在 `.gitignore` 中；不要提交、不要写进文档或日志。
+- 配置备份（`backups/config.toml.bak.*`）会把 `auto_login_account` 与 `bark_url` 写成 `<redacted>`；从备份恢复后需要重新填写账号。`config show` 与诊断报告默认脱敏，GUI 输入框默认掩码。
 - 登录页截图可能包含账号，日志目录不得提交。
 
 ### 9.4 LDPlayer 预设与 Profile
