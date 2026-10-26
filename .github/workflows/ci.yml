@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  # P2-26: the Windows Release workflow calls this job, so a release can never
+  # outrun the fmt/clippy/test/release-build/portable-smoke/Python/Node matrix.
+  # Keeping the gates in one place stops the CI and release workflows from
+  # drifting apart.
+  workflow_call:
 
 permissions:
   contents: read
@@ -33,6 +38,14 @@ jobs:
 
       - name: Rust tests
         run: cargo test --manifest-path rust/Cargo.toml
+
+      # The release guards in release.yml are PowerShell embedded in YAML, so
+      # nothing would execute them until a real tag was pushed. This runs the
+      # shipped guard steps against a synthetic repository, which makes a broken
+      # guard fail on the pull request instead of at release time.
+      - name: Release guard simulation
+        shell: pwsh
+        run: .\scripts\simulate_release_guards.ps1
 
       - name: Rust release build
         run: cargo build --release --manifest-path rust/Cargo.toml --bins
@@ -65,13 +78,6 @@ jobs:
         shell: pwsh
         run: .\scripts\package_release.ps1 -ReleaseDirectory "$pwd\dist"
 
-      - name: Upload Windows release artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: zhfd-checkin-windows
-          path: dist/*.zip
-          if-no-files-found: error
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -93,3 +99,12 @@ jobs:
 
       - name: AutoJs6 structural smoke test
         run: node autojs6/validate_node.js
+
+      # P2-26: upload last, so a failing Python/Node gate can no longer leave a
+      # downloadable Windows artifact behind for a build that never passed.
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhfd-checkin-windows
+          path: dist/*.zip
+          if-no-files-found: error

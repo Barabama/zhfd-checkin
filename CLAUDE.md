@@ -36,7 +36,7 @@ git tag --list
 cd rust; cargo test --lib
 ```
 
-当前基线：Cargo `0.3.5`，最新 tag `v0.3.4`（`v0.3.5` 发布准备中），`cargo test --lib` 167 passed。HEAD 可能比 tag 多 docs-only 提交。
+当前基线：Cargo `0.3.5`，最新 tag `v0.3.5`，`cargo test --lib` 167 passed。HEAD 可能比 tag 多 docs-only 提交。
 
 ## 环境
 
@@ -70,7 +70,9 @@ zhfd-checkin.exe run --dry-run --instance-index 0
 
 | 文件 | 职责 |
 |---|---|
-| `rust/src/main.rs` | CLI、run 编排、状态机、导航、结果、任务、测试（约 4,824 行） |
+| `rust/src/main.rs` | CLI 命令分发、run 编排、状态机、导航、结果、任务、测试（约 5,315 行） |
+| `rust/src/cli.rs` | clap 定义、help 文案与参数约束（CLI 专用，GUI 不依赖 clap） |
+| `rust/src/commands.rs` | clap-free 的 typed request/policy（`RunPolicy`/`RunRequest`/`RunSource` 等），CLI 与 GUI 共用 |
 | `rust/src/page.rs` | 通用页面模型：PageView/PageNode/NodeBounds、路由识别、单轮 hierarchy 观测 |
 | `rust/src/foreground.rs` | 前台包观测与 FR-013 检查（自动登录与状态机共享） |
 | `rust/src/auto_login.rs` | 登录页识别、协议复选框、一次一键登录与结果字段（不依赖 Profile 几何） |
@@ -86,14 +88,14 @@ zhfd-checkin.exe run --dry-run --instance-index 0
 关键位置（用函数名搜索，行号会漂移）：
 
 ```text
-guarded_tap            main.rs:2745
-authorize_page_action  domain.rs:181
-authorize_click        domain.rs:523
-run_inner_with_device  main.rs:1995   （高风险大函数）
-locate_or_navigate     main.rs:2988   （高风险大函数）
+guarded_tap            main.rs:2905
+authorize_page_action  domain.rs:187
+authorize_click        domain.rs:533
+run_inner_with_device  main.rs:2158   （高风险大函数）
+locate_or_navigate     main.rs:3172   （高风险大函数）
 observe_page_route     page.rs
 detect_page_route      page.rs
-extract_hierarchy_date main.rs:1916
+extract_hierarchy_date main.rs:2079
 ```
 
 `rust/src/lib.rs` 是 `include!("main.rs")`；`cargo test` 会把同一批测试在 lib 与 bin 各跑一次。报告数量用 `cargo test --lib`。

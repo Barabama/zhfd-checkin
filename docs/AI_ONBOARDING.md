@@ -1,6 +1,6 @@
 # 新 AI 上手手册
 
-- 最后核对：2026-10-21
+- 最后核对：2026-10-26
 - 适用对象：第一次接触本仓库的 AI 编码代理或新维护者
 - 当前状态数字以 [STATUS.md](./STATUS.md) 为准；本文件讲稳定的结构与规则。
 
@@ -272,9 +272,9 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 
 ### 8.4 CI / Release
 
-- `.github/workflows/ci.yml`：push/PR → fmt、clippy、test、release build、portable smoke、provenance、打包 artifact、Python、Node。
-- `.github/workflows/release.yml`：`v*` tag push（或手动）→ 同上 Rust 门禁 → 打包 → 发布 GitHub Release 与 `dist/*.zip`。
-- **已知缺口**：release workflow 不跑 Python/Node；不校验 tag 名与 Cargo 版本一致；`workflow_dispatch` 可在任意分支运行。发布前先确认 CI 在**同一个 commit** 上为绿。
+- `.github/workflows/ci.yml`：push/PR/tag → fmt、clippy、test、release guard 离线回归、release build、portable smoke、provenance、打包 artifact、Python、Node；artifact 上传在 Python/Node 之后。也作为 reusable workflow（`workflow_call`）供 release 复用。
+- `.github/workflows/release.yml`：`v*` tag push（或手动重跑某个 tag）→ 先以 reusable workflow 跑上面整套 CI（`verify` job）→ release guard（tag ref / tag 名 == `v<Cargo 版本>` / tag 提交 == checkout HEAD / tag 提交在默认分支上）→ 构建 → portable smoke → 打包 → asset guard → 发布 GitHub Release。
+- 发布门禁已加固（2026-10-26）；细节与离线回归见 [ENGINEERING_AND_RELEASE.md](./ENGINEERING_AND_RELEASE.md)。发布前仍先确认 CI 在**同一个 commit** 上为绿。
 
 ### 8.5 发布资产
 
@@ -412,9 +412,8 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 - 最新审计：[V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)。
 - v0.3.2 修复了其中大部分 P1，但 **v0.3.2 / v0.3.3 / v0.3.4 / v0.3.5 本身尚未独立审计**；v0.3.3 的自动登录与预设调整同样未审计。
 - 仍未关闭：
-  - release workflow 不绑定 tag/版本，`workflow_dispatch` 无 ref 限制；
-  - release 不依赖 CI，且不跑 Python/Node；
-  - GUI 黑盒、低分辨率/高 DPI、迁移中断、真实外勤 live 尚未验收。
+  - GUI 黑盒、低分辨率/高 DPI、迁移中断、真实外勤 live 尚未验收；
+  - 发布门禁（P1-4 / P2-26）已于 2026-10-26 加固，但**尚未在 GitHub runner 上真实执行过**（下一次 tag 发布是首次真实运行）。
 - 不要把 commit message 里的 “close P1” 当作独立验收通过。
 
 ---

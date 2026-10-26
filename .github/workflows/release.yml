@@ -1,39 +1,124 @@
 name: Windows Release
 
+# P1-4: a release must be traceable to a tag that matches the shipped version.
+# `push` on `v*` is the normal entry point; `workflow_dispatch` stays available
+# so a failed tag run can be re-dispatched on the same tag. The guard step
+# below refuses to continue on a branch ref, on a tag whose name disagrees with
+# the Cargo version, and on a tag that does not point at a commit on the
+# default branch.
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
 
+# Least privilege at the workflow level: the reusable CI workflow called below
+# can therefore never do more than read the repository. Only the `release` job
+# opts into write access, and only to create the Release.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  # P2-26: the release must not outrun CI. Calling ci.yml (instead of
+  # copy-pasting a subset of its steps) keeps fmt/clippy/test/release-build/
+  # portable-smoke/Python/Node in exactly one place, so the CI matrix and the
+  # release gates cannot drift apart. Any gate failure blocks `release`.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
   release:
+    needs: verify
     runs-on: windows-latest
+    permissions:
+      contents: write # softprops/action-gh-release creates the Release
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # The tag-target check walks history, so it needs the full clone
+          # rather than the default single-commit checkout.
+          fetch-depth: 0
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
-      - name: Rust checks
+      # P1-4: bind the release to (a) a tag ref, (b) a tag name that is the
+      # Cargo version prefixed with `v`, (c) a tag present in this checkout,
+      # (d) a tag pointing at the checked-out commit, and (e) a commit that is
+      # on the default branch. Before this step the workflow could be
+      # dispatched from any branch and would publish assets named after the
+      # Cargo version while the Release itself carried an unrelated tag.
+      - name: Verify the release ref is a tag bound to the Cargo version
         shell: pwsh
+        env:
+          # Passed through the environment instead of being interpolated into
+          # the script body, so a branch name can never be spliced into
+          # PowerShell source and the script stays statically parseable.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          cargo fmt --manifest-path rust/Cargo.toml --all -- --check
-          cargo clippy --manifest-path rust/Cargo.toml --all-targets --all-features -- -D warnings
-          cargo test --manifest-path rust/Cargo.toml
+          $ErrorActionPreference = "Stop"
+          $version = (cargo metadata --manifest-path rust/Cargo.toml --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_TYPE -ne "tag") {
+            throw "Refusing to release from a '$($env:GITHUB_REF_TYPE)' ref. Re-dispatch this workflow on tag v$version. ref=$($env:GITHUB_REF)"
+          }
+          $tag = $env:GITHUB_REF_NAME
+          # Anchored, so a pre-release (v0.4.0-rc.1) or a four-part build
+          # (v0.3.5.1) tag is never published as a stable release.
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tags must look like vX.Y.Z. tag=$tag"
+          }
+          if ($tag -ne "v$version") {
+            throw "Tag name does not match the Cargo version. tag=$tag expected=v$version`nBump rust/Cargo.toml (and commit) before tagging."
+          }
+          if (-not (git rev-parse -q --verify "refs/tags/$tag")) {
+            throw "$tag is not present in this checkout. Re-dispatch this workflow on the tag ref."
+          }
+          # Compare peeled commits rather than raw object ids, so this holds for
+          # both lightweight and annotated tags.
+          $tagCommit = (git rev-parse "$tag^{commit}").Trim()
+          $headCommit = (git rev-parse "HEAD^{commit}").Trim()
+          if ($tagCommit -ne $headCommit) {
+            throw "The checked-out commit is not the tagged commit. tag_commit=$tagCommit head=$headCommit tag=$tag"
+          }
+          # The tag must also land on a commit the default branch contains:
+          # tagging an unmerged feature-branch commit would publish a Release
+          # that no reviewed branch has. The remote-tracking ref is written
+          # explicitly so the check cannot depend on which refspec
+          # actions/checkout happened to configure.
+          $defaultBranch = $env:DEFAULT_BRANCH
+          if ([string]::IsNullOrWhiteSpace($defaultBranch)) {
+            $symref = (& git ls-remote --symref origin HEAD 2>&1) -join "`n"
+            $match = [regex]::Match($symref, 'ref:\s+refs/heads/(\S+)\s+HEAD')
+            if (-not $match.Success) {
+              throw "Unable to determine the remote default branch. output=$symref"
+            }
+            $defaultBranch = $match.Groups[1].Value
+          }
+          $trackingRef = "refs/remotes/origin/$defaultBranch"
+          git fetch --quiet --no-tags origin "+refs/heads/${defaultBranch}:${trackingRef}"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to fetch '$defaultBranch' to verify the tag target."
+          }
+          if (-not (git rev-parse -q --verify $trackingRef)) {
+            throw "Origin has no branch '$defaultBranch'; cannot verify the tag target."
+          }
+          git merge-base --is-ancestor $tagCommit $trackingRef
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag $tag points at $tagCommit, which is not an ancestor of $trackingRef. Release from the default branch, or merge the commit first."
+          }
+          Write-Host "release_guard=PASS tag=$tag version=$version commit=$tagCommit default_branch=$defaultBranch"
 
       - name: Build release binaries
-        run: cargo build --release --manifest-path rust/Cargo.toml --bins
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --manifest-path rust/Cargo.toml --bins
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
 
       - name: Portable smoke and commit check
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           .\scripts\portable_smoke.ps1 -ExePath "$pwd\rust\target\release\zhfd-checkin.exe" -FixturePath "$pwd\autojs6\fixtures\ready.png"
           $expected = (git rev-parse --short=12 HEAD).Trim()
           $version = (cargo metadata --manifest-path rust/Cargo.toml --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
@@ -55,6 +140,30 @@ jobs:
       - name: Package
         shell: pwsh
         run: .\scripts\package_release.ps1 -ReleaseDirectory "$pwd\dist"
+
+      # P1-4: package_release.ps1 names the asset from the version it read and
+      # the commit git reported at *package time*. Re-derive that name and
+      # require the packaged file to match, so the published asset can never
+      # carry a version or commit the tag does not claim. Also rejects a stale
+      # zip left behind by an earlier run or an incremental workspace.
+      - name: Verify the packaged asset matches the tag
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (cargo metadata --manifest-path rust/Cargo.toml --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $commit = (git rev-parse --short=12 HEAD).Trim()
+          $expected = "zhfd-checkin-windows-x64-v$version-$commit.zip"
+          if (-not (Test-Path -LiteralPath "$pwd\dist" -PathType Container)) {
+            throw "No dist directory at $pwd\dist; the package step did not produce an artifact."
+          }
+          $found = @(Get-ChildItem -LiteralPath "$pwd\dist" -Filter *.zip)
+          if ($found.Count -ne 1) {
+            throw "Expected exactly one release zip in dist, found $($found.Count)."
+          }
+          if ($found[0].Name -ne $expected) {
+            throw "Release asset name does not match the tag. asset=$($found[0].Name) expected=$expected"
+          }
+          Write-Host "asset_guard=PASS asset=$($found[0].Name)"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

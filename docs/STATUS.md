@@ -1,6 +1,6 @@
 # 当前状态（唯一事实源）
 
-- 最后核对：2026-10-21（Asia/Shanghai）
+- 最后核对：2026-10-26（Asia/Shanghai）
 - 仓库：`https://github.com/Barabama/zhfd-checkin`
 - 本文件是**当前状态的唯一事实源**。其他文档只描述稳定知识；状态数字以这里为准。
 
@@ -10,6 +10,7 @@
 |---|---|
 | 默认分支 | `master` |
 | HEAD（发布） | `c60918c`（`v0.3.5` tag） |
+| master HEAD | `8c7009c`（比 tag 多 2 个 docs-only 提交） |
 | HEAD 与远端 | 与 `origin/master` 同步 |
 | Cargo 版本 | `0.3.5` |
 | `v0.3.5` tag commit | `c60918c` |
@@ -73,9 +74,9 @@ cargo build --release --bins                   ✅
 - 2026-10-21 CLI 设计审计：[CLI 命令面设计审计](./audits/CLI_DESIGN_AUDIT_2026-10-21.md)。结论：最大嵌套 2 层、结构已扁平，但 help 可发现性、CLI/GUI/状态机耦合、`task create --all-instances` 参数组合仍需改进；列为 P1/P2，未改代码。**AI 辅助，不构成独立验收。**
 - v0.3.3 的自动登录、预设 DPI 调整与模块拆分仍未独立审计；现场只完成一次 live 一键登录（900x1600@320）与一次 720x1280@320 dry-run，且该 live 证据早于最终 pre-tap/dialog 改动（见 AI 审计 EVID-01）。
 - 未关闭项：
-  - **P1-4**：release workflow 不绑定 tag 名 / Cargo 版本 / tag 目标；`workflow_dispatch` 可在任意分支运行。
-  - **P2-26**：release 不依赖 CI；Python/Node 门禁不在 release workflow 中；CI 在 Python/Node 之前上传 artifact。
   - 其余 P2/P3 见审计报告；多数为诊断、GUI 状态与兼容性问题。
+- 2026-10-26 关闭的发布门禁项（AI 辅助，非独立审计）：**P1-4** 与 **P2-26** 已由 `.github/workflows/release.yml` / `ci.yml` 的改动处理 —— release 现在要求 tag ref、tag 名 == `v<Cargo 版本>`、tag 提交 == checkout 的 HEAD、且 tag 提交在默认分支上；`release` job `needs: verify`（reusable `ci.yml`），asset 名在发布前复核；CI 的 artifact 上传移到 Python/Node 之后。变更记录见 [ENGINEERING_AND_RELEASE.md](./ENGINEERING_AND_RELEASE.md)。
+  - 该改动**尚未**在 GitHub runner 上真实执行过（tag 发布是首次真实运行），本地离线回归见 `scripts/simulate_release_guards.ps1`（15 个场景）。
 
 ## 5. 已知运行限制
 
@@ -94,7 +95,7 @@ cargo build --release --bins                   ✅
 ```powershell
 git status -sb
 git log --oneline -3
-git rev-list -n1 v0.3.3
+git rev-list -n1 v0.3.5
 git tag --list
 cd rust; cargo test --lib
 ```

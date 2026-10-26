@@ -34,13 +34,13 @@ GUI 是应用服务的展示和用户动作入口，不应复制实例发现、�
 | 3 GUI 信息架构 | 分组导航、Profile 排序、日志/事件证据浏览已实现 | 小窗口/缩放/长路径/大量日志仍未验收 |
 | 4 工程补齐 | APK ZIP/XML 边界、结果契约、身份保留、port 语义、构建溯源已实现 | CI/release runner 已实际运行；完整设备级验收仍未完成 |
 
-当前 `master` HEAD 为 `1b1931f`（`v0.3.2` 之后两个 docs-only 提交）；最新发布 tag `v0.3.2` 对应 `8d3f58e`，`v0.3.1` 对应 `a955d0a`。
-当前状态与未关闭项以 [STATUS.md](./STATUS.md) 为准；独立审计见 [V0.3.1 独立审计报告](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)。
+当前的 HEAD、tag、Release、CI 与审计状态一律以 [STATUS.md](./STATUS.md) 为准，本文件不复制这些数字。
+独立审计见 [V0.3.1 独立审计报告](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)。
 
 ## 当前仍待完成的系统级事项
 
-- 完成 `v0.3.2` 的独立审计（v0.3.1 审计中的 P1-1/2/3/6/7/8 已修复，P1-9 已由 ADR-0002 处理）；
-- release workflow 绑定 tag/版本并依赖 CI（审计 P1-4 / P2-26）；
+- 完成 `v0.3.2` 及之后各版本（`v0.3.3`/`v0.3.4`/`v0.3.5`）的独立审计（v0.3.1 审计中的 P1-1/2/3/6/7/8 已修复，P1-9 已由 ADR-0002 处理）；
+- ~~release workflow 绑定 tag/版本并依赖 CI（审计 P1-4 / P2-26）~~ → 已于 2026-10-26 加固，见 [ENGINEERING_AND_RELEASE.md](./ENGINEERING_AND_RELEASE.md)（仍待真实 tag 发布验证）；
 - 窗口内三实例 dry-run 与真实 live / 外勤 live 的设备级复验；
 - GUI 低分辨率、高 DPI、窄窗口、长中文路径、迁移中断、计划任务交互黑盒验收；
 - 架构拆分：把 `main.rs` 中的编排抽成应用服务，减少 GUI 对内部函数的直接依赖。
