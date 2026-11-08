@@ -1,10 +1,135 @@
+use crate::domain::{DeviceWaitFailure, WAIT_BOOT_TIMEOUT};
 use crate::profile::Orientation;
+use crate::wait::{WaitOutcome, poll_until};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
     process::Output,
+    thread,
+    time::{Duration, Instant},
 };
+
+/// How often the boot wait re-probes the guest. Matches the cadence of the ADB
+/// connect and app-foreground waits so a slow boot does not turn into a burst of
+/// `adb shell` processes.
+pub const BOOT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The handful of shell reads that decide whether the guest is usable.
+///
+/// A trait instead of calling [`AdbDevice::shell`] directly so the boot wait can
+/// be replayed against scripted output in unit tests — no ADB binary, no
+/// emulator, no real sleeping.
+pub trait ShellProbe {
+    fn shell(&self, args: &[&str]) -> Result<String>;
+}
+
+impl ShellProbe for AdbDevice {
+    fn shell(&self, args: &[&str]) -> Result<String> {
+        AdbDevice::shell(self, args)
+    }
+}
+
+/// One observation of the guest boot state.
+///
+/// Deliberately richer than a bool: a `boot_timeout` has to say *which*
+/// condition was still missing, otherwise "the operator is away from the desk"
+/// and "Android is wedged" look identical in the log.
+#[derive(Debug, Clone, Default)]
+pub struct BootSnapshot {
+    pub boot_completed: Option<String>,
+    pub bootanim: Option<String>,
+    pub size_parseable: bool,
+    /// Last shell failure among the three reads, if any.
+    pub error: Option<String>,
+}
+
+impl BootSnapshot {
+    /// All three readiness conditions.
+    ///
+    /// `init.svc.bootanim` is absent on some builds; a missing or empty value is
+    /// treated as unknown rather than "still running", so those builds are not
+    /// blocked forever.
+    pub fn is_ready(&self) -> bool {
+        let completed = self.boot_completed.as_deref().map(str::trim) == Some("1");
+        let animation_stopped = match self.bootanim.as_deref().map(str::trim) {
+            None | Some("") => true,
+            Some(value) => value.eq_ignore_ascii_case("stopped"),
+        };
+        completed && animation_stopped && self.size_parseable
+    }
+
+    /// Non-PII one-line description for the failure detail and events.
+    pub fn describe(&self) -> String {
+        format!(
+            "boot_completed={} bootanim={} wm_size_parseable={}{}",
+            self.boot_completed.as_deref().unwrap_or("<读取失败>"),
+            self.bootanim.as_deref().unwrap_or("<读取失败>"),
+            self.size_parseable,
+            self.error
+                .as_deref()
+                .map(|error| format!("; 最后一次 shell 错误: {error}"))
+                .unwrap_or_default()
+        )
+    }
+}
+
+fn probe_boot_snapshot<S: ShellProbe>(shell: &S) -> BootSnapshot {
+    let boot_completed = shell.shell(&["getprop", "sys.boot_completed"]);
+    let bootanim = shell.shell(&["getprop", "init.svc.bootanim"]);
+    let size = shell.shell(&["wm", "size"]);
+    BootSnapshot {
+        // Raw value on success (`""`, `0`, `1`), `None` only when the read
+        // failed — the difference drives both readiness and the timeout detail.
+        boot_completed: boot_completed.as_ref().ok().map(|v| v.trim().to_string()),
+        bootanim: bootanim.as_ref().ok().map(|v| v.trim().to_string()),
+        size_parseable: size.as_ref().ok().and_then(|v| parse_size(v)).is_some(),
+        error: boot_completed
+            .err()
+            .or_else(|| bootanim.err())
+            .or_else(|| size.err())
+            .map(|error| format!("{error:#}")),
+    }
+}
+
+/// Injectable core of [`AdbDevice::wait_for_boot`].
+///
+/// A single unreadable shell call is not treated as a failure: while the guest
+/// boots, `adb shell` itself may answer nothing for tens of seconds, and that is
+/// a normal "not ready yet". The last observation is kept so the timeout detail
+/// names the condition that never became true.
+fn wait_for_boot_with<F, N, Z>(
+    mut snapshot: F,
+    timeout: Duration,
+    interval: Duration,
+    now: N,
+    sleep: Z,
+) -> WaitOutcome<()>
+where
+    F: FnMut() -> BootSnapshot,
+    N: Fn() -> Instant,
+    Z: Fn(Duration),
+{
+    let mut last = BootSnapshot::default();
+    let (ready, stats) = poll_until(timeout, interval, now, sleep, || {
+        last = snapshot();
+        Ok(last.is_ready().then_some(()))
+    });
+    match ready {
+        Some(()) => WaitOutcome::ok((), stats.attempts),
+        None => WaitOutcome::failed(
+            DeviceWaitFailure::new(
+                WAIT_BOOT_TIMEOUT,
+                format!(
+                    "Android 系统未在 {timeout:?} 内完成引导（{}）",
+                    last.describe()
+                ),
+            )
+            .into_error(),
+            stats.attempts,
+        ),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AdbDevice {
@@ -152,6 +277,29 @@ impl AdbDevice {
             orientation: Orientation::from_dimensions(width, height),
             package: self.current_package().ok(),
         })
+    }
+
+    /// One observation of the boot state, including the raw
+    /// `sys.boot_completed` value. Never fails: during boot a shell call itself
+    /// can be unavailable, which is a normal "not ready yet".
+    ///
+    /// Kept as a single snapshot rather than separate `boot_completed()` /
+    /// `bootanim()` probes so readiness is decided from one consistent round:
+    /// three independent calls could each see a different moment of the boot.
+    pub fn boot_snapshot(&self) -> BootSnapshot {
+        probe_boot_snapshot(self)
+    }
+
+    /// Wait until the guest Android is booted enough for `info()`'s geometry
+    /// probe, or fail with `boot_timeout`.
+    pub fn wait_for_boot(&self, timeout: Duration) -> WaitOutcome<()> {
+        wait_for_boot_with(
+            || probe_boot_snapshot(self),
+            timeout,
+            BOOT_POLL_INTERVAL,
+            Instant::now,
+            thread::sleep,
+        )
     }
 
     /// The raw `mCurrentFocus=`/`mFocusedApp=` line, length-limited.
@@ -729,5 +877,210 @@ mod tests {
             parse_package("mCurrentFocus=Window{u0 cn.edu.fzu.fdxypa/cn.edu.fzu.Main}"),
             Some("cn.edu.fzu.fdxypa".into())
         );
+    }
+
+    /// Scripted `adb shell` output keyed by the property/command asked for.
+    #[derive(Default)]
+    struct FakeShell {
+        boot_completed: std::cell::RefCell<std::collections::VecDeque<Result<String>>>,
+        bootanim: std::cell::RefCell<std::collections::VecDeque<Result<String>>>,
+        size: std::cell::RefCell<std::collections::VecDeque<Result<String>>>,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl FakeShell {
+        fn from_rounds(rounds: &[(Option<&str>, Option<&str>, Option<&str>)]) -> Self {
+            let fake = Self::default();
+            for (boot, anim, size) in rounds {
+                fake.boot_completed.borrow_mut().push_back(match boot {
+                    Some(value) => Ok(value.to_string()),
+                    None => Err(anyhow::anyhow!("adb shell 失败: device offline")),
+                });
+                fake.bootanim.borrow_mut().push_back(match anim {
+                    Some(value) => Ok(value.to_string()),
+                    None => Err(anyhow::anyhow!("adb shell 失败: device offline")),
+                });
+                fake.size.borrow_mut().push_back(match size {
+                    Some(value) => Ok(value.to_string()),
+                    None => Err(anyhow::anyhow!("adb shell 失败: device offline")),
+                });
+            }
+            fake
+        }
+
+        /// The last scripted answer repeats, so a wait that outlives the script
+        /// still terminates instead of panicking.
+        fn next(
+            queue: &std::cell::RefCell<std::collections::VecDeque<Result<String>>>,
+        ) -> Result<String> {
+            let mut queue = queue.borrow_mut();
+            if queue.len() > 1 {
+                queue.pop_front().unwrap()
+            } else {
+                match queue.front() {
+                    Some(Ok(value)) => Ok(value.clone()),
+                    Some(Err(error)) => Err(anyhow::anyhow!("{error:#}")),
+                    None => Err(anyhow::anyhow!("脚本已耗尽")),
+                }
+            }
+        }
+    }
+
+    impl ShellProbe for FakeShell {
+        fn shell(&self, args: &[&str]) -> Result<String> {
+            self.calls.set(self.calls.get() + 1);
+            match args {
+                ["getprop", "sys.boot_completed"] => Self::next(&self.boot_completed),
+                ["getprop", "init.svc.bootanim"] => Self::next(&self.bootanim),
+                ["wm", "size"] => Self::next(&self.size),
+                other => panic!("未预期的 shell 调用: {other:?}"),
+            }
+        }
+    }
+
+    struct FakeClock {
+        base: Instant,
+        elapsed: std::cell::Cell<Duration>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                elapsed: std::cell::Cell::new(Duration::ZERO),
+            }
+        }
+        fn now(&self) -> Instant {
+            self.base + self.elapsed.get()
+        }
+        fn sleep(&self, duration: Duration) {
+            self.elapsed.set(self.elapsed.get() + duration);
+        }
+    }
+
+    #[test]
+    fn boot_wait_returns_as_soon_as_both_properties_and_size_are_ready() {
+        // Round 1: shell itself is unavailable (normal during boot). Round 2:
+        // boot_completed is still empty. Round 3: bootanim is still running.
+        // Round 4: everything is ready.
+        let shell = FakeShell::from_rounds(&[
+            (None, None, None),
+            (Some(""), Some("stopped"), Some("Physical size: 900x1600\n")),
+            (
+                Some("1"),
+                Some("running"),
+                Some("Physical size: 900x1600\n"),
+            ),
+            (
+                Some("1"),
+                Some("stopped"),
+                Some("Physical size: 900x1600\n"),
+            ),
+        ]);
+        let clock = FakeClock::new();
+        let outcome = wait_for_boot_with(
+            || probe_boot_snapshot(&shell),
+            Duration::from_secs(60),
+            Duration::from_millis(500),
+            || clock.now(),
+            |duration| clock.sleep(duration),
+        );
+        assert!(outcome.is_ok(), "引导完成后必须返回成功");
+        assert_eq!(outcome.attempts, 4);
+        // Three polls slept; the successful fourth did not.
+        assert_eq!(clock.elapsed.get(), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn boot_wait_reports_boot_timeout_and_names_the_missing_condition() {
+        let shell = FakeShell::from_rounds(&[(
+            Some("0"),
+            Some("running"),
+            Some("Physical size: 900x1600\n"),
+        )]);
+        let clock = FakeClock::new();
+        let outcome = wait_for_boot_with(
+            || probe_boot_snapshot(&shell),
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+            || clock.now(),
+            |duration| clock.sleep(duration),
+        );
+        let error = outcome.value.expect_err("系统一直未引导完成");
+        assert_eq!(
+            crate::domain::device_wait_code(&error),
+            Some(crate::domain::WAIT_BOOT_TIMEOUT)
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("boot_completed=0"),
+            "必须指出缺的是哪一条: {text}"
+        );
+        assert!(text.contains("bootanim=running"));
+        // The deadline is honoured exactly, and no probe is issued after it:
+        // four polls fit in 2 s at 500 ms (0, .5, 1.0, 1.5), then the budget is
+        // spent and the wait stops rather than probing a fifth time.
+        assert_eq!(clock.elapsed.get(), Duration::from_secs(2));
+        assert_eq!(outcome.attempts, 4);
+    }
+
+    #[test]
+    fn boot_wait_requires_a_parseable_wm_size_even_when_both_properties_are_ready() {
+        let shell = FakeShell::from_rounds(&[(
+            Some("1"),
+            Some("stopped"),
+            Some("Physical size: unknown\n"),
+        )]);
+        let clock = FakeClock::new();
+        let outcome = wait_for_boot_with(
+            || probe_boot_snapshot(&shell),
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+            || clock.now(),
+            |duration| clock.sleep(duration),
+        );
+        assert!(!outcome.is_ok(), "wm size 不可解析时不得视为已就绪");
+        assert_eq!(
+            crate::domain::device_wait_code(&outcome.value.unwrap_err()),
+            Some(crate::domain::WAIT_BOOT_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn missing_bootanim_property_does_not_block_a_booted_guest() {
+        // Some builds do not expose `init.svc.bootanim`; an empty value must be
+        // treated as unknown rather than "still running".
+        let shell =
+            FakeShell::from_rounds(&[(Some("1"), Some(""), Some("Physical size: 900x1600\n"))]);
+        let clock = FakeClock::new();
+        let outcome = wait_for_boot_with(
+            || probe_boot_snapshot(&shell),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            || clock.now(),
+            |duration| clock.sleep(duration),
+        );
+        assert!(outcome.is_ok(), "缺少 bootanim 时不得永久等待");
+        assert_eq!(outcome.attempts, 1);
+    }
+
+    #[test]
+    fn boot_completed_only_accepts_an_exact_one() {
+        // The property is "0"/"" before boot and "1" after; whitespace from the
+        // shell stream must not change the verdict.
+        for (raw, expected) in [
+            (" 1 \n", true),
+            ("0\n", false),
+            ("\n", false),
+            ("true\n", false),
+        ] {
+            let shell = FakeShell::from_rounds(&[(
+                Some(raw),
+                Some("stopped"),
+                Some("Physical size: 1x1\n"),
+            )]);
+            let snapshot = probe_boot_snapshot(&shell);
+            assert_eq!(snapshot.is_ready(), expected, "raw={raw:?}");
+        }
     }
 }

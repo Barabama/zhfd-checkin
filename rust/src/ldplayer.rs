@@ -1,9 +1,20 @@
+use crate::domain::{DeviceWaitFailure, WAIT_INSTANCE_LAUNCH_TIMEOUT, WAIT_INSTANCE_NOT_LISTED};
+use crate::wait::{WaitOutcome, poll_until};
 use anyhow::{Context, Result, bail};
 use std::{
     path::{Path, PathBuf},
     thread,
     time::Duration,
 };
+
+/// How often `ldconsole list2` is re-read while waiting for an instance to show
+/// up. Launching a VM is a multi-second operation, so polling faster than this
+/// only burns subprocesses.
+pub const INSTANCE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often the `running` flag is re-read while waiting for a launch. LDPlayer
+/// flips it once the VM window exists, seconds after the launch command.
+pub const RUNNING_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct LdPlayer {
@@ -126,6 +137,33 @@ impl LdPlayer {
             .with_context(|| format!("LDPlayer 实例不存在: {}", index))
     }
 
+    /// Wait for the instance to appear in `ldconsole list2`.
+    ///
+    /// A fully powered-off LDPlayer instance may be absent from that list
+    /// entirely, so "not listed" must be retried instead of failing at once —
+    /// but this only *observes*. Whether the instance is then launched stays the
+    /// caller's decision, which keeps read-only paths (`diagnose`, `profile
+    /// detect`, GUI probes) from starting a VM.
+    ///
+    /// A failed `list2` invocation is treated like "not listed yet" and retried:
+    /// during an LDPlayer restart the console itself can be briefly unavailable.
+    /// If the budget expires the outcome carries `instance_not_listed` and names
+    /// the last console error, so "the tool never answered" is distinguishable
+    /// from "the instance is gone".
+    pub fn wait_for_instance_visible(
+        &self,
+        index: u32,
+        timeout: Duration,
+    ) -> WaitOutcome<Instance> {
+        wait_for_instance_with(
+            index,
+            timeout,
+            std::time::Instant::now,
+            thread::sleep,
+            || self.instances(),
+        )
+    }
+
     pub fn wait_for_stopped(&self, index: u32, timeout: Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
@@ -137,20 +175,48 @@ impl LdPlayer {
         bail!("LDPlayer 实例停止超时: {}", index)
     }
 
-    pub fn launch_wait(&self, index: u32, timeout: Duration) -> Result<()> {
+    /// Start the instance if it is stopped and wait for the VM to report
+    /// `running`.
+    ///
+    /// `running` only means the VM process is up; the guest Android may still be
+    /// booting, which is why the caller follows this with an ADB connect and a
+    /// boot wait. The two failure modes are kept apart on purpose: a failing
+    /// `launch` command cannot be fixed by waiting, so it surfaces with its own
+    /// context, while "never reached running" is `instance_launch_timeout`.
+    pub fn launch_wait(&self, index: u32, timeout: Duration) -> WaitOutcome<()> {
         // After `quit`, `isrunning` can briefly return stale output. Check the
         // parsed instance state and issue launch only while it is stopped.
-        if !self.instance(index)?.running {
-            self.command(&["launch", "--index", &index.to_string()])?;
+        let already_running = match self.instance(index) {
+            Ok(instance) => instance.running,
+            Err(error) => return WaitOutcome::failed(error, 0),
+        };
+        if !already_running
+            && let Err(error) = self
+                .command(&["launch", "--index", &index.to_string()])
+                .with_context(|| format!("LDPlayer 实例启动命令失败: {index}"))
+        {
+            return WaitOutcome::failed(error, 0);
         }
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            if self.instance(index)?.running {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_secs(2));
+        let (running, stats) = poll_until(
+            timeout,
+            RUNNING_POLL_INTERVAL,
+            std::time::Instant::now,
+            thread::sleep,
+            || Ok(self.instance(index)?.running.then_some(())),
+        );
+        match running {
+            Some(()) => WaitOutcome::ok((), stats.attempts),
+            None => WaitOutcome::failed(
+                DeviceWaitFailure::new(
+                    WAIT_INSTANCE_LAUNCH_TIMEOUT,
+                    format!(
+                        "LDPlayer 实例启动超时: {index}（{timeout:?} 内未进入 running；VM 进程未就绪）"
+                    ),
+                )
+                .into_error(),
+                stats.attempts,
+            ),
         }
-        bail!("LDPlayer 实例启动超时: {}", index)
     }
 
     /// TCP ADB serial used by `adb connect` for LDPlayer instance indexes.
@@ -404,6 +470,47 @@ unsafe extern "system" {
     fn GetACP() -> u32;
 }
 
+/// Injectable core of [`LdPlayer::wait_for_instance_visible`].
+///
+/// `list` produces the parsed `list2` rows; clock and sleep are parameters so a
+/// unit test can replay "absent, absent, present" without real time or a fake
+/// `ldconsole.exe`. The loop never launches anything — that decision belongs to
+/// the caller.
+fn wait_for_instance_with<L, N, S>(
+    index: u32,
+    timeout: Duration,
+    now: N,
+    sleep: S,
+    mut list: L,
+) -> WaitOutcome<Instance>
+where
+    L: FnMut() -> Result<Vec<Instance>>,
+    N: Fn() -> std::time::Instant,
+    S: Fn(Duration),
+{
+    let (found, stats) = poll_until(timeout, INSTANCE_POLL_INTERVAL, now, sleep, || {
+        Ok(list()?.into_iter().find(|instance| instance.index == index))
+    });
+    match found {
+        Some(instance) => WaitOutcome::ok(instance, stats.attempts),
+        None => WaitOutcome::failed(
+            DeviceWaitFailure::new(
+                WAIT_INSTANCE_NOT_LISTED,
+                format!(
+                    "LDPlayer 实例不存在: {index}（{timeout:?} 内未出现在 ldconsole list2）{}",
+                    stats
+                        .last_error
+                        .as_deref()
+                        .map(|error| format!("；最后一次读取失败: {error}"))
+                        .unwrap_or_default()
+                ),
+            )
+            .into_error(),
+            stats.attempts,
+        ),
+    }
+}
+
 fn parse_instance(line: &str) -> Option<Instance> {
     let fields: Vec<_> = line.split(',').map(str::trim).collect();
     if fields.len() < 7 {
@@ -566,5 +673,112 @@ OtherPath          REG_SZ    C:\Other
             // mojibake rather than being guessed as CP936.
             assert!(!decode_console_output(CP936).is_empty());
         }
+    }
+
+    // ===== staged instance-readiness waits =====
+
+    struct FakeClock {
+        base: std::time::Instant,
+        elapsed: std::cell::Cell<Duration>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                base: std::time::Instant::now(),
+                elapsed: std::cell::Cell::new(Duration::ZERO),
+            }
+        }
+        fn now(&self) -> std::time::Instant {
+            self.base + self.elapsed.get()
+        }
+        fn sleep(&self, duration: Duration) {
+            self.elapsed.set(self.elapsed.get() + duration);
+        }
+    }
+
+    fn instance(index: u32, running: bool) -> Instance {
+        Instance {
+            index,
+            name: format!("实例 {index}"),
+            running,
+            ldplayer_reported_port: None,
+            width: None,
+            height: None,
+            dpi: None,
+        }
+    }
+
+    #[test]
+    fn instance_visibility_wait_returns_the_instance_once_it_appears() {
+        let clock = FakeClock::new();
+        let listings: [&[Instance]; 3] = [&[], &[], &[instance(0, false)]];
+        let mut round = 0;
+        let outcome = wait_for_instance_with(
+            0,
+            Duration::from_secs(30),
+            || clock.now(),
+            |duration| clock.sleep(duration),
+            || {
+                let listing = listings[round.min(listings.len() - 1)];
+                round += 1;
+                Ok(listing.to_vec())
+            },
+        );
+        let found = outcome.value.expect("第三次读取时实例已出现");
+        assert_eq!(found.index, 0);
+        assert!(!found.running, "出现不等于已启动，启动是调用方的决定");
+        assert_eq!(outcome.attempts, 3);
+        // Two 2 s polls before the third read found it.
+        assert_eq!(clock.elapsed.get(), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn instance_visibility_wait_never_launches_and_times_out_as_not_listed() {
+        let clock = FakeClock::new();
+        // The listing closure is the only thing the wait may consult. If it ever
+        // tried to launch, this would need an ldconsole process and fail here.
+        let mut reads = 0;
+        let outcome = wait_for_instance_with(
+            1,
+            Duration::from_secs(5),
+            || clock.now(),
+            |duration| clock.sleep(duration),
+            || {
+                reads += 1;
+                Ok(vec![instance(0, true)])
+            },
+        );
+        let error = outcome.value.expect_err("实例一直不出现必须失败");
+        assert_eq!(
+            crate::domain::device_wait_code(&error),
+            Some(crate::domain::WAIT_INSTANCE_NOT_LISTED)
+        );
+        assert!(reads >= 2, "预算内必须反复重试而不是读一次就放弃");
+        assert_eq!(clock.elapsed.get(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn instance_visibility_wait_treats_a_failing_list2_as_not_ready_yet() {
+        // LDPlayer's console can be briefly unavailable while it restarts. That
+        // must be retried, and the timeout detail must say the read failed.
+        let clock = FakeClock::new();
+        let outcome = wait_for_instance_with(
+            0,
+            Duration::from_secs(4),
+            || clock.now(),
+            |duration| clock.sleep(duration),
+            || Err(anyhow::anyhow!("ldconsole list2 读取失败")),
+        );
+        let error = outcome.value.expect_err("控制台始终不可用时不能报告成功");
+        assert_eq!(
+            crate::domain::device_wait_code(&error),
+            Some(crate::domain::WAIT_INSTANCE_NOT_LISTED)
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("最后一次读取失败"),
+            "必须区分'实例不存在'与'工具不可用': {text}"
+        );
     }
 }

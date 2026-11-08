@@ -33,6 +33,12 @@ locating_poll_seconds = 2
 location_timeout_seconds = 120
 success_timeout_seconds = 60
 startup_timeout_seconds = 30
+# Seconds to wait for a powered-off instance to appear in `ldconsole list2`,
+# clamped to 5-120. Only used when the run is allowed to launch instances.
+instance_appear_timeout_seconds = 30
+# Seconds to wait for the guest Android to finish booting after ADB connects,
+# clamped to 30-600. LDPlayer 冷启动加系统引导在低配机上常见 60-120 秒。
+boot_timeout_seconds = 180
 stable_frames = 2
 unknown_retries = 3
 # Field work ("外勤签到") uses a different live control. It stays disabled by
@@ -139,6 +145,18 @@ pub struct RuntimeConfig {
     pub success_timeout_seconds: u64,
     #[serde(default = "default_startup_timeout")]
     pub startup_timeout_seconds: u64,
+    /// How long to wait for `ldconsole list2` to report the target instance
+    /// when the run is allowed to launch it. A fully powered-off instance can
+    /// be missing from that list entirely, so "not listed yet" is a wait
+    /// condition, not an immediate failure. Clamped to 5-120 where it is used.
+    #[serde(default = "default_instance_appear_timeout")]
+    pub instance_appear_timeout_seconds: u64,
+    /// How long to wait for the guest Android to finish booting after ADB has
+    /// connected (`sys.boot_completed`, boot animation stopped, `wm size`
+    /// parseable). An LDPlayer cold start plus Android boot commonly takes
+    /// 60-120 s on a slow host. Clamped to 30-600 where it is used.
+    #[serde(default = "default_boot_timeout")]
+    pub boot_timeout_seconds: u64,
     #[serde(default = "default_stable_frames")]
     pub stable_frames: u32,
     #[serde(default = "default_unknown_retries")]
@@ -196,6 +214,12 @@ fn default_success_timeout() -> u64 {
 fn default_startup_timeout() -> u64 {
     30
 }
+fn default_instance_appear_timeout() -> u64 {
+    30
+}
+fn default_boot_timeout() -> u64 {
+    180
+}
 fn default_stable_frames() -> u32 {
     2
 }
@@ -225,6 +249,8 @@ impl Config {
         if self.runtime.locating_poll_seconds == 0
             || self.runtime.location_timeout_seconds == 0
             || self.runtime.startup_timeout_seconds == 0
+            || self.runtime.instance_appear_timeout_seconds == 0
+            || self.runtime.boot_timeout_seconds == 0
             || self.runtime.stable_frames == 0
         {
             anyhow::bail!("runtime 的轮询/超时/stable_frames 必须大于 0");
@@ -972,10 +998,53 @@ mod tests {
         assert!(!legacy.accept_login_terms);
         assert!(legacy.auto_login_account.is_empty());
         assert_eq!(legacy.auto_login_timeout_seconds, 30);
+        // New device-readiness keys: a config written before they existed must
+        // still parse, and must get the documented defaults rather than 0 (which
+        // `validate` rejects).
+        assert_eq!(config.runtime.instance_appear_timeout_seconds, 30);
+        assert_eq!(config.runtime.boot_timeout_seconds, 180);
+        assert_eq!(legacy.instance_appear_timeout_seconds, 30);
+        assert_eq!(legacy.boot_timeout_seconds, 180);
         assert_eq!(config.window.start, "21:00");
         assert_eq!(config.window.end, "23:59");
         assert_eq!(config.window.timezone, "Asia/Shanghai");
         assert_eq!(config.app.package_name, "cn.edu.fzu.fdxypa");
+    }
+
+    #[test]
+    fn zero_device_readiness_timeouts_are_rejected_so_waits_cannot_vanish() {
+        // A 0 here would make the stage budgets instantly expire, which reads as
+        // "the device was ready" or as an unexplained instant timeout. Validation
+        // must reject it instead of clamping silently.
+        let mut config = Config::default();
+        config.runtime.boot_timeout_seconds = 0;
+        assert!(
+            config.validate().is_err(),
+            "boot_timeout_seconds = 0 必须被拒绝"
+        );
+
+        let mut config = Config::default();
+        config.runtime.instance_appear_timeout_seconds = 0;
+        assert!(
+            config.validate().is_err(),
+            "instance_appear_timeout_seconds = 0 必须被拒绝"
+        );
+
+        // The defaults themselves must pass, or first run could not save them.
+        Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn device_readiness_timeouts_round_trip_through_toml() {
+        let config = Config::default();
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.runtime.boot_timeout_seconds, 180);
+        assert_eq!(parsed.runtime.instance_appear_timeout_seconds, 30);
+        // The embedded template must contain the keys too: it is the source of
+        // `Config::default()`, and a typo there panics at startup.
+        assert!(DEFAULT_CONFIG.contains("boot_timeout_seconds = 180"));
+        assert!(DEFAULT_CONFIG.contains("instance_appear_timeout_seconds = 30"));
     }
 
     #[test]

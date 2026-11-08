@@ -307,6 +307,100 @@ pub enum ExitCode {
     Timeout = 5,
 }
 
+/// Stable codes for the staged device-readiness waits. Each stage can run out
+/// of its own budget, and "the instance never appeared", "the VM never came up",
+/// "ADB never registered" and "Android never finished booting" need different
+/// operator actions, so they must not collapse into `device_setup_failed`.
+pub const WAIT_INSTANCE_NOT_LISTED: &str = "instance_not_listed";
+pub const WAIT_INSTANCE_NOT_RUNNING: &str = "instance_not_running";
+pub const WAIT_INSTANCE_LAUNCH_TIMEOUT: &str = "instance_launch_timeout";
+pub const WAIT_ADB_CONNECT_TIMEOUT: &str = "adb_connect_timeout";
+pub const WAIT_BOOT_TIMEOUT: &str = "boot_timeout";
+
+/// A device-readiness failure, carried as a typed `anyhow` error so the run
+/// layer can recover the stage-specific code and choose its own exit code.
+///
+/// A bare `bail!("...")` cannot be classified: `propagated_failure` keys off
+/// `error_stage`, and every error raised during device setup shares the
+/// `device_setup` stage, so all of them would exit 2 as
+/// `device_setup_failed`. `device_setup_failed` stays reserved for unexpected
+/// I/O (a broken `ldconsole`/`adb` invocation, for example).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceWaitFailure {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+impl DeviceWaitFailure {
+    pub fn new(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn into_error(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
+}
+
+impl std::fmt::Display for DeviceWaitFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for DeviceWaitFailure {}
+
+/// The device-readiness code carried by `error`, if it is one.
+///
+/// `anyhow` downcasting searches the context chain, so adding context to the
+/// message does not hide the classification.
+pub fn device_wait_code(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .downcast_ref::<DeviceWaitFailure>()
+        .map(|failure| failure.code)
+}
+
+/// Exit code for a staged device-readiness failure.
+///
+/// The waits are timeouts by nature and stay distinct from
+/// `device_setup_failed` (exit 2), which now means "the console or ADB tool
+/// itself misbehaved" rather than "the device was slow".
+/// `instance_not_running` is the exception: nothing was waited for, the operator
+/// chose not to allow a launch, so it is a plain device failure.
+pub fn device_wait_exit_code(code: &str) -> ExitCode {
+    match code {
+        WAIT_INSTANCE_NOT_LISTED
+        | WAIT_INSTANCE_LAUNCH_TIMEOUT
+        | WAIT_ADB_CONNECT_TIMEOUT
+        | WAIT_BOOT_TIMEOUT => ExitCode::Timeout,
+        _ => ExitCode::DeviceFailure,
+    }
+}
+
+/// Operator-facing recovery advice for a staged device-readiness failure.
+pub fn device_wait_recovery(code: &str) -> &'static str {
+    match code {
+        WAIT_INSTANCE_NOT_LISTED => {
+            "实例 index 不存在或实例已完全退出；请在 LDPlayer 中确认实例名，或先手动启动一次。未执行任何点击。"
+        }
+        WAIT_INSTANCE_NOT_RUNNING => {
+            "实例当前未运行，且本命令不会自动启动实例；请先手动启动 LDPlayer 实例后重试。未执行任何点击。"
+        }
+        WAIT_INSTANCE_LAUNCH_TIMEOUT => {
+            "实例启动超时；请手动启动 LDPlayer 实例后重试。未执行任何点击。"
+        }
+        WAIT_ADB_CONNECT_TIMEOUT => {
+            "ADB 未就绪；请确认模拟器已启动并允许 ADB 调试。未执行任何点击。"
+        }
+        WAIT_BOOT_TIMEOUT => {
+            "Android 系统未在预算内完成引导；请手动启动实例并等待桌面出现后重试。未执行任何点击。"
+        }
+        _ => "设备未就绪；请检查模拟器状态后重试。未执行任何点击。",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
     #[serde(default)]
@@ -410,6 +504,12 @@ pub struct RunResult {
     /// "something is drawn on top of it" are not conflated.
     #[serde(default)]
     pub overlay_package: Option<String>,
+    /// Wall-clock milliseconds spent in device preparation (instance listed →
+    /// launched → ADB connected → Android booted). `None` when preparation never
+    /// completed, so a slow-but-successful start is distinguishable from a
+    /// failure caused by a stage that never finished.
+    #[serde(default)]
+    pub device_ready_ms: Option<u64>,
     #[serde(default)]
     pub app_version: Option<String>,
     #[serde(default)]

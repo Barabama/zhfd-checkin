@@ -36,7 +36,7 @@ git tag --list
 cd rust; cargo test --lib
 ```
 
-当前基线：Cargo `0.3.5`，最新 tag `v0.3.5`，`cargo test --lib` 167 passed。HEAD 可能比 tag 多 docs-only 提交。
+当前基线：Cargo `0.3.5`，最新 tag `v0.3.5`，`cargo test --lib` 199 passed。HEAD 可能比 tag 多 docs-only 提交。
 
 ## 环境
 
@@ -50,7 +50,7 @@ cd rust; cargo test --lib
 cd rust
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib                 # 167 tests
+cargo test --lib                 # 199 tests
 cargo build --release --bins     # 必须 --bins：CLI 与 GUI 一起
 ```
 
@@ -73,6 +73,7 @@ zhfd-checkin.exe run --dry-run --instance-index 0
 | `rust/src/main.rs` | CLI 命令分发、run 编排、状态机、导航、结果、任务、测试（约 5,315 行） |
 | `rust/src/cli.rs` | clap 定义、help 文案与参数约束（CLI 专用，GUI 不依赖 clap） |
 | `rust/src/commands.rs` | clap-free 的 typed request/policy（`RunPolicy`/`RunRequest`/`RunSource` 等），CLI 与 GUI 共用 |
+| `rust/src/wait.rs` | 通用有界轮询（`poll_until` / `WaitOutcome`，时钟与 sleep 可注入） |
 | `rust/src/page.rs` | 通用页面模型：PageView/PageNode/NodeBounds、路由识别、单轮 hierarchy 观测 |
 | `rust/src/foreground.rs` | 前台包观测与 FR-013 检查（自动登录与状态机共享） |
 | `rust/src/auto_login.rs` | 登录页识别、协议复选框、一次一键登录与结果字段（不依赖 Profile 几何） |
@@ -93,6 +94,8 @@ authorize_page_action  domain.rs:187
 authorize_click        domain.rs:533
 run_inner_with_device  main.rs:2158   （高风险大函数）
 locate_or_navigate     main.rs:3172   （高风险大函数）
+stage_device           main.rs       （四阶段设备就绪等待；§ docs/AI_ONBOARDING.md 6.1）
+runtime_with_target_recording main.rs
 observe_page_route     page.rs
 detect_page_route      page.rs
 extract_hierarchy_date main.rs:2079
@@ -107,6 +110,7 @@ extract_hierarchy_date main.rs:2079
 - 一次运行最多一次 tap；点击后只等待成功，不再进入 Ready 分支。
 - 成功必须有目标包作用域的 `签到成功`/`已签到` 文本 + 当天日期；颜色本身不够。
 - 未知页面、证据冲突、overlay、外勤未 opt-in 一律 fail-closed。
+- 设备准备按阶段等待（实例出现 → VM running → adb → 引导），每阶段独立预算与错误码；等待发生在任何点击之前，等待失败时 `clicked=false`（ADR-0006）。`launch=false` 的调用路径不等待实例出现、不代为启动实例。
 - 登录页默认 `login_required`；只有 `allow_auto_login` + `accept_login_terms` + live/confirm 才允许一次一键登录；不输入/保存凭据，一次运行最多一次登录点击。
 - 数据根单一；配置写入原子替换 + 备份；Repair 状态禁止普通 save/migrate。
 - 成功日期只采信目标 package 节点；冲突时返回 unknown。
@@ -118,9 +122,10 @@ extract_hierarchy_date main.rs:2079
 - 显式 `--config` 指向不存在的文件会创建默认配置。
 - 便携配置存在但损坏时不会回退，必须走 GUI Repair。
 - 迁移仅 GUI 入口；库函数 `migrate_to_root` 不写指针。
-- `location_timeout_seconds` 被钳制到 1–120 秒。
+- `location_timeout_seconds` 被钳制到 1–120 秒；`instance_appear_timeout_seconds` 钳制 5–120 秒，`boot_timeout_seconds` 钳制 30–600 秒（上限在使用处钳制，`0` 由校验拒绝）。
 - `stable_frames = 0` 会被配置校验拒绝；即使绕过，`authorize_click` 也拒绝 0 帧。
 - 自动登录相关：`allow_auto_login`、`accept_login_terms` 默认均为 false；`auto_login_account` 为可选期望账号（本机配置，禁止提交）；`auto_login_timeout_seconds` 使用时钳制 5–120 秒。
+- 设备就绪相关：`emulator.auto_launch`（默认 true）决定 `run`/`login` 能否启动实例；`startup_timeout_seconds` 语义不变（启动命令→VM running、adb connect 重试）；`instance_appear_timeout_seconds`（默认 30）与 `boot_timeout_seconds`（默认 180）是新键，见 ADR-0006。
 
 ## 文档规则
 

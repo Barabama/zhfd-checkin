@@ -2,6 +2,14 @@
 
 Windows 便携式「智汇福大晚点名签到」辅助工具。Rust CLI + GUI，通过 ADB 控制 LDPlayer；默认 dry-run，live 点击必须在用户显式授权后通过全部门禁。
 
+![功能演示：环境检查 → 导航到签到页 → 定位等待 → 确认签到状态](docs/assets/zhfd-checkin.gif)
+
+## 它做什么
+
+- **dry-run（默认）**：启动 App、导航到晚点名签到页、读取页面与定位状态，**不点击**签到按钮。
+- **live**：需显式 `--live --confirm`，且同时通过 route / mode / 目标 App 前台 / 时间窗口 / 校准 Profile / 连续 Ready / 点击前复核，一次运行最多点击一次。
+- **设备准备**：按阶段等待「实例出现 → VM running → ADB 就绪 → Android 引导完成」，每阶段独立预算与错误码，等待失败时必定 `clicked=false`。
+
 ## 文档入口
 
 | 文档 | 内容 |

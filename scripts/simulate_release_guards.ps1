@@ -8,19 +8,30 @@ param(
 # Offline smoke test for the release gates in .github/workflows/release.yml.
 #
 # The point of this script is that it exercises the guards that actually ship:
-# it extracts the `run:` block of the two guard steps straight out of the
-# workflow file rather than re-implementing the checks, so editing a guard
-# changes what is tested here automatically.
+# it extracts the `run:` block of each guard step straight out of the workflow
+# file rather than re-implementing the checks, so editing a guard changes what
+# is tested here automatically. Three guards are covered:
+#
+#   1. "Verify the release ref is a tag bound to the Cargo version"  (pre-build)
+#   2. "Verify the packaged asset matches the tag"                   (post-package)
+#   3. "Re-verify the tag and any existing Release before publishing" (pre-publish)
 #
 # Everything runs in a synthetic world built under $WorkRoot - a bare "origin"
 # repository, a seed repo and one scratch clone per scenario. The scenarios
 # never push, tag or publish, and they never write to this repository.
 #
+# The pre-publish guard asks the GitHub API whether a Release already exists.
+# Reaching the real API would need a token and network, so the scenarios put a
+# compiled stand-in (scripts/GhStub.cs, built with csc.exe) on PATH as `gh` and
+# feed it the answer each scenario wants. A .cmd shim was tried first and
+# rejected: cmd.exe runs AutoRun hooks (a conda hook on the author's machine),
+# and their output lands in the captured stdout and corrupts the JSON.
+#
 # What it DOES touch in the real repository: it reads `rust/Cargo.toml` for the
 # version, so the synthetic fixture is built with the version the guards will
 # accept, and it reads `release.yml` for the guard source. Both are reads.
 #
-# -CheckRealTag additionally runs the release guard against this checkout when
+# -CheckRealTag additionally runs the first guard against this checkout when
 # HEAD is exactly the released tag (the state a tag push produces). That case
 # runs the guard's `git fetch` against the real `origin`, which writes
 # `refs/remotes/origin/<default>` and `FETCH_HEAD` into the real `.git`. It is
@@ -31,6 +42,7 @@ param(
 #   .\scripts\simulate_release_guards.ps1 -KeepScratch
 #   .\scripts\simulate_release_guards.ps1 -CheckRealTag
 #
+# Requires Windows PowerShell 7 (`pwsh`) and csc.exe from .NET Framework 4.x.
 # Exit code 0 = every scenario behaved as expected, 1 = at least one mismatch.
 
 $ErrorActionPreference = "Stop"
@@ -95,10 +107,12 @@ $guardScript = Join-Path $WorkRoot "release_guard.ps1"
 Set-Content -LiteralPath $guardScript -Encoding utf8 -Value (Get-StepScript $workflowPath "Verify the release ref is a tag bound to the Cargo version")
 $assetGuardScript = Join-Path $WorkRoot "asset_guard.ps1"
 Set-Content -LiteralPath $assetGuardScript -Encoding utf8 -Value (Get-StepScript $workflowPath "Verify the packaged asset matches the tag")
+$prepublishGuardScript = Join-Path $WorkRoot "prepublish_guard.ps1"
+Set-Content -LiteralPath $prepublishGuardScript -Encoding utf8 -Value (Get-StepScript $workflowPath "Re-verify the tag and any existing Release before publishing")
 
 # The guards are PowerShell: a syntax error should be reported as such rather
 # than as a mysterious scenario failure.
-foreach ($script in @($guardScript, $assetGuardScript)) {
+foreach ($script in @($guardScript, $assetGuardScript, $prepublishGuardScript)) {
     $tokens = $null; $errors = $null
     $null = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
     if ($errors -and $errors.Count -gt 0) {
@@ -262,6 +276,142 @@ Assert "asset guard: single zip, wrong commit in the name" (Invoke-AssetGuard @(
 Assert "asset guard: two zips (stale artifact left behind)" (Invoke-AssetGuard @($goodName, $wrongVersionName)) $false "asset_guard=PASS"
 Assert "asset guard: no zip at all" (Invoke-AssetGuard @()) $false "asset_guard=PASS"
 Assert "asset guard: dist directory missing" (Invoke-AssetGuard $null) $false "asset_guard=PASS"
+
+# --- pre-publish guard ------------------------------------------------------
+# This guard reads the remote tag and asks the GitHub API about an existing
+# Release, so its scenarios need (a) an `origin` they control per scenario and
+# (b) a stand-in for `gh`. Each scenario therefore gets its own bare origin, and
+# a compiled stub answers the API call from a JSON file.
+$ghBin = Join-Path $WorkRoot "ghbin"
+$stubSource = Join-Path $PSScriptRoot "GhStub.cs"
+if (-not (Test-Path -LiteralPath $stubSource)) {
+    throw "gh stub source not found: $stubSource"
+}
+New-Item -ItemType Directory -Path $ghBin -Force | Out-Null
+$csc = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if (-not (Test-Path -LiteralPath $csc)) { throw "csc.exe not found at $csc" }
+& $csc /nologo /target:exe "/out:$(Join-Path $ghBin 'gh.exe')" $stubSource | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Failed to compile the gh stub from $stubSource." }
+
+function New-PublishScenario {
+    param([string]$Name)
+    $root = Join-Path $WorkRoot $Name
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    $scenarioOrigin = Join-Path $root "origin.git"
+    $seedRepo = Join-Path $root "seed"
+    & git init --quiet --bare $scenarioOrigin
+    & git init --quiet --initial-branch=$DEFAULT_BRANCH $seedRepo
+    New-Item -ItemType Directory -Path (Join-Path $seedRepo "rust\src") -Force | Out-Null
+    @"
+[package]
+name = "zhfd-checkin"
+version = "$TEST_VERSION"
+edition = "2024"
+
+[[bin]]
+name = "zhfd-checkin"
+path = "src/main.rs"
+"@ | Set-Content -LiteralPath (Join-Path $seedRepo "rust\Cargo.toml") -Encoding utf8
+    Set-Content -LiteralPath (Join-Path $seedRepo "rust\src\main.rs") -Encoding utf8 -Value "fn main() {}"
+    & git -C $seedRepo @GIT_IDENTITY add -A
+    & git -C $seedRepo @GIT_IDENTITY commit --quiet -m "synthetic release fixture"
+    & git -C $seedRepo remote add origin $scenarioOrigin
+    & git -C $seedRepo push --quiet origin $DEFAULT_BRANCH
+    & git -C $scenarioOrigin symbolic-ref HEAD "refs/heads/$DEFAULT_BRANCH"
+    $clone = Join-Path $root "clone"
+    & git clone --quiet $scenarioOrigin $clone
+    & git -C $clone checkout --quiet $DEFAULT_BRANCH
+    if ($LASTEXITCODE -ne 0) { throw "clone/checkout failed for $Name" }
+    return [pscustomobject]@{ Root = $root; Clone = $clone }
+}
+
+function Set-GhAnswer {
+    param([pscustomobject]$Scenario, [int]$ExitCode, [string]$Stdout = "", [string]$Stderr = "")
+    $spec = [ordered]@{ exit_code = $ExitCode; stdout = $Stdout; stderr = $Stderr }
+    $spec | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $Scenario.Root "gh-spec.json") -Encoding utf8
+}
+
+function Invoke-PrepublishGuard {
+    param([pscustomobject]$Scenario)
+    $savedPath = $env:PATH
+    Push-Location $Scenario.Clone
+    try {
+        $env:PATH = "$ghBin;$savedPath"
+        $env:GH_STUB_SPEC = Join-Path $Scenario.Root "gh-spec.json"
+        $env:GH_TOKEN = "stub-token"
+        $env:REPOSITORY = "owner/repo"
+        $env:GITHUB_REF_NAME = $TEST_TAG
+        $text = (& pwsh -NoProfile -File $prepublishGuardScript 2>&1 | Out-String)
+        if ($null -eq $text) { $text = "" }
+        return $text
+    } finally {
+        Pop-Location
+        $env:PATH = $savedPath
+        Remove-Item Env:GH_STUB_SPEC, Env:GH_TOKEN, Env:REPOSITORY, Env:GITHUB_REF_NAME -ErrorAction SilentlyContinue
+    }
+}
+
+function New-ReleaseJson {
+    param([string[]]$AssetNames)
+    $assets = @($AssetNames | ForEach-Object { [ordered]@{ name = $_ } })
+    [ordered]@{ tag_name = $TEST_TAG; assets = $assets } | ConvertTo-Json -Depth 5 -Compress
+}
+
+function Get-ScenarioAssetName {
+    param([pscustomobject]$Scenario)
+    $short = (& git -C $Scenario.Clone rev-parse --short=12 HEAD | Out-String).Trim()
+    "zhfd-checkin-windows-x64-$TEST_TAG-$short.zip"
+}
+
+function Add-ScenarioTag {
+    param([pscustomobject]$Scenario)
+    & git -C $Scenario.Clone tag $TEST_TAG
+    & git -C $Scenario.Clone push --quiet origin "refs/tags/$TEST_TAG"
+}
+
+$s = New-PublishScenario "p1-no-release"
+Add-ScenarioTag $s
+Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Not Found (HTTP 404)"
+Assert "pre-publish: tag unchanged, no existing Release" (Invoke-PrepublishGuard $s) $true "prepublish_guard=PASS"
+
+$s = New-PublishScenario "p2-same-asset"
+Add-ScenarioTag $s
+Set-GhAnswer $s -ExitCode 0 -Stdout (New-ReleaseJson @((Get-ScenarioAssetName $s)))
+Assert "pre-publish: existing Release carries this commit's asset" (Invoke-PrepublishGuard $s) $true "prepublish_guard=PASS"
+
+$s = New-PublishScenario "p3-foreign-asset"
+Add-ScenarioTag $s
+Set-GhAnswer $s -ExitCode 0 -Stdout (New-ReleaseJson @("zhfd-checkin-windows-x64-$TEST_TAG-000000000000.zip"))
+Assert "pre-publish: existing Release carries another commit's asset" (Invoke-PrepublishGuard $s) $false "prepublish_guard=PASS"
+
+$s = New-PublishScenario "p4-tag-moved"
+Add-ScenarioTag $s
+& git -C $s.Clone @GIT_IDENTITY commit --quiet --allow-empty -m "moved"
+& git -C $s.Clone push --quiet --force origin "refs/tags/$TEST_TAG"
+Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Not Found (HTTP 404)"
+Assert "pre-publish: remote tag moved to a newer commit" (Invoke-PrepublishGuard $s) $false "prepublish_guard=PASS"
+
+$s = New-PublishScenario "p5-tag-gone"
+Add-ScenarioTag $s
+& git -C $s.Clone push --quiet origin ":refs/tags/$TEST_TAG"
+Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Not Found (HTTP 404)"
+Assert "pre-publish: remote tag no longer exists" (Invoke-PrepublishGuard $s) $false "prepublish_guard=PASS"
+
+$s = New-PublishScenario "p6-gh-error"
+Add-ScenarioTag $s
+Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Bad credentials (HTTP 401)"
+Assert "pre-publish: cannot tell whether a Release exists" (Invoke-PrepublishGuard $s) $false "prepublish_guard=PASS"
+
+$s = New-PublishScenario "p7-annotated"
+& git -C $s.Clone @GIT_IDENTITY tag -a $TEST_TAG -m "annotated tag"
+& git -C $s.Clone push --quiet origin "refs/tags/$TEST_TAG"
+Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Not Found (HTTP 404)"
+Assert "pre-publish: annotated tag resolves to the same commit" (Invoke-PrepublishGuard $s) $true "prepublish_guard=PASS"
+
+$s = New-PublishScenario "p8-empty-release"
+Add-ScenarioTag $s
+Set-GhAnswer $s -ExitCode 0 -Stdout (New-ReleaseJson @())
+Assert "pre-publish: existing Release has no assets yet" (Invoke-PrepublishGuard $s) $true "prepublish_guard=PASS"
 
 # --- the real repository (opt-in: -CheckRealTag) -----------------------------
 # The scenarios above are synthetic, so they prove the guard's logic but not that

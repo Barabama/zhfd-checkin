@@ -335,6 +335,21 @@ fn event_summary(kind: &str, data: &serde_json::Value) -> String {
             field("elapsed_seconds"),
             field("limit_seconds")
         ),
+        // Device-readiness stages. A scheduled-task failure is often diagnosable
+        // from these two lines alone, so they must not fall through to raw JSON.
+        "wait_started" => format!(
+            "stage={} budget={}ms clicked=false",
+            field("stage"),
+            field("budget_ms")
+        ),
+        "wait_finished" => format!(
+            "stage={} ok={} elapsed={}ms attempts={} detail={} clicked=false",
+            field("stage"),
+            field("ok"),
+            field("elapsed_ms"),
+            field("attempts"),
+            field("detail")
+        ),
         "blocked" => format!("blocked_by={}", field("blocked_by")),
         "foreign_window" => format!(
             "#{} stage={} package={} nodes={} focus={}",
@@ -742,6 +757,7 @@ mod tests {
             foreground_package: None,
             hierarchy_status: None,
             overlay_package: None,
+            device_ready_ms: None,
             app_version: Some("0.3.0".into()),
             git_commit: Some("test".into()),
             git_dirty: Some(false),
@@ -817,6 +833,7 @@ mod tests {
             foreground_package: None,
             hierarchy_status: None,
             overlay_package: None,
+            device_ready_ms: None,
             app_version: None,
             git_commit: None,
             git_dirty: None,
@@ -886,6 +903,7 @@ mod tests {
             foreground_package: None,
             hierarchy_status: None,
             overlay_package: None,
+            device_ready_ms: None,
             app_version: None,
             git_commit: None,
             git_dirty: None,

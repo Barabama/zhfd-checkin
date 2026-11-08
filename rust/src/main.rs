@@ -14,6 +14,7 @@ mod page;
 mod process;
 mod profile;
 mod vision;
+mod wait;
 
 use anyhow::{Context, Result, bail};
 use cli::{
@@ -41,6 +42,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use wait::WaitOutcome;
 
 const LDPLAYER_URL: &str = "https://www.ldmnq.com/";
 const ZHFD_URL: &str = "https://app.fzu.edu.cn/fd-app/m/index.html";
@@ -155,7 +157,45 @@ fn load_store_for_cli(config_path: Option<&Path>) -> Result<ConfigStore> {
 /// config/unknown code.
 fn reported_device_failure(error: anyhow::Error) -> ExitCode {
     eprintln!("错误: {error:#}");
+    // A staged readiness failure is a timeout, not a generic device failure:
+    // the operator needs to tell "the emulator was slow to boot" apart from
+    // "adbd/ldconsole could not be invoked at all".
+    match domain::device_wait_code(&error) {
+        Some(code) => domain::device_wait_exit_code(code),
+        None => ExitCode::DeviceFailure,
+    }
+}
+
+/// Record a staged device-readiness failure on the result and return its exit
+/// code, or `None` when `error` is an unrelated I/O failure.
+///
+/// The code travels on the error itself (`DeviceWaitFailure`) instead of being
+/// re-derived from `error_stage`, because every device-setup error shares that
+/// stage and would otherwise collapse into `device_setup_failed` with exit 2.
+fn record_device_setup_failure(result: &mut RunResult, error: &anyhow::Error) -> ExitCode {
+    if let Some(code) = record_device_wait_failure(result, error) {
+        return code;
+    }
+    // Unclassified device-setup failure: still gets a stable machine code, so a
+    // result can never look successful merely because no specific code applied.
+    let (code_label, recovery) = propagated_failure("device_setup");
+    set_run_failure(result, code_label, "device_setup", recovery);
+    result.error = Some(format!("{error:#}"));
+    eprintln!("运行失败: {error:#}");
     ExitCode::DeviceFailure
+}
+
+fn record_device_wait_failure(result: &mut RunResult, error: &anyhow::Error) -> Option<ExitCode> {
+    let code = domain::device_wait_code(error)?;
+    set_run_failure(
+        result,
+        code,
+        "device_setup",
+        domain::device_wait_recovery(code),
+    );
+    result.error = Some(format!("{error:#}"));
+    eprintln!("运行失败: {error:#}");
+    Some(domain::device_wait_exit_code(code))
 }
 
 /// Best-effort display path for a config that failed to load: the explicit
@@ -179,32 +219,52 @@ struct ResolvedInstance {
     serial: String,
 }
 
-fn resolve_instance_target(
-    ld: &ldplayer::LdPlayer,
+/// Resolve the caller's selector to a concrete instance identity.
+///
+/// Presence is checked separately ([`resolve_instance_target`] for read-only
+/// callers, [`readiness_gate`] for the run path) because a fully
+/// powered-off LDPlayer instance can be missing from `ldconsole list2`, and the
+/// right reaction differs by caller: the run path may wait for it and launch it,
+/// while read-only paths must fail at once rather than block for a minute.
+/// Folding presence into this function is what previously made `auto_launch`
+/// unreachable for exactly the case it exists for.
+///
+/// `instances` is a caller-supplied snapshot so one `list2` read can serve both
+/// the intent and the presence check.
+fn resolve_instance_intent(
+    instances: &[ldplayer::Instance],
     store: &ConfigStore,
     target: Option<&InstanceTargetArgs>,
 ) -> Result<ResolvedInstance> {
     let target = target.cloned().unwrap_or_default();
-    let instances = ld.instances()?;
-    if instances.is_empty() {
-        bail!("LDPlayer 没有可用实例");
-    }
     let configured_instances = store.config.emulator.effective_instances();
     let requested_serial = target.serial.filter(|value| !value.trim().is_empty());
 
     let index_from_serial = requested_serial.as_deref().and_then(|serial| {
-        instances.iter().find_map(|instance| {
-            let default_serial = ldplayer::LdPlayer::tcp_serial_for_index(instance.index)?;
-            let configured_match = configured_instances.iter().any(|configured| {
-                configured.instance_index == instance.index && configured.serial.trim() == serial
-            });
-            (default_serial == serial || configured_match).then_some(instance.index)
-        })
+        instances
+            .iter()
+            .find_map(|instance| {
+                let default_serial = ldplayer::LdPlayer::tcp_serial_for_index(instance.index)?;
+                let configured_match = configured_instances.iter().any(|configured| {
+                    configured.instance_index == instance.index
+                        && configured.serial.trim() == serial
+                });
+                (default_serial == serial || configured_match).then_some(instance.index)
+            })
+            .or_else(|| {
+                // The instance may not be listed yet (powered off). A serial that
+                // equals the index-derived TCP serial still names its instance,
+                // which is what lets a launch-enabled run wait for it.
+                configured_instances
+                    .iter()
+                    .find(|configured| configured.serial.trim() == serial)
+                    .map(|configured| configured.instance_index)
+            })
     });
 
     if requested_serial.is_some() && index_from_serial.is_none() {
         bail!(
-            "ADB serial 未匹配到已发现的 LDPlayer 实例: {}",
+            "ADB serial 未匹配到 LDPlayer 实例（ldconsole list2 与配置均无匹配）: {}",
             requested_serial.as_deref().unwrap()
         );
     }
@@ -223,10 +283,6 @@ fn resolve_instance_target(
         .instance_index
         .or(index_from_serial)
         .unwrap_or(store.config.emulator.instance_index);
-    let instance = instances
-        .iter()
-        .find(|instance| instance.index == index)
-        .with_context(|| format!("LDPlayer 实例不存在: {}", index))?;
     let configured_instance = configured_instances
         .into_iter()
         .find(|configured| configured.instance_index == index);
@@ -244,16 +300,51 @@ fn resolve_instance_target(
         })
         .or(ldplayer::LdPlayer::tcp_serial_for_index(index))
         .with_context(|| format!("LDPlayer 实例 index 超出 TCP ADB 端口范围: {index}"))?;
+    // Precedence is unchanged: an operator-supplied instance name wins over the
+    // vendor's, and only an unlisted instance falls back to the index.
     let name = configured_instance
         .as_ref()
         .filter(|configured| !configured.name.trim().is_empty())
         .map(|configured| configured.name.clone())
-        .unwrap_or_else(|| instance.name.clone());
+        .or_else(|| {
+            instances
+                .iter()
+                .find(|instance| instance.index == index)
+                .map(|instance| instance.name.clone())
+        })
+        .unwrap_or_else(|| format!("实例 {index}"));
     Ok(ResolvedInstance {
         index,
         name,
         serial,
     })
+}
+
+/// Resolve the selector *and* require the instance to be present in `list2`.
+///
+/// Used by the callers that genuinely need a listed instance up front (profile
+/// sync, diagnostics). The run path uses [`resolve_instance_intent`] plus an
+/// explicit wait so that "not listed yet" is a retry, not a dead end.
+fn resolve_instance_target(
+    ld: &ldplayer::LdPlayer,
+    store: &ConfigStore,
+    target: Option<&InstanceTargetArgs>,
+) -> Result<ResolvedInstance> {
+    let instances = ld.instances()?;
+    // "nothing is listed at all" and "that index is missing" have different
+    // recovery actions (create/start an instance vs. correct the index), so they
+    // must not collapse into the same message.
+    if instances.is_empty() {
+        bail!("ldconsole list2 未发现任何实例（LDPlayer 可能未创建实例，或实例已完全退出）");
+    }
+    let resolved = resolve_instance_intent(&instances, store, target)?;
+    if !instances
+        .iter()
+        .any(|instance| instance.index == resolved.index)
+    {
+        bail!("LDPlayer 实例不存在: {}", resolved.index);
+    }
+    Ok(resolved)
 }
 
 /// Validate a user-entered dependency selection before it is persisted.
@@ -741,7 +832,8 @@ fn sync_profile_inner(
             ld.launch_wait(
                 index,
                 Duration::from_secs(store.config.runtime.startup_timeout_seconds),
-            )?;
+            )
+            .value?;
             record.restarted = true;
             sync_log.event("restarted", serde_json::json!({"index": index}))?;
         }
@@ -852,7 +944,7 @@ impl SyncLifecycle for ldplayer::LdPlayer {
     }
 
     fn launch_wait(&self, index: u32, timeout: Duration) -> Result<()> {
-        ldplayer::LdPlayer::launch_wait(self, index, timeout)
+        ldplayer::LdPlayer::launch_wait(self, index, timeout).value
     }
 }
 
@@ -1244,6 +1336,7 @@ fn new_run_result(mode: Mode, log: &RunLog, target: &InstanceTargetArgs) -> RunR
         foreground_package: None,
         hierarchy_status: None,
         overlay_package: None,
+        device_ready_ms: None,
         app_version: Some(VERSION.into()),
         git_commit: Some(GIT_COMMIT.into()),
         git_dirty: git_dirty(),
@@ -1375,9 +1468,13 @@ fn run_single(store: &ConfigStore, policy: &RunPolicy) -> Result<(ExitCode, RunR
     let code = match execution {
         Ok(code) => code,
         Err(error) => {
-            // Propagated I/O errors still converge through the single failure
-            // entry, keeping the most specific stage already recorded and
-            // deriving a stable machine code from it.
+            // A classified readiness failure keeps its own machine code and exit
+            // code; everything else converges through the single failure entry,
+            // keeping the most specific stage already recorded.
+            if let Some(code) = record_device_wait_failure(&mut result, &error) {
+                finalize_run(&log, &mut result)?;
+                return Ok((code, result));
+            }
             let stage = result
                 .error_stage
                 .clone()
@@ -1607,6 +1704,20 @@ fn blocked_instance_result(
     result
 }
 
+/// Whether an empty `ldconsole list2` is a shared-dependency failure.
+///
+/// It is not, when this build may launch instances: a fully powered-off
+/// LDPlayer reports nothing here at all, and each planned instance then gets its
+/// own `instance_not_listed` from the per-instance stage instead of the whole
+/// batch being blocked by a dependency that is actually present. Treating it as
+/// fatal is what previously blocked `--all-instances` on a cold machine.
+///
+/// With `auto_launch = false` nothing can bring an instance up, so D-05 still
+/// applies: the batch is blocked and every instance gets a blocked result.
+fn empty_listing_blocks_batch(auto_launch: bool) -> bool {
+    !auto_launch
+}
+
 /// Dependencies shared by every planned instance. A failure here is not a
 /// per-device fault and must not be reported as N independent device errors.
 fn shared_preflight(store: &ConfigStore) -> Result<()> {
@@ -1615,8 +1726,8 @@ fn shared_preflight(store: &ConfigStore) -> Result<()> {
         &store.root,
     )?;
     let instances = ld.instances()?;
-    if instances.is_empty() {
-        bail!("ldconsole list2 未发现任何实例");
+    if instances.is_empty() && empty_listing_blocks_batch(store.config.emulator.auto_launch) {
+        bail!("ldconsole list2 未发现任何实例，且 emulator.auto_launch = false");
     }
     let adb_path = adb::find_adb_for_ldplayer(
         &store.config.emulator.adb_path,
@@ -1670,6 +1781,10 @@ fn instance_summary_entry(
         "run_id": result.run_id,
         "result_path": result.artifact_paths.first(),
         "exit_code": exit_code,
+        // Per-instance device-preparation cost. Each instance gets its own
+        // budget, so a batch summary shows which instance was slow rather than
+        // one aggregate that hides it.
+        "device_ready_ms": result.device_ready_ms,
     })
 }
 
@@ -1731,9 +1846,16 @@ fn login_inner(
     result.error_stage = Some("device_setup".into());
     let target: InstanceTargetArgs = args.target.clone().into();
     let (_ld, device, info) =
-        match runtime_with_target_recording(store, true, Some(&target), Some(result)) {
+        match runtime_with_target_recording(store, true, Some(&target), Some(result), Some(log)) {
             Ok(value) => value,
-            Err(error) => return Ok(reported_device_failure(error)),
+            Err(error) => {
+                // Every device-setup failure must be recorded on the result.
+                // A login-only run is judged successful by the *absence* of an
+                // `error_code` (see `finalize_run`), so returning an
+                // unclassified error without recording it would report
+                // `status=success` for a device that never became ready.
+                return Ok(record_device_setup_failure(result, &error));
+            }
         };
 
     // Profile detection is informational here: login taps use hierarchy bounds,
@@ -1827,7 +1949,7 @@ fn run_inner(
         log,
         result,
         |store, launch, target, result| {
-            runtime_with_target_recording(store, launch, Some(target), Some(result))
+            runtime_with_target_recording(store, launch, Some(target), Some(result), Some(log))
         },
     )
 }
@@ -2172,11 +2294,26 @@ where
 {
     let mode = policy.mode;
     result.error_stage = Some("device_setup".into());
-    let (ld, device, info) = runtime_provider(store, true, &policy.target, result)?;
+    let (ld, device, info) = match runtime_provider(store, true, &policy.target, result) {
+        Ok(value) => value,
+        Err(error) => {
+            // A staged readiness failure has its own machine code and exit code;
+            // propagate anything else so the caller's generic path handles it.
+            return match record_device_wait_failure(result, &error) {
+                Some(code) => Ok(code),
+                None => Err(error),
+            };
+        }
+    };
     result.serial = device.serial.clone();
-    let selected = resolve_instance_target(&ld, store, Some(&policy.target))?;
-    result.instance_index = Some(selected.index);
-    result.instance_name = Some(selected.name);
+    // The identity was already resolved (and recorded) during device
+    // preparation. Re-listing here could disagree with it — an instance that was
+    // just launched is listed a moment later — and would bail for no reason.
+    if result.instance_index.is_none() || result.instance_name.is_none() {
+        let selected = resolve_instance_target(&ld, store, Some(&policy.target))?;
+        result.instance_index = Some(selected.index);
+        result.instance_name = Some(selected.name);
+    }
 
     result.error_stage = Some("profile_detection".into());
     let profile = match profile::find_profile(info.width, info.height, info.density_dpi) {
@@ -2949,7 +3086,329 @@ pub(crate) fn runtime_with_target(
     launch: bool,
     instance_target: Option<&InstanceTargetArgs>,
 ) -> Result<(ldplayer::LdPlayer, adb::AdbDevice, adb::DeviceInfo)> {
-    runtime_with_target_recording(store, launch, instance_target, None)
+    runtime_with_target_recording(store, launch, instance_target, None, None)
+}
+
+/// A staged wait as seen by `events.jsonl`.
+///
+/// Every wait emits a `wait_started` / `wait_finished` pair so a scheduled-task
+/// failure can be attributed to a stage from the log alone, without the
+/// screenshots or hierarchy that a device that never booted cannot produce.
+struct WaitReporter<'a> {
+    log: Option<&'a RunLog>,
+}
+
+impl<'a> WaitReporter<'a> {
+    fn started(&self, stage: &str, budget: Duration) -> Result<Instant> {
+        if let Some(log) = self.log {
+            log.event(
+                "wait_started",
+                serde_json::json!({"stage": stage, "budget_ms": budget.as_millis() as u64}),
+            )?;
+        }
+        Ok(Instant::now())
+    }
+
+    fn finished(
+        &self,
+        stage: &str,
+        started: Instant,
+        attempts: u32,
+        ok: bool,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        if let Some(log) = self.log {
+            log.event(
+                "wait_finished",
+                serde_json::json!({
+                    "stage": stage,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "attempts": attempts,
+                    "ok": ok,
+                    "detail": detail,
+                    "clicked": false,
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record that the very first `list2` read failed and that the staged wait
+    /// will retry it. A recovered run would otherwise show no trace of the
+    /// console hiccup; a failed one would not say why.
+    fn listing_read_failed(&self, error: &anyhow::Error) -> Result<()> {
+        if let Some(log) = self.log {
+            log.event(
+                "instance_listing_failed",
+                serde_json::json!({"error": format!("{error:#}"), "retry": true}),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Budget for "the instance showed up in `ldconsole list2`".
+fn instance_appear_budget(store: &ConfigStore) -> Duration {
+    const MIN_SECONDS: u64 = 5;
+    const MAX_SECONDS: u64 = 120;
+    Duration::from_secs(
+        store
+            .config
+            .runtime
+            .instance_appear_timeout_seconds
+            .clamp(MIN_SECONDS, MAX_SECONDS),
+    )
+}
+
+/// Budget for "the guest Android finished booting".
+///
+/// The lower bound is deliberately well above the 20 s a warm host needs: too
+/// small a value would turn every cold start into a failure, which is the
+/// behaviour this wait exists to remove.
+fn boot_budget(store: &ConfigStore) -> Duration {
+    const MIN_SECONDS: u64 = 30;
+    const MAX_SECONDS: u64 = 600;
+    Duration::from_secs(
+        store
+            .config
+            .runtime
+            .boot_timeout_seconds
+            .clamp(MIN_SECONDS, MAX_SECONDS),
+    )
+}
+
+/// What device preparation should do next, given what `list2` reported.
+///
+/// Kept as a pure decision so the four combinations (listed/not, running/not,
+/// launch allowed/not) are testable without an emulator: the surrounding
+/// function only performs the side effect this chooses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessGate {
+    /// Listed and running: nothing to start.
+    Proceed,
+    /// Absent from `list2`, but this command may launch instances.
+    WaitForListing,
+    /// Listed but stopped, and this command may launch instances.
+    WaitForLaunch,
+    /// Absent from `list2` and launching is not allowed.
+    NotListed,
+    /// Listed but stopped and launching is not allowed.
+    NotRunning,
+}
+
+fn readiness_gate(instances: &[ldplayer::Instance], index: u32, may_launch: bool) -> ReadinessGate {
+    let listed = instances.iter().find(|instance| instance.index == index);
+    match listed {
+        // A stopped instance is *not* launched by read-only callers: they must
+        // fail fast instead of idling for a VM they will never start.
+        Some(instance) if instance.running => ReadinessGate::Proceed,
+        Some(_) if may_launch => ReadinessGate::WaitForLaunch,
+        Some(_) => ReadinessGate::NotRunning,
+        None if may_launch => ReadinessGate::WaitForListing,
+        None => ReadinessGate::NotListed,
+    }
+}
+
+/// The device operations device preparation needs, as a seam.
+///
+/// The staging order (listed → running → ADB → booted) is what the feature is
+/// about, and it must be testable without an emulator. A trait lets a test
+/// record which stage ran and assert that the ones that must not happen —
+/// tapping, launching when not allowed, probing the app before boot — never do.
+trait ReadinessBackend {
+    type Device;
+
+    fn wait_for_listing(
+        &self,
+        index: u32,
+        timeout: Duration,
+    ) -> crate::wait::WaitOutcome<ldplayer::Instance>;
+    fn launch_wait(&self, index: u32, timeout: Duration) -> crate::wait::WaitOutcome<()>;
+    fn connect(&self, serial: &str, timeout: Duration) -> WaitOutcome<Self::Device>;
+    fn wait_for_boot(
+        &self,
+        device: &Self::Device,
+        timeout: Duration,
+    ) -> crate::wait::WaitOutcome<()>;
+    /// Which boot condition was still missing, for the `wait_finished` detail.
+    fn boot_detail(&self, _device: &Self::Device) -> Option<String> {
+        None
+    }
+}
+
+struct RealReadiness {
+    ld: ldplayer::LdPlayer,
+    adb_path: PathBuf,
+}
+
+impl ReadinessBackend for RealReadiness {
+    type Device = adb::AdbDevice;
+
+    fn wait_for_listing(
+        &self,
+        index: u32,
+        timeout: Duration,
+    ) -> crate::wait::WaitOutcome<ldplayer::Instance> {
+        self.ld.wait_for_instance_visible(index, timeout)
+    }
+
+    fn launch_wait(&self, index: u32, timeout: Duration) -> crate::wait::WaitOutcome<()> {
+        self.ld.launch_wait(index, timeout)
+    }
+
+    fn connect(&self, serial: &str, timeout: Duration) -> WaitOutcome<adb::AdbDevice> {
+        connect_adb_device(&self.adb_path, serial, timeout)
+    }
+
+    fn wait_for_boot(
+        &self,
+        device: &adb::AdbDevice,
+        timeout: Duration,
+    ) -> crate::wait::WaitOutcome<()> {
+        device.wait_for_boot(timeout)
+    }
+
+    fn boot_detail(&self, device: &adb::AdbDevice) -> Option<String> {
+        Some(device.boot_snapshot().describe())
+    }
+}
+
+/// Run the staged readiness sequence and return a device that is ready to be
+/// probed by `info()`.
+///
+/// Every stage is bounded, logged, and fail-closed: nothing beyond this
+/// function touches the device until it has returned, and it never taps.
+fn stage_device<B: ReadinessBackend>(
+    backend: &B,
+    store: &ConfigStore,
+    instances: &[ldplayer::Instance],
+    selected: &ResolvedInstance,
+    may_launch: bool,
+    waits: &WaitReporter<'_>,
+) -> Result<B::Device> {
+    let mut gate = readiness_gate(instances, selected.index, may_launch);
+
+    // Waiting for the instance to *appear* is not the same as waiting for it to
+    // *run*: an instance that shows up during the wait is usually still stopped,
+    // so the gate is re-evaluated from what the wait actually observed instead
+    // of reusing the pre-wait `list2` snapshot.
+    if gate == ReadinessGate::WaitForListing {
+        let budget = instance_appear_budget(store);
+        let started = waits.started("instance_visible", budget)?;
+        let outcome = backend.wait_for_listing(selected.index, budget);
+        waits.finished(
+            "instance_visible",
+            started,
+            outcome.attempts,
+            outcome.is_ok(),
+            None,
+        )?;
+        let listed = outcome.value?;
+        gate = readiness_gate(std::slice::from_ref(&listed), selected.index, may_launch);
+    }
+
+    match gate {
+        ReadinessGate::Proceed => {}
+        ReadinessGate::WaitForLaunch => {
+            let budget = Duration::from_secs(store.config.runtime.startup_timeout_seconds.max(1));
+            let started = waits.started("instance_launch", budget)?;
+            let outcome = backend.launch_wait(selected.index, budget);
+            waits.finished(
+                "instance_launch",
+                started,
+                outcome.attempts,
+                outcome.is_ok(),
+                None,
+            )?;
+            outcome.value?;
+        }
+        // Read-only callers must not idle for a VM they will never start, and
+        // must not pretend they waited.
+        ReadinessGate::NotListed => {
+            return Err(domain::DeviceWaitFailure::new(
+                domain::WAIT_INSTANCE_NOT_LISTED,
+                format!(
+                    "LDPlayer 实例不存在: {}（ldconsole list2 中没有该实例，且当前命令不会自动启动实例）",
+                    selected.index
+                ),
+            )
+            .into_error());
+        }
+        ReadinessGate::NotRunning => {
+            return Err(domain::DeviceWaitFailure::new(
+                domain::WAIT_INSTANCE_NOT_RUNNING,
+                format!(
+                    "LDPlayer 实例未运行: {}（请先手动启动实例，或启用 emulator.auto_launch 并使用会启动设备的命令）",
+                    selected.index
+                ),
+            )
+            .into_error());
+        }
+        // Construction invariant: this arm is only reachable while
+        // `may_launch` is true, and the gate was already re-evaluated from what
+        // the wait observed, so it can only be `Proceed` or `WaitForLaunch`.
+        // Kept fail-closed rather than `unreachable!` so a future edit can never
+        // panic in the middle of device setup.
+        ReadinessGate::WaitForListing => {
+            return Err(domain::DeviceWaitFailure::new(
+                domain::WAIT_INSTANCE_NOT_LISTED,
+                format!(
+                    "LDPlayer 实例未能出现在 ldconsole list2: {}",
+                    selected.index
+                ),
+            )
+            .into_error());
+        }
+    }
+
+    let adb_budget = Duration::from_secs(store.config.runtime.startup_timeout_seconds.max(1));
+    let started = waits.started("adb_connect", adb_budget)?;
+    let outcome = backend.connect(&selected.serial, adb_budget);
+    let connect_detail = outcome
+        .value
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
+    waits.finished(
+        "adb_connect",
+        started,
+        outcome.attempts,
+        outcome.is_ok(),
+        connect_detail.as_deref(),
+    )?;
+    let device = match outcome.value {
+        Ok(device) => device,
+        Err(error) => {
+            return Err(domain::DeviceWaitFailure::new(
+                domain::WAIT_ADB_CONNECT_TIMEOUT,
+                format!("{error:#}"),
+            )
+            .into_error());
+        }
+    };
+
+    // The guest boot wait must come before any app/geometry probe: `info()`
+    // reads `wm size`, which a still-booting framework cannot answer, and every
+    // later step (foreground, hierarchy) assumes the same.
+    let budget = boot_budget(store);
+    let started = waits.started("boot", budget)?;
+    let outcome = backend.wait_for_boot(&device, budget);
+    // On failure, record which condition was still missing: on a scheduled task
+    // the event stream is usually the only evidence left behind.
+    let detail = if outcome.is_ok() {
+        None
+    } else {
+        backend.boot_detail(&device)
+    };
+    waits.finished(
+        "boot",
+        started,
+        outcome.attempts,
+        outcome.is_ok(),
+        detail.as_deref(),
+    )?;
+    outcome.value?;
+    Ok(device)
 }
 
 fn runtime_with_target_recording(
@@ -2957,35 +3416,69 @@ fn runtime_with_target_recording(
     launch: bool,
     instance_target: Option<&InstanceTargetArgs>,
     result: Option<&mut RunResult>,
+    log: Option<&RunLog>,
 ) -> Result<(ldplayer::LdPlayer, adb::AdbDevice, adb::DeviceInfo)> {
+    let setup_started = Instant::now();
+    let waits = WaitReporter { log };
     let ld = ldplayer::LdPlayer::discover(
         &configured_path(store, &store.config.emulator.ldconsole_path),
         &store.root,
     )?;
-    let selected = resolve_instance_target(&ld, store, instance_target)?;
-    if let Some(result) = result {
-        result.instance_index = Some(selected.index);
-        result.instance_name = Some(selected.name.clone());
-        result.serial = selected.serial.clone();
+
+    let may_launch = launch && store.config.emulator.auto_launch;
+
+    // Resolve intent before requiring presence: a powered-off instance may be
+    // absent from `list2`, and requiring presence here is exactly what used to
+    // make `emulator.auto_launch` unreachable.
+    //
+    // A failing first read is not fatal for a launch-enabled run: the console can
+    // be briefly unavailable while LDPlayer restarts, and the staged listing wait
+    // exists to retry exactly that. Without a retry the console error itself is
+    // the better answer, so it is kept and returned instead.
+    let (instances, listing_error) = match ld.instances() {
+        Ok(instances) => (instances, None),
+        Err(error) if may_launch => (Vec::new(), Some(error)),
+        Err(error) => return Err(error.context("读取 ldconsole list2 失败")),
+    };
+    let selected = match resolve_instance_intent(&instances, store, instance_target) {
+        Ok(selected) => selected,
+        Err(error) => {
+            // The selector cannot be resolved against an unreadable listing;
+            // report the console failure rather than a derived "not listed".
+            return Err(match listing_error {
+                Some(listing_error) => listing_error.context("读取 ldconsole list2 失败"),
+                None => error,
+            });
+        }
+    };
+    // `result` is reborrowed rather than moved: the identity is recorded before
+    // the waits (so a failure still names the instance) and the elapsed time
+    // after them.
+    let mut result = result;
+    if let Some(slot) = result.as_mut() {
+        slot.instance_index = Some(selected.index);
+        slot.instance_name = Some(selected.name.clone());
+        slot.serial = selected.serial.clone();
     }
-    let instance = ld.instance(selected.index)?;
-    if launch && store.config.emulator.auto_launch && !instance.running {
-        ld.launch_wait(
-            instance.index,
-            Duration::from_secs(store.config.runtime.startup_timeout_seconds),
-        )?;
-    }
+
     let adb_path = adb::find_adb_for_ldplayer(
         &store.config.emulator.adb_path,
         Some(&ld.executable),
         Some(&store.root),
     )?;
-    let device = connect_adb_device(
-        &adb_path,
-        &selected.serial,
-        Duration::from_secs(store.config.runtime.startup_timeout_seconds.max(1)),
-    )?;
+    if let Some(error) = &listing_error {
+        waits.listing_read_failed(error)?;
+    }
+    let backend = RealReadiness {
+        ld: ld.clone(),
+        adb_path,
+    };
+    let device = stage_device(&backend, store, &instances, &selected, may_launch, &waits)?;
+
     let info = device.info();
+    if let Some(slot) = result.as_mut() {
+        slot.device_ready_ms = Some(setup_started.elapsed().as_millis() as u64);
+    }
     Ok((ld, device, info?))
 }
 
@@ -2993,9 +3486,15 @@ fn runtime_with_target_recording(
 /// registered with the host daemon. Keep connecting until the startup budget
 /// expires instead of turning that normal boot race into an immediate GUI/CLI
 /// device failure.
-fn connect_adb_device(adb_path: &Path, serial: &str, timeout: Duration) -> Result<adb::AdbDevice> {
+fn connect_adb_device(
+    adb_path: &Path,
+    serial: &str,
+    timeout: Duration,
+) -> crate::wait::WaitOutcome<adb::AdbDevice> {
     let deadline = Instant::now() + timeout;
+    let mut attempts = 0u32;
     loop {
+        attempts += 1;
         let connect_error = match process::command(adb_path)
             .args(["connect", serial])
             .output()
@@ -3009,7 +3508,7 @@ fn connect_adb_device(adb_path: &Path, serial: &str, timeout: Duration) -> Resul
         };
 
         let last_error = match adb::AdbDevice::discover(&adb_path.to_string_lossy(), serial) {
-            Ok(device) => return Ok(device),
+            Ok(device) => return crate::wait::WaitOutcome::ok(device, attempts),
             Err(error) => match connect_error {
                 Some(connect_error) => format!("{connect_error}; 设备状态: {error:#}"),
                 None => format!("{error:#}"),
@@ -3017,7 +3516,10 @@ fn connect_adb_device(adb_path: &Path, serial: &str, timeout: Duration) -> Resul
         };
 
         if Instant::now() >= deadline {
-            bail!("连接 ADB 设备超时: {} ({})", serial, last_error);
+            return crate::wait::WaitOutcome::failed(
+                anyhow::anyhow!("连接 ADB 设备超时: {serial} ({last_error})"),
+                attempts,
+            );
         }
         thread::sleep(Duration::from_millis(500));
     }
@@ -3750,19 +4252,23 @@ fn print_device(serial: &str, info: &adb::DeviceInfo) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GIT_COMMIT, PageRoute, PageView, RunStatus, SyncLifecycle, TapDevice, TapRequest, VERSION,
-        VisualCandidate, blocked_instance_result, build_id, build_id_for, build_task_command_line,
-        detect_page_route, finalize_run, find_checkin_entry_bounds, find_clickable_labeled_bounds,
-        find_labeled_bounds, foreground_check, git_dirty, guarded_tap, instance_summary_entry,
-        location_wait_limit, may_continue_on_checkin_page, new_run_result, propagated_failure,
-        restore_sync_backup, set_run_failure, unconfirmed_page_failure, unconfirmed_route_for,
-        visual_candidate,
+        GIT_COMMIT, InstanceTargetArgs, PageRoute, PageView, ReadinessBackend, ReadinessGate,
+        RunStatus, SyncLifecycle, TapDevice, TapRequest, VERSION, VisualCandidate, WaitReporter,
+        blocked_instance_result, boot_budget, build_id, build_id_for, build_task_command_line,
+        detect_page_route, empty_listing_blocks_batch, finalize_run, find_checkin_entry_bounds,
+        find_clickable_labeled_bounds, find_labeled_bounds, foreground_check, git_dirty,
+        guarded_tap, instance_appear_budget, instance_summary_entry, location_wait_limit,
+        may_continue_on_checkin_page, new_run_result, propagated_failure, readiness_gate,
+        record_device_setup_failure, resolve_instance_intent, restore_sync_backup, set_run_failure,
+        stage_device, unconfirmed_page_failure, unconfirmed_route_for, visual_candidate,
     };
     use crate::{
         config::{Config, EmulatorInstanceConfig},
         domain::{CheckinMode, Mode, RunResult},
+        ldplayer,
         logger::RunLog,
         vision::ButtonState,
+        wait::WaitOutcome,
     };
     use anyhow::Result;
     // `Parser` provides `try_parse_from`, used by the CLI argument tests.
@@ -5311,5 +5817,571 @@ mod tests {
         assert_eq!(controller.stops.get(), 1);
         assert_eq!(controller.launches.get(), 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    // ===== staged device-readiness waits =====
+
+    fn wait_instance(index: u32, running: bool) -> ldplayer::Instance {
+        ldplayer::Instance {
+            index,
+            name: format!("实例 {index}"),
+            running,
+            ldplayer_reported_port: None,
+            width: None,
+            height: None,
+            dpi: None,
+        }
+    }
+
+    /// Records every backend call, so a test can assert not only the outcome
+    /// but that the stages which must not run never did.
+    struct RecordingBackend {
+        listed: Option<ldplayer::Instance>,
+        boot_ok: bool,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl RecordingBackend {
+        fn new(listed: Option<ldplayer::Instance>, boot_ok: bool) -> Self {
+            Self {
+                listed,
+                boot_ok,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+
+        fn record(&self, name: &'static str) {
+            self.calls.borrow_mut().push(name);
+        }
+    }
+
+    impl ReadinessBackend for RecordingBackend {
+        type Device = ();
+
+        fn wait_for_listing(
+            &self,
+            _index: u32,
+            _timeout: Duration,
+        ) -> WaitOutcome<ldplayer::Instance> {
+            self.record("wait_for_listing");
+            match &self.listed {
+                Some(instance) => WaitOutcome::ok(instance.clone(), 2),
+                None => WaitOutcome::failed(
+                    crate::domain::DeviceWaitFailure::new(
+                        crate::domain::WAIT_INSTANCE_NOT_LISTED,
+                        "测试：实例始终未出现",
+                    )
+                    .into_error(),
+                    3,
+                ),
+            }
+        }
+
+        fn launch_wait(&self, _index: u32, _timeout: Duration) -> WaitOutcome<()> {
+            self.record("launch_wait");
+            WaitOutcome::ok((), 1)
+        }
+
+        fn connect(&self, _serial: &str, _timeout: Duration) -> WaitOutcome<()> {
+            self.record("connect");
+            WaitOutcome::ok((), 3)
+        }
+
+        fn wait_for_boot(&self, _device: &(), _timeout: Duration) -> WaitOutcome<()> {
+            self.record("wait_for_boot");
+            if self.boot_ok {
+                WaitOutcome::ok((), 4)
+            } else {
+                WaitOutcome::failed(
+                    crate::domain::DeviceWaitFailure::new(
+                        crate::domain::WAIT_BOOT_TIMEOUT,
+                        "测试：系统未引导完成",
+                    )
+                    .into_error(),
+                    9,
+                )
+            }
+        }
+    }
+
+    fn readiness_store(root: &Path, auto_launch: bool) -> crate::config::ConfigStore {
+        let mut config = Config::default();
+        config.emulator.auto_launch = auto_launch;
+        crate::config::ConfigStore {
+            root: root.to_path_buf(),
+            path: root.join("config.toml"),
+            config,
+            origin: crate::config::ConfigOrigin::Explicit,
+            created_default: false,
+            recovery_error: None,
+        }
+    }
+
+    fn selected(index: u32) -> super::ResolvedInstance {
+        super::ResolvedInstance {
+            index,
+            name: format!("实例 {index}"),
+            serial: format!("127.0.0.1:{}", 5555 + index * 2),
+        }
+    }
+
+    #[test]
+    fn intent_resolution_accepts_an_unlisted_index_before_presence_is_required() {
+        // A powered-off instance can be missing from `list2`; resolution must
+        // still name it so the run path can wait for and launch it.
+        let root = temp_root("intent-unlisted");
+        let store = readiness_store(&root, true);
+        let target = InstanceTargetArgs {
+            instance_index: Some(3),
+            serial: None,
+        };
+        let resolved = resolve_instance_intent(&[], &store, Some(&target))
+            .expect("未列出的实例仍必须能解析出 index/serial");
+        assert_eq!(resolved.index, 3);
+        assert_eq!(resolved.serial, "127.0.0.1:5561");
+        // No vendor name is available, so the fallback must still be readable.
+        assert_eq!(resolved.name, "实例 3");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn intent_resolution_maps_an_unlisted_serial_through_the_configured_instance() {
+        let root = temp_root("intent-serial");
+        let mut store = readiness_store(&root, true);
+        store.config.emulator.instances = vec![EmulatorInstanceConfig {
+            name: "签到实例 2".into(),
+            instance_index: 2,
+            serial: "127.0.0.1:9999".into(),
+            enabled: true,
+        }];
+        let target = InstanceTargetArgs {
+            instance_index: None,
+            serial: Some("127.0.0.1:9999".into()),
+        };
+        let resolved = resolve_instance_intent(&[], &store, Some(&target))
+            .expect("配置中的 serial 必须能在实例未列出时解析出 index");
+        assert_eq!(resolved.index, 2);
+        assert_eq!(resolved.serial, "127.0.0.1:9999");
+        // The operator-supplied name from the config still wins when the vendor
+        // did not report one.
+        assert_eq!(resolved.name, "签到实例 2");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn intent_resolution_ignores_the_vendor_name_when_the_config_sets_one() {
+        let root = temp_root("intent-name-precedence");
+        let mut store = readiness_store(&root, true);
+        store.config.emulator.instances = vec![EmulatorInstanceConfig {
+            name: "人工命名".into(),
+            instance_index: 0,
+            serial: String::new(),
+            enabled: true,
+        }];
+        let resolved = resolve_instance_intent(
+            &[wait_instance(0, true)],
+            &store,
+            Some(&InstanceTargetArgs {
+                instance_index: Some(0),
+                serial: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(resolved.name, "人工命名");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_budgets_clamp_both_ends() {
+        let root = temp_root("readiness-budgets");
+        let mut store = readiness_store(&root, true);
+
+        store.config.runtime.instance_appear_timeout_seconds = 0;
+        assert_eq!(
+            instance_appear_budget(&store),
+            Duration::from_secs(5),
+            "0 不得让等待变成瞬间超时"
+        );
+        store.config.runtime.instance_appear_timeout_seconds = 10_000;
+        assert_eq!(
+            instance_appear_budget(&store),
+            Duration::from_secs(120),
+            "不得让实例出现等待无限延长"
+        );
+
+        store.config.runtime.boot_timeout_seconds = 1;
+        assert_eq!(
+            boot_budget(&store),
+            Duration::from_secs(30),
+            "低于下限的引导预算会被拉回 30 秒"
+        );
+        store.config.runtime.boot_timeout_seconds = 10_000;
+        assert_eq!(boot_budget(&store), Duration::from_secs(600));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staged_waits_emit_started_and_finished_events_with_attempts() {
+        // The event pair is what makes a scheduled-task failure diagnosable from
+        // events.jsonl alone, so it must be emitted with real numbers — not as a
+        // placeholder that always says zero attempts.
+        let root = temp_root("readiness-events");
+        let store = readiness_store(&root, true);
+        let log = RunLog::new(&root).unwrap().quiet();
+        let backend = RecordingBackend::new(Some(wait_instance(0, false)), true);
+        let waits = WaitReporter { log: Some(&log) };
+        stage_device(&backend, &store, &[], &selected(0), true, &waits).unwrap();
+
+        let events = fs::read_to_string(log.dir.join("events.jsonl")).unwrap();
+        let parsed: Vec<serde_json::Value> = events
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let kinds: Vec<&str> = parsed
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap_or_default())
+            .collect();
+        // Four stages, each with a start and a finish, in execution order.
+        assert_eq!(
+            kinds,
+            vec![
+                "wait_started",
+                "wait_finished",
+                "wait_started",
+                "wait_finished",
+                "wait_started",
+                "wait_finished",
+                "wait_started",
+                "wait_finished",
+            ]
+        );
+        let stages: Vec<String> = parsed
+            .iter()
+            .filter(|event| event["kind"] == "wait_finished")
+            .map(|event| event["data"]["stage"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            stages,
+            vec!["instance_visible", "instance_launch", "adb_connect", "boot"]
+        );
+        for event in parsed
+            .iter()
+            .filter(|event| event["kind"] == "wait_finished")
+        {
+            assert_eq!(event["data"]["ok"], true);
+            assert_eq!(
+                event["data"]["clicked"], false,
+                "等待事件必须显式声明没有点击"
+            );
+            assert!(
+                event["data"]["attempts"].as_u64().unwrap() > 0,
+                "attempts 必须是真实探测次数: {event}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_without_a_log_writes_no_events_but_still_waits() {
+        // `diagnose`/`profile detect`/GUI probes call runtime_with_target with no
+        // RunLog. That must not change the staging itself, only the reporting.
+        let root = temp_root("readiness-no-log");
+        let store = readiness_store(&root, false);
+        let backend = RecordingBackend::new(None, true);
+        let waits = WaitReporter { log: None };
+        stage_device(
+            &backend,
+            &store,
+            &[wait_instance(0, true)],
+            &selected(0),
+            false,
+            &waits,
+        )
+        .unwrap();
+        assert_eq!(backend.calls(), vec!["connect", "wait_for_boot"]);
+        // No run log directory is created by the waits themselves.
+        assert!(!root.join("logs").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_instance_list_only_blocks_a_batch_that_cannot_launch() {
+        // `auto_launch = true`: the per-instance stage owns the failure, so one
+        // cold instance does not block the whole batch with a shared blocker.
+        assert!(!empty_listing_blocks_batch(true));
+        // `auto_launch = false`: nothing can start an instance, so this is
+        // genuinely a shared-dependency failure (D-05).
+        assert!(empty_listing_blocks_batch(false));
+    }
+
+    #[test]
+    fn instance_that_never_appears_fails_before_adb_connect() {
+        let root = temp_root("readiness-never-appears");
+        let store = readiness_store(&root, true);
+        let backend = RecordingBackend::new(None, true);
+        let waits = WaitReporter { log: None };
+        let error = stage_device(&backend, &store, &[], &selected(0), true, &waits)
+            .expect_err("实例始终未出现必须失败");
+        assert_eq!(
+            crate::domain::device_wait_code(&error),
+            Some(crate::domain::WAIT_INSTANCE_NOT_LISTED)
+        );
+        assert_eq!(
+            backend.calls(),
+            vec!["wait_for_listing"],
+            "实例未出现时不得连接 ADB 或等待引导"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unclassified_device_setup_failure_still_records_a_machine_code() {
+        // A login-only run counts as successful when it has no `error_code`, so
+        // a device-setup failure that is not one of the classified waits must
+        // still be recorded, or the run would claim success.
+        let root = temp_root("device-setup-unclassified");
+        let log = RunLog::new(&root).unwrap().quiet();
+        let mut result = new_run_result(Mode::DryRun, &log, &InstanceTargetArgs::default());
+        result.login_only = Some(true);
+
+        let code =
+            record_device_setup_failure(&mut result, &anyhow::anyhow!("ldconsole.exe 不可执行"));
+        assert_eq!(code, crate::domain::ExitCode::DeviceFailure);
+        assert_eq!(result.error_code.as_deref(), Some("device_setup_failed"));
+        assert_eq!(result.error_stage.as_deref(), Some("device_setup"));
+        assert!(
+            result
+                .recovery_action
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+        );
+
+        finalize_run(&log, &mut result).unwrap();
+        assert_eq!(
+            result.status.as_deref(),
+            Some(RunStatus::Failed.as_str()),
+            "未分类的设备准备失败绝不能被写成 success"
+        );
+        assert!(!result.clicked);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn classified_wait_failure_keeps_its_own_code_and_exit_code() {
+        let root = temp_root("device-setup-classified");
+        let log = RunLog::new(&root).unwrap().quiet();
+        let mut result = new_run_result(Mode::DryRun, &log, &InstanceTargetArgs::default());
+
+        let error = crate::domain::DeviceWaitFailure::new(
+            crate::domain::WAIT_BOOT_TIMEOUT,
+            "Android 未完成引导",
+        )
+        .into_error();
+        let code = record_device_setup_failure(&mut result, &error);
+        assert_eq!(code, crate::domain::ExitCode::Timeout);
+        assert_eq!(result.error_code.as_deref(), Some("boot_timeout"));
+        assert_eq!(result.error_stage.as_deref(), Some("device_setup"));
+        assert!(!result.clicked);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_gate_separates_not_listed_from_not_running() {
+        let listed_stopped = vec![wait_instance(0, false)];
+        let listed_running = vec![wait_instance(0, true)];
+        assert_eq!(
+            readiness_gate(&listed_running, 0, false),
+            ReadinessGate::Proceed
+        );
+        // Launch disabled: the two "cannot continue" cases must stay distinct,
+        // because the operator's next action differs (wrong index vs. start it).
+        assert_eq!(
+            readiness_gate(&listed_stopped, 0, false),
+            ReadinessGate::NotRunning
+        );
+        assert_eq!(readiness_gate(&[], 0, false), ReadinessGate::NotListed);
+        // Launch allowed: both become waits, never immediate failures.
+        assert_eq!(
+            readiness_gate(&listed_stopped, 0, true),
+            ReadinessGate::WaitForLaunch
+        );
+        assert_eq!(readiness_gate(&[], 0, true), ReadinessGate::WaitForListing);
+        // A listed *different* instance says nothing about the requested one.
+        assert_eq!(
+            readiness_gate(&[wait_instance(1, true)], 0, false),
+            ReadinessGate::NotListed
+        );
+    }
+
+    #[test]
+    fn launch_disabled_and_stopped_instance_fails_without_touching_the_device() {
+        let root = temp_root("readiness-not-running");
+        let store = readiness_store(&root, false);
+        let backend = RecordingBackend::new(Some(wait_instance(0, false)), true);
+        let waits = WaitReporter { log: None };
+        let error = stage_device(
+            &backend,
+            &store,
+            &[wait_instance(0, false)],
+            &selected(0),
+            false,
+            &waits,
+        )
+        .expect_err("实例未运行且不允许启动时必须失败");
+        assert_eq!(
+            crate::domain::device_wait_code(&error),
+            Some(crate::domain::WAIT_INSTANCE_NOT_RUNNING)
+        );
+        assert!(
+            backend.calls().is_empty(),
+            "不得启动、连接或等待任何东西: {:?}",
+            backend.calls()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_disabled_and_running_instance_waits_for_boot_without_launching() {
+        let root = temp_root("readiness-running");
+        let store = readiness_store(&root, false);
+        let backend = RecordingBackend::new(None, true);
+        let waits = WaitReporter { log: None };
+        stage_device(
+            &backend,
+            &store,
+            &[wait_instance(0, true)],
+            &selected(0),
+            false,
+            &waits,
+        )
+        .unwrap();
+        assert_eq!(
+            backend.calls(),
+            vec!["connect", "wait_for_boot"],
+            "正在运行的实例只连接并等待引导，绝不 launch"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn boot_failure_stops_before_any_device_probe() {
+        // The boot wait is the last readiness gate and must sit before anything
+        // reads the screen or the hierarchy. The backend records every call, so
+        // a boot timeout has to be the final recorded stage.
+        let root = temp_root("readiness-boot-timeout");
+        let store = readiness_store(&root, false);
+        let backend = RecordingBackend::new(None, false);
+        let waits = WaitReporter { log: None };
+        let error = stage_device(
+            &backend,
+            &store,
+            &[wait_instance(0, true)],
+            &selected(0),
+            false,
+            &waits,
+        )
+        .expect_err("引导超时必须失败");
+        assert_eq!(
+            crate::domain::device_wait_code(&error),
+            Some(crate::domain::WAIT_BOOT_TIMEOUT)
+        );
+        assert_eq!(backend.calls(), vec!["connect", "wait_for_boot"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_enabled_waits_for_listing_then_launches_and_continues() {
+        let root = temp_root("readiness-launch");
+        let store = readiness_store(&root, true);
+        // Absent from the first snapshot, appears (and is still stopped) during
+        // the wait: the launch stage must still run afterwards.
+        let backend = RecordingBackend::new(Some(wait_instance(0, false)), true);
+        let waits = WaitReporter { log: None };
+        stage_device(&backend, &store, &[], &selected(0), true, &waits).unwrap();
+        assert_eq!(
+            backend.calls(),
+            vec![
+                "wait_for_listing",
+                "launch_wait",
+                "connect",
+                "wait_for_boot"
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn already_running_instance_skips_both_instance_stages() {
+        let root = temp_root("readiness-already-running");
+        let store = readiness_store(&root, true);
+        let backend = RecordingBackend::new(None, true);
+        let waits = WaitReporter { log: None };
+        stage_device(
+            &backend,
+            &store,
+            &[wait_instance(0, true)],
+            &selected(0),
+            true,
+            &waits,
+        )
+        .unwrap();
+        assert_eq!(backend.calls(), vec!["connect", "wait_for_boot"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn device_wait_failures_map_to_timeouts_not_device_failures() {
+        use crate::domain::{
+            ExitCode, WAIT_ADB_CONNECT_TIMEOUT, WAIT_BOOT_TIMEOUT, WAIT_INSTANCE_LAUNCH_TIMEOUT,
+            WAIT_INSTANCE_NOT_LISTED, WAIT_INSTANCE_NOT_RUNNING, device_wait_exit_code,
+            device_wait_recovery,
+        };
+        // The three "we waited and gave up" codes are timeouts (exit 5);
+        // device_setup_failed (exit 2) stays for non-wait I/O problems, and
+        // "you must start it yourself" is not a timeout because nothing waited.
+        for code in [
+            WAIT_INSTANCE_NOT_LISTED,
+            WAIT_INSTANCE_LAUNCH_TIMEOUT,
+            WAIT_ADB_CONNECT_TIMEOUT,
+            WAIT_BOOT_TIMEOUT,
+        ] {
+            assert_eq!(
+                device_wait_exit_code(code),
+                ExitCode::Timeout,
+                "{code} 必须是超时"
+            );
+            assert!(!device_wait_recovery(code).trim().is_empty());
+        }
+        assert_eq!(
+            device_wait_exit_code(WAIT_INSTANCE_NOT_RUNNING),
+            ExitCode::DeviceFailure
+        );
+        assert_eq!(
+            device_wait_exit_code("device_setup_failed"),
+            ExitCode::DeviceFailure
+        );
+    }
+
+    #[test]
+    fn device_wait_failure_code_survives_added_context() {
+        // The classification must not depend on the message text, and adding
+        // context must not hide it — the wait helpers add context freely.
+        let error = anyhow::Error::new(crate::domain::DeviceWaitFailure::new(
+            crate::domain::WAIT_BOOT_TIMEOUT,
+            "原始原因",
+        ))
+        .context("外层说明");
+        assert_eq!(
+            crate::domain::device_wait_code(&error),
+            Some(crate::domain::WAIT_BOOT_TIMEOUT)
+        );
+        assert_eq!(
+            crate::domain::device_wait_code(&anyhow::anyhow!("别的错误")),
+            None
+        );
     }
 }

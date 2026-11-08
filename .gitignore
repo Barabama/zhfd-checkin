@@ -33,6 +33,10 @@ reports/
 *.zip
 *.vdi
 
+# 演示录屏：体积大，且运行截图可能含账号/定位等 PII。
+# 需要时用 `git add -f docs/assets/<name>.gif` 显式放行，并先确认画面已脱敏。
+docs/assets/*.gif
+
 # 系统文件
 Thumbs.db
 desktop.ini

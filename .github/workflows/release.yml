@@ -31,6 +31,11 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write # softprops/action-gh-release creates the Release
+    # Two dispatches on the same tag used to race into the publish step, which
+    # can leave a partial asset set. Serialise per tag instead.
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -165,8 +170,84 @@ jobs:
           }
           Write-Host "asset_guard=PASS asset=$($found[0].Name)"
 
+      # P1-4 (second half): the release guard above binds the *build inputs* to
+      # a tag, and it runs ~10 minutes before publication. Two things can still
+      # go wrong in that window, and both publish a Release that lies about
+      # which commit it ships:
+      #   - the tag is force-moved, so the Release is cut at a new target while
+      #     the asset name and the build-id check still name the old commit;
+      #   - an earlier Release for the same version already carries an asset
+      #     named after a different commit, and action-gh-release adds the new
+      #     zip beside it instead of replacing it.
+      # Re-read the remote tag and inspect the existing Release immediately
+      # before publishing, and refuse in either case.
+      - name: Re-verify the tag and any existing Release before publishing
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          $version = (cargo metadata --manifest-path rust/Cargo.toml --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $commit = (git rev-parse --short=12 HEAD).Trim()
+          $fullCommit = (git rev-parse HEAD | Out-String).Trim()
+          $expectedAsset = "zhfd-checkin-windows-x64-v$version-$commit.zip"
+
+          # 1. The remote tag must still point at the commit that was built.
+          #    The refspec has to be a glob: asking for `refs/tags/<tag>` exactly
+          #    returns only the tag object for an annotated tag and no peeled
+          #    line, which would compare a tag object id against a commit id.
+          $remoteLines = @(& git ls-remote --tags origin "refs/tags/$tag*" 2>&1)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to read the remote tag $tag. output=$($remoteLines -join ' ')"
+          }
+          $escapedTag = [regex]::Escape($tag)
+          $peeledPattern = '\srefs/tags/' + $escapedTag + '\^\{\}$'
+          $plainPattern = '\srefs/tags/' + $escapedTag + '$'
+          $peeled = $remoteLines | Where-Object { $_ -match $peeledPattern } | Select-Object -First 1
+          $plain = $remoteLines | Where-Object { $_ -match $plainPattern } | Select-Object -First 1
+          $line = if ($peeled) { $peeled } elseif ($plain) { $plain } else { $null }
+          if (-not $line) {
+            throw "Remote tag $tag disappeared between the guard step and publication."
+          }
+          $remoteCommit = ($line -split "\s+")[0]
+          if ($remoteCommit -ne $fullCommit) {
+            throw "The tag moved while the release was building. remote=$remoteCommit built=$fullCommit. Re-run the workflow on the current tag."
+          }
+          Write-Host "tag_guard=PASS tag=$tag remote_commit=$remoteCommit"
+
+          # 2. An existing Release for this version may only be re-published for
+          #    the same commit. Any other asset name means a different commit was
+          #    already published under this version.
+          $existing = & gh api "repos/$env:REPOSITORY/releases/tags/$tag" 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            $release = $existing | ConvertFrom-Json
+            $names = @($release.assets | ForEach-Object { $_.name })
+            if ($names.Count -gt 0) {
+              $foreign = @($names | Where-Object { $_ -ne $expectedAsset })
+              if ($foreign.Count -gt 0) {
+                throw "Release $tag already carries assets from a different commit: $($foreign -join ', '). Refusing to publish $expectedAsset beside them. Delete the stale Release or bump the version."
+              }
+              Write-Host "existing_release=PASS tag=$tag assets=$($names -join ',')"
+            } else {
+              Write-Host "existing_release=EMPTY tag=$tag (re-publishing $expectedAsset)"
+            }
+          } elseif ($existing -match "404|Not Found") {
+            Write-Host "existing_release=ABSENT tag=$tag"
+          } else {
+            # Anything else (auth, rate limit, network) must not be treated as
+            # "no existing release": that is the fail-open direction.
+            throw "Unable to check whether Release $tag already exists. output=$($existing -join ' ')"
+          }
+          Write-Host "prepublish_guard=PASS tag=$tag commit=$fullCommit asset=$expectedAsset"
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # Bind the Release object to the tag and commit that were just
+          # verified, rather than letting the action infer them.
+          tag_name: ${{ github.ref_name }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: dist/*.zip

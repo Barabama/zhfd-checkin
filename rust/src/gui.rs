@@ -718,6 +718,19 @@ fn explain_error(error: &str) -> &'static str {
         }
         "auto_login_timeout" => "一键登录后未在超时内离开登录页；程序未重试，请人工核对登录状态。",
         "auto_login_not_confirmed" => "登录后页面证据不可读；程序已停止，未继续签到。",
+        "instance_not_listed" => {
+            "实例 index 不存在，或实例已完全退出；请在 LDPlayer 中确认实例名，或先手动启动一次。程序未执行点击。"
+        }
+        "instance_not_running" => {
+            "实例当前未运行，且本命令不会自动启动实例；请先手动启动 LDPlayer 实例后重试。程序未执行点击。"
+        }
+        "instance_launch_timeout" => {
+            "实例启动超时；请手动启动 LDPlayer 实例后重试。程序未执行点击。"
+        }
+        "adb_connect_timeout" => "ADB 未就绪；请确认模拟器已启动并允许 ADB 调试。程序未执行点击。",
+        "boot_timeout" => {
+            "Android 系统未在预算内完成引导；请手动启动实例并等待桌面出现后重试。程序未执行点击。"
+        }
         "navigation_not_confirmed" => "未能确认进入晚点名签到页；请手动导航后重试。",
         "page_context_changed" => "运行中页面/签到模式发生变化；安全策略已停止自动点击。",
         "hierarchy_unavailable" => "无法读取页面结构；为安全起见没有继续点击。",
@@ -1383,9 +1396,19 @@ impl GuiApp {
                 ui.label(format!("页面日期：{date}"));
             }
             if let Some(error) = &result.error {
+                // `result.error` is the human-readable detail for a propagated
+                // failure (`boot_timeout: Android 系统未在 ... 内完成引导`), so the
+                // hint must be looked up from the *machine code*, not from the
+                // message text — otherwise every classified wait failure falls
+                // through to the generic "请查看诊断报告" hint.
+                let hint = result
+                    .error_code
+                    .as_deref()
+                    .map(explain_error)
+                    .unwrap_or_else(|| explain_error(error));
                 ui.colored_label(
                     egui::Color32::LIGHT_RED,
-                    format!("错误：{}（{}）", error, explain_error(error)),
+                    format!("错误：{}（{}）", error, hint),
                 );
             } else if result.field_work_ready {
                 ui.colored_label(
