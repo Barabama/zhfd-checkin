@@ -1,6 +1,6 @@
 # 工程构建、版本与发布流程
 
-更新时间：2026-10-26（Asia/Shanghai）
+最后核对：2026-11-09（Asia/Shanghai）
 
 > 当前 HEAD/tag/Release/CI/审计状态以 [STATUS.md](./STATUS.md) 为准；本文件只维护工程流程。
 
@@ -46,14 +46,14 @@ CLI/GUI 共享业务函数，不把 UI 的按钮/输入当作第二套业务策�
   [V0.3.1 独立审计报告](./audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md)；
 - 本地工作区不等于发布，tag/Release 仍须独立验收与用户明确批准。
 
-### 发布门禁（2026-10-26 加固）
+### 发布门禁（2026-10-26 加固，2026-10-27 补齐）
 
-`release.yml` 现在把发布绑定到 tag 和 Cargo 版本，并复用 CI 门禁。发布前依次检查：
+`release.yml` 现在把发布绑定到 tag、Cargo 版本和已存在的 Release。发布前依次检查：
 
 1. `verify` job 以 reusable workflow 调用 `ci.yml`（`release` job `needs: verify`）：
-   fmt / clippy / tests / release build / portable smoke / Python / Node 全部通过后才进入
-   `release` job——任一门禁失败即不发布；
-2. **release guard**（在构建之前运行，fail-fast）：
+   fmt / clippy / tests / release guard 离线回归 / release build / portable smoke /
+   Python / Node 全部通过后才进入 `release` job——任一门禁失败即不发布；
+2. **release guard**（构建之前，fail-fast）：
    - `GITHUB_REF_TYPE` 必须是 `tag`；
    - tag 名必须匹配 `^vX.Y.Z$`（不接受 `v0.4.0-rc.1`、`v0.3.5.1` 这类后缀）；
    - tag 名必须等于 `v<Cargo 版本>`（即 `v0.3.5` ↔ `rust/Cargo.toml` 的 `0.3.5`）；
@@ -61,9 +61,20 @@ CLI/GUI 共享业务函数，不把 UI 的按钮/输入当作第二套业务策�
    - tag peel 出的提交（`git rev-parse "<tag>^{commit}"`）必须等于 checkout 的 HEAD
      （`git rev-parse "HEAD^{commit}"`）——用 peel 而不是裸对象 id，所以轻量与附注 tag 都成立；
    - tag 指向的提交必须是远端默认分支的祖先（即不能对未合并的功能分支提交打 tag 发布）；
-3. **asset guard**（在打包之后、发布之前运行）：`dist/` 必须存在、恰好有一个 zip，
-   且文件名必须是 `zhfd-checkin-windows-x64-v<版本>-<12 位 commit>.zip`；
-4. 全部通过后才执行 `softprops/action-gh-release`。
+3. **asset guard**（打包之后）：`dist/` 必须存在、恰好一个 zip，且文件名必须是
+   `zhfd-checkin-windows-x64-v<版本>-<12 位 commit>.zip`；
+4. **pre-publish guard**（发布之前，重读远端状态）：
+   - 远端 tag 必须仍指向被构建的提交（`git ls-remote --tags origin "refs/tags/<tag>*"`
+     取 peeled 行；策略串必须是 glob，否则附注 tag 只返回 tag 对象、拿不到 peeled 提交）；
+   - 若该版本已有 Release，其资产名必须与本次要发布的完全一致；出现别的资产名说明
+     同一版本下已经发布过另一个 commit，直接拒绝（`action-gh-release` 会同名覆盖，
+     不会删除别的资产，所以"并排多一个 zip"是真实风险）；
+   - 查询 Release 失败（401/限流/网络）**不**视为"不存在"——那是 fail-open 方向；
+5. 全部通过后才执行 `softprops/action-gh-release`，并显式传
+   `tag_name` / `target_commitish`，把 Release 对象绑定到刚才复核过的 tag 与提交。
+
+`release` job 带 `concurrency: release-${{ github.ref }}`（`cancel-in-progress: false`），
+避免同一 tag 的两次派发并发进入发布步骤、留下半个资产集。
 
 因此 `workflow_dispatch` 只能用于**重跑某个 tag 的发布**：在分支上手点会直接失败，
 不再可能从任意分支发出 Release。`permissions` 也改为 job 级最小权限——
@@ -77,11 +88,19 @@ reusable 的 `ci.yml` 只有 `contents: read`，只有 `release` job 有 `conten
 
 - ~~release workflow 不校验 tag 名与 Cargo 版本一致，`workflow_dispatch` 可在任意分支运行~~ → 已修复（release guard）；
 - ~~release workflow 不运行 Python / Node 门禁~~ → 已修复（`verify` 复用 `ci.yml`）；
-- ~~CI 在 Python / Node 之前上传 artifact~~ → 已修复（上传移到门禁之后）。
+- ~~CI 在 Python / Node 之前上传 artifact~~ → 已修复（上传移到门禁之后）；
+- ~~Release 对象本身没有被绑定，发布前也不复核 tag 是否被移动~~ → 已修复（pre-publish guard + `target_commitish`）；
+- ~~同一 tag 的并发派发会竞争发布~~ → 已修复（`concurrency`）。
 
 ### 发布流程仍开放的缺口
 
 - 仍要求打 tag 前 bump `rust/Cargo.toml`；不一致现在会被 release guard 直接拒绝（有意的 fail-closed，不再静默产出旧版本号资产）；
+- **P2-26 的残余**：`release` job 从源码**重新构建**，不下载 `ci.yml` 产出的那个 artifact。
+  保证的是"同一份源码通过了门禁"，不是"通过门禁的那份字节被发布"。`ci.yml` 上传的 artifact
+  目前没有消费者。两边的绑定靠 `release` job 自己重跑 portable smoke 与 build-id 校验；
+  如果两次构建真的分叉（runner 镜像、工具链、缓存），没有检查会发现。
+- 门禁只保证内部一致性，不区分"首次发布"和"重发/覆盖某个已发布版本"；任何有写权限的
+  协作者都能对任意 `vX.Y.Z` tag 重跑 `workflow_dispatch`。没有 `environment:` 审批门。
 - guard 与 asset 命名规则只在本机被**离线模拟 + 真实 tag 复核**过（见下），尚未在 GitHub runner 上真实运行——下一次 tag 发布会是首次真实执行；
 - 发布仍依赖 `windows-latest` runner；未在干净 Windows 镜像上做便携验收。
 
@@ -101,13 +120,13 @@ cargo build --release --manifest-path .\rust\Cargo.toml --bins
 
 ### 发布门禁的离线回归（`scripts/simulate_release_guards.ps1`）
 
-两条 guard 是「YAML 里的 PowerShell」，在真正打 tag 之前没有任何东西会执行它们。
-该脚本**从 `release.yml` 抽出两条 guard 的 `run:` 块**（不是重新实现一遍），在临时
-目录里合成一个 bare `origin` + 每个场景一个 scratch clone，然后跑 15 个场景。因为它
-直接消费 workflow 里的脚本，改写 guard 会自动反映到测试里，不会出现「测试与实现脱节」。
+三条 guard 都是「YAML 里的 PowerShell」，在真正打 tag 之前没有任何东西会执行它们。
+该脚本**从 `release.yml` 抽出每条 guard 的 `run:` 块**（不是重新实现一遍），在临时
+目录里合成仓库跑 23 个场景。因为它直接消费 workflow 里的脚本，改写 guard 会自动反映到
+测试里，不会出现「测试与实现脱节」。
 
 ```powershell
-.\scripts\simulate_release_guards.ps1                  # 15 个场景，全部符合预期才退出 0
+.\scripts\simulate_release_guards.ps1                  # 23 个场景，全部符合预期才退出 0
 .\scripts\simulate_release_guards.ps1 -KeepScratch     # 保留临时仓库以便排查
 .\scripts\simulate_release_guards.ps1 -CheckRealTag    # 额外用真实 checkout 跑一次 guard
 ```
@@ -116,9 +135,14 @@ cargo build --release --manifest-path .\rust\Cargo.toml --bins
 不发布。它只从真实仓库**读**两处：`rust/Cargo.toml`（取版本，用于合成 fixture）和
 `release.yml`（取 guard 源码）。
 
-`-CheckRealTag` 是显式 opt-in，因为那一次会把 guard 跑在真实 checkout 上，而 guard 内含
-`git fetch origin +refs/heads/<default>:refs/remotes/origin/<default>`——它会写真实
-`.git` 的 remote-tracking ref 和 `FETCH_HEAD`。只有 HEAD 正好是已发布 tag 时才有意义
+pre-publish guard 需要问 GitHub API 某个 Release 是否存在。为了不碰真实 API，脚本用
+`csc.exe` 把 `scripts/GhStub.cs` 编译成 `gh.exe` 放到临时 PATH 上，按场景回放
+`GH_STUB_SPEC` 里的 JSON 应答。（没有用 `.cmd` shim：cmd.exe 会执行 AutoRun 钩子——
+作者机器上有 conda hook——它的输出会混进被捕获的 stdout，污染 guard 解析的 JSON。）
+
+`-CheckRealTag` 是显式 opt-in，因为那一次会把第一条 guard 跑在真实 checkout 上，而
+guard 内含 `git fetch origin +refs/heads/<default>:refs/remotes/origin/<default>`——它会写
+真实 `.git` 的 remote-tracking ref 和 `FETCH_HEAD`。只有 HEAD 正好是已发布 tag 时才有意义
 （tag push 后的状态）。
 
 CI 在 `cargo test` 之后、release build 之前执行默认（不带 `-CheckRealTag`）的那一遍，
@@ -126,7 +150,7 @@ CI 在 `cargo test` 之后、release build 之前执行默认（不带 `-CheckRe
 `skipped  release guard: real-repository check is opt-in (-CheckRealTag)`——这是预期，
 不是失败。
 
-### 本地模拟结果（2026-10-26）
+### 本地模拟结果（2026-10-26 / 2026-10-27）
 
 测试版本取自 `rust/Cargo.toml`（当前 `0.3.5`），因此版本 bump 后脚本仍然自洽。
 
@@ -147,14 +171,28 @@ release guard（9 个场景）：
 asset guard（6 个场景）：唯一 zip 且名字正确 → PASS；名字里版本错、commit 错、
 两个 zip（上一轮残留）、没有 zip、`dist/` 不存在 → 全部 REFUSED。
 
-`-CheckRealTag` 已在 `v0.3.5`（`c60918c`）的 checkout 上跑过一次：16 个场景全过，
+pre-publish guard（8 个场景，每个场景自带一个 bare `origin`）：
+
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| tag 未变动，尚无 Release | 通过 | PASS（`existing_release=ABSENT`） |
+| 已有 Release，资产名正是本次要发的 | 通过 | PASS（`existing_release=PASS`） |
+| 已有 Release，但资产属于另一个 commit | 拒绝 | REFUSED（`already carries assets from a different commit`） |
+| 构建期间 tag 被强移到更新的提交 | 拒绝 | REFUSED（`The tag moved while the release was building`） |
+| 远端 tag 已被删除 | 拒绝 | REFUSED（`Remote tag … disappeared`） |
+| `gh` 返回 401（无法判断 Release 是否存在） | 拒绝 | REFUSED（`Unable to check whether Release … already exists`） |
+| 附注 tag 解析到同一提交 | 通过 | PASS |
+| 已有 Release 但还没有资产 | 通过 | PASS（`existing_release=EMPTY`） |
+
+`-CheckRealTag` 已在 `v0.3.5`（`c60918c`）的 checkout 上跑过一次：24 个场景全过，
 `release_guard=PASS tag=v0.3.5 version=0.3.5 commit=c60918c… default_branch=master`——
 即这条 guard 会接受当前真实的 tag。默认运行里那一项显示为
 `skipped  release guard: real-repository check is opt-in (-CheckRealTag)`。
 
-限制：这只覆盖两条 guard 的**逻辑和 PowerShell 运行语义**，不覆盖
+限制：这只覆盖三条 guard 的**逻辑和 PowerShell 运行语义**，不覆盖
 `needs: verify` 的 reusable-workflow 调用、`workflow_call` 触发、
-`softprops/action-gh-release` 的真实行为，以及 actions/checkout 在 tag push 上留下的
-真实 ref 布局。下一次 tag 发布仍是这些改动的首次真实执行。
+`softprops/action-gh-release` 的真实行为、`gh` 的真实 API 应答格式，以及
+actions/checkout 在 tag push 上留下的真实 ref 布局。下一次 tag 发布仍是这些改动的
+首次真实执行。
 
 UiAutomator2 真实 binary manifest fixture 仅用于 parser，不是目标 App APK，也不可安装；见 [fixture 说明](../rust/src/testdata/README.md)。

@@ -1,6 +1,6 @@
 # 签到页面状态与安全策略
 
-更新时间：2026-10-21（Asia/Shanghai）
+最后核对：2026-10-29（Asia/Shanghai）
 
 ## 三个独立维度
 
@@ -23,6 +23,16 @@ AND second Ready confirmation AND this run has not tapped
 ```
 
 任何未知、失败或页面切换都应停止。点击后只等待结果，不得再次 tap。dry-run 永远不能调用 tap。
+
+## 设备就绪等待不产生任何点击
+
+设备准备（[ADR-0006](./adr/ADR-0006-staged-device-readiness.md)）在页面观测与点击之前按四个阶段等待：实例出现在 `ldconsole list2` → VM `running` → `adb connect` → Android 引导完成（`sys.boot_completed` + `init.svc.bootanim` + 可解析的 `wm size`）。
+
+- 每个阶段只有 `ldconsole` / `adb` 观测与轮询，**不执行 `input tap`、不执行任何页面操作**；等待失败时 `clicked=false` 由结构保证。
+- 首次 `list2` 读取失败时，允许启动的 `run`/`login` 会把它交给 stage 1 重试（并写 `instance_listing_failed` 事件）；不允许启动的路径直接报告控制台错误。两者都不改变任何点击门禁。
+- 等待只影响「设备是否可用」，不放宽本节任何一条门禁：route / mode / 前台包 / 时间窗口 / 校准 Profile / 连续 Ready / 点击前复核全部照常生效。
+- dry-run 与 live 走同一套等待（dry-run 不是离线预览）；等待阶段不会因为配置项而在 live 下额外点击任何东西。
+- 唯一允许在等待期间发生的「写操作」仍然是既有行为：`run` / `login`（`emulator.auto_launch = true` 时）调用 `ldconsole launch` 启动实例，以及 launch 之后的 `adb connect`。设备准备阶段只有 `run` / `login` / `app install`（且 `emulator.auto_launch = true`）会对**已列出但未运行**的实例调用 `ldconsole launch`；`launch=false` 的调用路径（`diagnose`、`profile detect`、`ui dump`、GUI 探测、`profile sync` 的前后读回）不会代为启动实例。`profile sync` 自身的「退出 → 改配置 → 重启」是既有行为，不属于就绪等待，也不会因为本特性新增任何点击。
 
 ## 外勤/未知模式
 

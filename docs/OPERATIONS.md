@@ -1,6 +1,6 @@
 # Windows 安装、配置与运维
 
-更新时间：2026-10-21（Asia/Shanghai）
+最后核对：2026-10-29（Asia/Shanghai）
 
 > 第一次使用请先阅读 [QUICK_START.md](./QUICK_START.md)；本文件用于补充路径、实例、CLI、数据目录和长期运维细节。
 
@@ -74,5 +74,13 @@ zhfd-checkin.exe task query --name ZHFD-AutoCheckin-DryRun
 ```
 
 live 任务/设备运行不由文档默认授权；不要将 live 配置作为无人值守计划任务。
+
+### 计划任务的设备前置条件
+
+- **建议保持实例处于运行状态**。程序会等待实例出现与系统引导，但**不会替你创建实例**。
+- `emulator.auto_launch = true`（默认）时，`run` 会等待实例出现在 `ldconsole list2`（`runtime.instance_appear_timeout_seconds`，默认 30s）并按需调用 `ldconsole launch`（`runtime.startup_timeout_seconds`，默认 30s）；随后等待 ADB 与 Android 引导（`runtime.boot_timeout_seconds`，默认 180s）。
+- `emulator.auto_launch = false` 时不会代为启动：实例未列出报 `instance_not_listed`，已列出但未运行报 `instance_not_running`（退出码 2，没有发生等待）。
+- 冷启动机器上单实例最坏耗时约为 `instance_appear + startup + boot`（默认合计 240 秒），`--all-instances` 为串行、逐实例独立预算。计划任务的触发时间需要留出这段余量。
+- 失败时先在 `events.jsonl` 里看 `wait_started` / `wait_finished` 的 `stage`：`instance_visible`、`instance_launch`、`adb_connect`、`boot` 分别对应四个阶段，`wait_finished.detail` 会给出最后一次探测的缺失条件。
 
 详细历史驱动、旧版本行为和端口采集记录保存在 [归档原件](./archive/2026-10-11/operations/LDPLAYER_ENVIRONMENT.md) 与 [迁移历史](./archive/2026-10-11/architecture/RUST_MIGRATION.md)。

@@ -1,6 +1,6 @@
 # 当前状态（唯一事实源）
 
-- 最后核对：2026-10-26（Asia/Shanghai）
+- 最后核对：2026-11-09（Asia/Shanghai）
 - 仓库：`https://github.com/Barabama/zhfd-checkin`
 - 本文件是**当前状态的唯一事实源**。其他文档只描述稳定知识；状态数字以这里为准。
 
@@ -43,8 +43,8 @@
 ```text
 cargo fmt --all -- --check                     ✅
 cargo clippy --all-targets --all-features -D warnings  ✅
-cargo test --lib                               ✅ 167 passed（v0.3.5；v0.3.2 tag 为 140）
-cargo test --all-targets                       ✅ lib 167 + bin 167（同一批测试跑两次）
+cargo test --lib                               ✅ 199 passed（v0.3.5 + 设备就绪等待；v0.3.2 tag 为 140）
+cargo test --all-targets                       ✅ lib 199 + bin 199（同一批测试跑两次）
 cargo build --release --bins                   ✅
 ```
 
@@ -60,6 +60,7 @@ cargo build --release --bins                   ✅
 | 登录页一键登录（默认关闭） | 是 | 是（153 tests） | 未运行（分支） | 是（2026-10-21 00:23，index 0，900x1600@320；00:58 在 720x1280@320 dry-run 验证预设适配） | **否** |
 | Windows 计划任务 | 是 | 字符串级 | 是 | 是（21:54/22:12 触发） | 部分 |
 | GUI Setup/Repair/迁移 | 是 | 状态机单元测试 | 构建通过 | 未做 GUI 黑盒 | **否** |
+| 设备就绪分阶段等待（ADR-0006） | 是 | 是（199 tests） | 未运行（分支） | 是（2026-10-29 干跑：启动中实例自动拉起 `device_ready_ms≈24s`；三实例 `--all-instances` 串行成功；`instance_not_running`/`instance_not_listed` 错误码与退出码 2/5 现场复现） | **否** |
 
 说明：2026-10-18 的三实例 live 证据来自 `0.3.1-90d086a+dirty` 构建（包含 v0.3.2 的修复但当时未提交），不是 `v0.3.2` tag 产物。它可以证明行为，不能替代对 tag 构建的独立验收。
 
@@ -75,16 +76,22 @@ cargo build --release --bins                   ✅
 - v0.3.3 的自动登录、预设 DPI 调整与模块拆分仍未独立审计；现场只完成一次 live 一键登录（900x1600@320）与一次 720x1280@320 dry-run，且该 live 证据早于最终 pre-tap/dialog 改动（见 AI 审计 EVID-01）。
 - 未关闭项：
   - 其余 P2/P3 见审计报告；多数为诊断、GUI 状态与兼容性问题。
-- 2026-10-26 关闭的发布门禁项（AI 辅助，非独立审计）：**P1-4** 与 **P2-26** 已由 `.github/workflows/release.yml` / `ci.yml` 的改动处理 —— release 现在要求 tag ref、tag 名 == `v<Cargo 版本>`、tag 提交 == checkout 的 HEAD、且 tag 提交在默认分支上；`release` job `needs: verify`（reusable `ci.yml`），asset 名在发布前复核；CI 的 artifact 上传移到 Python/Node 之后。变更记录见 [ENGINEERING_AND_RELEASE.md](./ENGINEERING_AND_RELEASE.md)。
-  - 该改动**尚未**在 GitHub runner 上真实执行过（tag 发布是首次真实运行），本地离线回归见 `scripts/simulate_release_guards.ps1`（15 个场景）。
+- 2026-10-26/27 关闭的发布门禁项（AI 辅助，非独立审计）：**P1-4** 与 **P2-26** 已由 `.github/workflows/release.yml` / `ci.yml` 的改动处理 —— release 现在要求 tag ref、tag 名 == `v<Cargo 版本>`、tag 提交 == checkout 的 HEAD、且 tag 提交在默认分支上；`release` job `needs: verify`（reusable `ci.yml`）；asset 名在发布前复核；**发布前重读远端 tag 并检查已有 Release 的资产名**（tag 被移动或同名版本已发布过别的 commit 时拒绝），`action-gh-release` 显式传 `tag_name`/`target_commitish`；`concurrency` 串行化同一 tag 的发布；CI 的 artifact 上传移到 Python/Node 之后。变更记录见 [ENGINEERING_AND_RELEASE.md](./ENGINEERING_AND_RELEASE.md)。
+  - 该改动**尚未**在 GitHub runner 上真实执行过（tag 发布是首次真实运行），本地离线回归见 `scripts/simulate_release_guards.ps1`（23 个场景）。
+  - **P2-26 的残余**：`release` job 从源码重新构建，不消费 `ci.yml` 上传的 artifact；保证的是「同一份源码通过了门禁」，不是「通过门禁的那份字节被发布」。
 
 ## 5. 已知运行限制
 
 - 平台仅支持 Windows（LDPlayer + ADB + PowerShell + MSVC）。
 - `edition = 2024`，需要 Rust ≥ 1.85；仓库没有 `rust-toolchain.toml`，CI 使用 stable。
-- `location_timeout_seconds` 会被静默钳制在 1–120 秒。
+- `location_timeout_seconds` 会被静默钳制在 1–120 秒；`runtime.instance_appear_timeout_seconds` 在使用处钳制 5–120 秒，`runtime.boot_timeout_seconds` 在使用处钳制 30–600 秒；两者的 `0` 会被配置校验拒绝。
 - `stable_frames = 0` 会被配置校验拒绝；即使绕过校验，`authorize_click` 也会拒绝 0 帧，而不是“立即点击”。
-- 完全关机的 LDPlayer 实例可能不出现在 `ldconsole list2`，`--all-instances` 会报 `LDPlayer 实例不存在`；建议运行前先启动实例。
+- 完全关机的 LDPlayer 实例可能不出现在 `ldconsole list2`。设备准备现在按四个阶段等待（实例出现 → VM `running` → ADB → Android 引导），每阶段独立预算与错误码（[ADR-0006](./adr/ADR-0006-staged-device-readiness.md)）。程序不会替你创建实例；建议运行前先启动实例，或保持 `auto_launch = true`。
+  - `run` / `login` 且 `emulator.auto_launch = true`：等待实例出现（`instance_appear_timeout_seconds`，默认 30s），出现后若未运行则启动；
+  - 等不到实例 → `instance_not_listed`，启动超时 → `instance_launch_timeout`，ADB 未就绪 → `adb_connect_timeout`，系统未引导 → `boot_timeout`（均为退出码 5）；
+  - `auto_launch = false` 时不会代为启动：实例未列出 → `instance_not_listed`，已列出但未运行 → `instance_not_running`（退出码 2，未发生等待）；
+  - `launch=false` 的调用路径（`diagnose`、`profile detect`、`ui dump`、GUI 探测，以及 `profile sync` 的前后读回）在设备准备阶段不等待、不代为启动：实例未列出 → `instance_not_listed`，已列出但未运行 → `instance_not_running`（退出码 2）。`profile sync` 自身的「退出→改配置→重启」流程是既有行为，与就绪等待无关。
+- 冷启动机器上 dry-run 的最坏耗时约为 `instance_appear_timeout_seconds + startup_timeout_seconds + boot_timeout_seconds`（默认 30+30+180 秒）。
 - `task create --all-instances` 与 `--instance-index`/`--serial` 的组合现在由 clap 在解析层拒绝（exit 2）；`--all-instances` 只运行配置中 enabled 的实例。
 - App 若弹出「是否重启App / 当前 App 可能被界面劫持」，运行以 `app_restart_dialog` 停止；程序不点击弹窗，需要人工取消/重启 App 并检查悬浮窗/录屏/辅助功能。
 - 自动登录的点击坐标来自 hierarchy bounds，不依赖 Profile 几何；但 live 运行仍要求 Profile 已标定。当前仅 `portrait_900x1600_d320`（原 900x1600 生产实例）与历史 `portrait_900x1600_d240` 已标定；LDPlayer 预设 1080x1920@480、720x1280@320、540x960@240 仍是占位几何，live 会在 `uncalibrated_profile` 停止，dry-run 可探测登录页。

@@ -1,6 +1,6 @@
 # 快速开始：从首次设置到 dry-run
 
-更新时间：2026-10-21（Asia/Shanghai）
+最后核对：2026-10-29（Asia/Shanghai）
 
 这份指南面向第一次安装的用户。目标是：配置好本机 LDPlayer/ADB，在一个实例上完成一次 dry-run，并知道如何检查结果。第一次请不要直接运行全部实例，也不要启用 live。
 
@@ -62,6 +62,11 @@
 | 结果或现象 | 建议处理 |
 |---|---|
 | `device_setup_failed` / ADB 设备不可用 | 启动模拟器，确认路径、实例 index 和 serial，再回“环境诊断”复查。 |
+| `instance_not_listed` | 实例 index 不存在，或实例已完全退出（不在 `ldconsole list2`）；确认实例名，或先手动启动一次。程序未点击。 |
+| `instance_not_running` | 实例已列出但未运行，且本命令不会自动启动它；先手动启动实例，或保持 `emulator.auto_launch = true` 后重试。 |
+| `instance_launch_timeout` | 实例启动超时（VM 进程未就绪）；手动启动实例后重试。 |
+| `adb_connect_timeout` | ADB 未就绪；确认模拟器已启动并允许 ADB 调试。 |
+| `boot_timeout` | Android 未在预算内完成引导；等待桌面出现后重试，或调大 `runtime.boot_timeout_seconds`。 |
 | `login_required` | 在模拟器中手动登录，再重新运行。默认不会自动登录；只有显式开启 `runtime.allow_auto_login` 与 `runtime.accept_login_terms` 后，live 运行才会尝试一次一键登录。 |
 | `overlay_present` | 根据日志中的包名检查遮挡窗口；在模拟器中手动关闭弹窗/广告后，再重新运行。程序不会自动关闭或点击弹窗。 |
 | `route_candidate_unconfirmed` | 不要让程序猜页面；查看最新截图和层级诊断，手动确认页面后再决定是否重试。 |

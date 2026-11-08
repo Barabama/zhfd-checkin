@@ -2,7 +2,7 @@
 
 > 隐私说明：2026-10-18 对 git 历史进行了重写，以移除测试 fixture 中出现的真实姓名、班级和定位地址。历史文档中出现的旧 commit hash 属于重写前引用；tag 名称（`v0.1.0`–`v0.3.5`）保持不变，指向重写后的对应提交。
 
-> 最后核对：2026-10-26（Asia/Shanghai）。当前状态数字以 [STATUS.md](./STATUS.md) 为准，本文件只维护文档索引。
+> 最后核对：2026-11-09（Asia/Shanghai）。当前状态数字以 [STATUS.md](./STATUS.md) 为准，本文件只维护文档索引。
 
 此处是当前用户文档与工程文档的索引。第一次使用建议按顺序阅读：
 
@@ -27,6 +27,7 @@
 | [adr/](./adr/) | 对冻结决策的修订记录（外勤 opt-in、BACK 回退、迁移持久化、自动登录提议） |
 | [design/](./design/) | 尚未实现的功能设计稿（当前：自动登录/一键登录） |
 | [audits/](./audits/) | 独立审计、修复复核及对应工程记录 |
+| [assets/](./assets/) | 文档与根 README 引用的演示素材（`zhfd-checkin.gif`，已脱敏） |
 | [archive/2026-10-11/](./archive/2026-10-11/) | 历史原件归档 |
 
 ## 历史原件映射
@@ -73,6 +74,7 @@
 | [ADR-0003](./adr/ADR-0003-recorded-data-root.md) | 持久化 GUI 迁移后的数据目录（修订 D-01） |
 | [ADR-0004](./adr/ADR-0004-auto-login-opt-in.md) | 登录页「一键登录」显式 opt-in（已接受，默认关闭） |
 | [ADR-0005](./adr/ADR-0005-login-session-setup.md) | 登录（会话建立）与签到（业务动作）分离：新增 `login` 命令 |
+| [ADR-0006](./adr/ADR-0006-staged-device-readiness.md) | 设备就绪按阶段等待（实例出现 / VM 运行 / ADB / Android 引导），新增两个超时配置键与五个设备错误码 |
 
 ## 设计稿
 

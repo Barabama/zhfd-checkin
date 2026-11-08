@@ -1,6 +1,6 @@
 # 新 AI 上手手册
 
-- 最后核对：2026-10-26
+- 最后核对：2026-10-29
 - 适用对象：第一次接触本仓库的 AI 编码代理或新维护者
 - 当前状态数字以 [STATUS.md](./STATUS.md) 为准；本文件讲稳定的结构与规则。
 
@@ -53,7 +53,7 @@ git log --oneline -5
 git tag --list
 git rev-list -n1 v0.3.5
 cd rust
-cargo test --lib          # 预期 167 passed（v0.3.2 tag 为 140）
+cargo test --lib          # 预期 199 passed（v0.3.2 tag 为 140）
 ```
 
 在看代码之前，先确认你不在一个脏工作区、没有待发布的本地改动。
@@ -179,7 +179,7 @@ CLI 与 GUI **共享** `main.rs` 的业务函数：`run`、`diagnose`、`task_co
 3. RunLog 目录 + RunResult(schema_version=3)
 4. --all-instances：shared preflight → 逐实例 run → batch summary
 5. 单实例：
-   device_setup → profile 检测 → 启动 App → 等待前台
+   device_setup（四阶段等待，见 6.1）→ profile 检测 → 启动 App → 等待前台
    → auto_login（仅 allow_auto_login；登录页才生效）
    → locate_or_navigate（stale 页刷新 / 导航 / 观测）
    → 外层模式分支（field work 或普通）
@@ -188,6 +188,35 @@ CLI 与 GUI **共享** `main.rs` 的业务函数：`run`、`diagnose`、`task_co
    → 点击后只等待成功确认，不再点击
 6. finalize_run：status/error_code/artifact_paths，写 result.json 与 finish 事件
 ```
+
+### 6.1 设备准备（`runtime_with_target_recording`）
+
+按阶段等待，每阶段独立预算、`wait_started`/`wait_finished` 事件与失败码（[ADR-0006](./adr/ADR-0006-staged-device-readiness.md)）：
+
+```text
+LdPlayer::discover
+→ ld.instances()（一次 list2 快照）
+→ resolve_instance_intent（只解析 index/serial/name，不要求已出现）
+→ [stage 1] 实例出现     instance_appear_timeout_seconds（30，钳制 5–120）
+→ [stage 2] VM running   startup_timeout_seconds（30）
+→ [stage 3] adb connect  startup_timeout_seconds（30）
+→ [stage 4] Android 引导 boot_timeout_seconds（180，钳制 30–600）
+→ device.info()
+```
+
+| 条件 | 行为 |
+|---|---|
+| 实例已列出且 `running` | 跳过 stage 1/2 |
+| 实例未列出 + `run`/`login` + `auto_launch=true` | stage 1 等待出现；出现后若仍未运行则进入 stage 2。**不调用 `launch`**：`launch_wait` 会先重读 `list2`，对未列出的实例无法启动 |
+| 实例已列出但未运行 + 允许启动 | stage 2 `launch_wait` |
+| 实例未列出 + `launch=false` 的调用（`diagnose`/`profile detect`/`ui dump`/GUI 探测/`profile sync` 的前后读回） | 立即 `instance_not_listed`，不等待、不代为启动 |
+| 实例已列出但未运行 + 不允许启动 | 立即 `instance_not_running` |
+
+引导判定需同时满足：`sys.boot_completed == 1`、`init.svc.bootanim` 为 `stopped`（缺失/为空视为未知）、`wm size` 可解析。引导期间单次 `shell` 失败只记录、不放弃；每次探测的最后一个快照写入 `wait_finished.detail`。
+
+首次 `ldconsole list2` 读取本身失败时（LDPlayer 正在重启等）：允许启动的 `run`/`login` 把它交给 stage 1 重试，并写 `instance_listing_failed` 事件；不允许启动的路径直接把控制台错误作为失败原因返回。
+
+所有等待都发生在任何页面观测与点击之前，因此等待失败时 `clicked=false` 由结构保证。
 
 证据目录：
 
@@ -220,9 +249,9 @@ CLI 与 GUI **共享** `main.rs` 的业务函数：`run`、`diagnose`、`task_co
 | 前台检查 | `log_foreground_snapshot` / `foreground_check` foreground.rs | FR-013 前台包观测与分类 |
 | 点击门禁 | `guarded_tap` main.rs:2745 | route/mode + click policy |
 | 日期解析 | `extract_hierarchy_date` main.rs:1916 | 成功日期与冲突规则 |
-| 测试 | main.rs / page.rs / auto_login.rs 测试模块 | 约 167 个测试 |
+| 测试 | main.rs / page.rs / auto_login.rs / adb.rs / ldplayer.rs / wait.rs 测试模块 | 约 199 个测试 |
 
-**高风险区域**：`run_inner_with_device` 与 `locate_or_navigate`。不要盲格式化、移动或重排；先读对应测试，再改。
+**高风险区域**：`run_inner_with_device`、`stage_device`/`runtime_with_target_recording` 与 `locate_or_navigate`。不要盲格式化、移动或重排；先读对应测试，再改。
 
 对应策略在 `domain.rs`：
 
@@ -256,7 +285,7 @@ pwsh -NoProfile -File scripts/portable_smoke.ps1 `
   -FixturePath "$PWD/autojs6/fixtures/ready.png"
 ```
 
-`cargo test --lib` = 167 passed。`cargo test --all-targets` 会在 lib 与 bin 各跑一次。
+`cargo test --lib` = 199 passed。`cargo test --all-targets` 会在 lib 与 bin 各跑一次。
 
 ### 8.3 构建溯源
 
@@ -273,7 +302,7 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 ### 8.4 CI / Release
 
 - `.github/workflows/ci.yml`：push/PR/tag → fmt、clippy、test、release guard 离线回归、release build、portable smoke、provenance、打包 artifact、Python、Node；artifact 上传在 Python/Node 之后。也作为 reusable workflow（`workflow_call`）供 release 复用。
-- `.github/workflows/release.yml`：`v*` tag push（或手动重跑某个 tag）→ 先以 reusable workflow 跑上面整套 CI（`verify` job）→ release guard（tag ref / tag 名 == `v<Cargo 版本>` / tag 提交 == checkout HEAD / tag 提交在默认分支上）→ 构建 → portable smoke → 打包 → asset guard → 发布 GitHub Release。
+- `.github/workflows/release.yml`：`v*` tag push（或手动重跑某个 tag）→ 先以 reusable workflow 跑上面整套 CI（`verify` job）→ release guard（tag ref / tag 名 == `v<Cargo 版本>` / tag 提交 == checkout HEAD / tag 提交在默认分支上）→ 构建 → portable smoke → 打包 → asset guard → pre-publish guard（重读远端 tag、检查已有 Release 的资产名）→ 发布 GitHub Release。
 - 发布门禁已加固（2026-10-26）；细节与离线回归见 [ENGINEERING_AND_RELEASE.md](./ENGINEERING_AND_RELEASE.md)。发布前仍先确认 CI 在**同一个 commit** 上为绿。
 
 ### 8.5 发布资产
@@ -308,6 +337,19 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 | 配置写入 | 同目录临时文件 + 原子替换 + 时间戳备份，保留最近 5 份 |
 | `captures/` | 会创建，但 Rust 代码当前不写入 |
 | `backups/` | 配置备份目录 |
+
+### 9.2.1 设备就绪与超时配置
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `emulator.auto_launch` | `true` | 允许 `run`/`login`/`app install` 对**已列出但未运行**的实例调用 `ldconsole launch`；`launch=false` 的调用路径永不受益于此。完全不在 `list2` 的实例无法被这条路径启动（`launch_wait` 会先重读 `list2`） |
+| `runtime.startup_timeout_seconds` | `30` | 「启动命令 → VM `running`」与「`adb connect` 重试」的预算（语义未变） |
+| `runtime.instance_appear_timeout_seconds` | `30` | 等待实例出现在 `ldconsole list2` 的预算，使用时钳制 5–120 |
+| `runtime.boot_timeout_seconds` | `180` | 等待 guest Android 完成引导的预算，使用时钳制 30–600 |
+
+- 两个新键的 `0` 由 `Config::validate` 拒绝；上限只在使用处钳制（与 `location_timeout_seconds` 相同模式），避免新增校验把已有配置打进 Repair。
+- 旧 `config.toml` 没有这两个键时按 serde 默认值解析，无需迁移。
+- GUI 暂未暴露这两个键，只能编辑配置文件。
 
 ### 9.3 自动登录配置
 
@@ -379,6 +421,20 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 | 3 | 视觉/页面失败 |
 | 4 | 配置/未分类错误（任何逃逸的 `anyhow` 错误） |
 | 5 | 超时 |
+
+### 11.1.1 设备就绪错误码
+
+| code | 退出码 | 触发条件 |
+|---|---|---|
+| `instance_not_listed` | 5 | 实例未出现在 `ldconsole list2`（等待预算用尽，或本命令不允许启动实例） |
+| `instance_launch_timeout` | 5 | 实例未在 `startup_timeout_seconds` 内进入 `running` |
+| `adb_connect_timeout` | 5 | `adb connect` / `get-state` 未在 `startup_timeout_seconds` 内就绪 |
+| `boot_timeout` | 5 | Android 未在 `boot_timeout_seconds` 内完成引导 |
+| `instance_not_running` | 2 | 实例已列出但未运行，且本命令不会启动它（没有发生等待，因此不是超时） |
+
+- 全部使用 `error_stage = "device_setup"`；
+- `device_setup_failed`（退出码 2）保留给非等待类 I/O 故障（`ldconsole`/`adb` 无法执行）；
+- 错误码随类型化错误（`domain::DeviceWaitFailure`）传播，不从 `error_stage` 反推，也不会被额外的 `.context()` 覆盖。
 
 ### 11.2 `result.json`
 
@@ -470,7 +526,7 @@ zhfd-checkin.exe analyze-image --image .\ready.png   # alias: vision
 
 - [ ] 读 `docs/STATUS.md` 与本文；
 - [ ] `git status -sb` 确认工作区干净；
-- [ ] `cargo test --lib` 确认 167 passed（v0.3.2 tag 为 140）；
+- [ ] `cargo test --lib` 确认 199 passed（v0.3.2 tag 为 140）；
 - [ ] 找到 `guarded_tap`、`authorize_click`、`run_inner_with_device`；
 - [ ] 确认自己没有运行任何 live/设备命令；
 - [ ] 明确本次任务是否触及 Frozen 决策（若是，先写 ADR）。
