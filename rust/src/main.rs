@@ -13,6 +13,7 @@ mod logger;
 mod page;
 mod process;
 mod profile;
+mod ui_text;
 mod vision;
 mod wait;
 
@@ -3591,7 +3592,7 @@ fn unconfirmed_page_failure(overlay: Option<&str>) -> (&'static str, String) {
         ),
         None => (
             "route_candidate_unconfirmed",
-            "页面层级可读，但没有页面身份标记（可能被弹窗遮挡，或页面尚未渲染完成）；请手动确认页面后重试。"
+            "无法确认签到页面。请在模拟器中检查是否显示“无晚点名清单”、页面尚未加载或有弹窗遮挡。程序已停止，未点击签到。"
                 .to_string(),
         ),
     }

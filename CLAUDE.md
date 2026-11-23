@@ -36,7 +36,7 @@ git tag --list
 cd rust; cargo test --lib
 ```
 
-当前基线：Cargo `0.3.5`，最新 tag `v0.3.5`，`cargo test --lib` 199 passed。HEAD 可能比 tag 多 docs-only 提交。
+当前基线：Cargo `0.3.5`，最新 tag `v0.3.5`，`cargo test --lib` 211 passed。HEAD 可能比 tag 多 docs-only 提交。
 
 ## 环境
 
@@ -50,7 +50,7 @@ cd rust; cargo test --lib
 cd rust
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib                 # 199 tests
+cargo test --lib                 # 211 tests
 cargo build --release --bins     # 必须 --bins：CLI 与 GUI 一起
 ```
 
@@ -79,6 +79,7 @@ zhfd-checkin.exe run --dry-run --instance-index 0
 | `rust/src/auto_login.rs` | 登录页识别、协议复选框、一次一键登录与结果字段（不依赖 Profile 几何） |
 | `rust/src/domain.rs` | 页面/业务/状态枚举、点击授权、自动登录策略、结果结构、时间窗口 |
 | `rust/src/config.rs` | 配置 schema、data root、原子保存/备份、迁移、恢复 |
+| `rust/src/ui_text.rs` | GUI 文案表（中文 / English）、术语与状态人话映射、错误提示 |
 | `rust/src/gui.rs` | egui 界面（Setup/Repair、运行、诊断、日志、计划任务） |
 | `rust/src/adb.rs` | ADB、截图、hierarchy dump、前台/overlay 观测 |
 | `rust/src/ldplayer.rs` | ldconsole 发现与实例控制 |
@@ -114,6 +115,7 @@ extract_hierarchy_date main.rs:2079
 - 登录页默认 `login_required`；只有 `allow_auto_login` + `accept_login_terms` + live/confirm 才允许一次一键登录；不输入/保存凭据，一次运行最多一次登录点击。
 - 数据根单一；配置写入原子替换 + 备份；Repair 状态禁止普通 save/migrate。
 - 成功日期只采信目标 package 节点；冲突时返回 unknown。
+- GUI 用户可见文案只来自 `ui_text.rs`（中文 / English 同表）；主界面不展示裸机器字段，原始值只在“技术详情”折叠区或证据页。`ui.language` 只影响展示。
 
 ## 配置与数据根
 
@@ -126,6 +128,7 @@ extract_hierarchy_date main.rs:2079
 - `stable_frames = 0` 会被配置校验拒绝；即使绕过，`authorize_click` 也拒绝 0 帧。
 - 自动登录相关：`allow_auto_login`、`accept_login_terms` 默认均为 false；`auto_login_account` 为可选期望账号（本机配置，禁止提交）；`auto_login_timeout_seconds` 使用时钳制 5–120 秒。
 - 设备就绪相关：`emulator.auto_launch`（默认 true）决定 `run`/`login` 能否启动实例；`startup_timeout_seconds` 语义不变（启动命令→VM running、adb connect 重试）；`instance_appear_timeout_seconds`（默认 30）与 `boot_timeout_seconds`（默认 180）是新键，见 ADR-0006。
+- 界面相关：`ui.language` 只接受 `"zh"` 或 `"en"`，默认 `"zh"`；旧配置没有 `[ui]` 段时按默认值解析。它不影响任何运行或门禁。
 
 ## 文档规则
 
@@ -135,6 +138,7 @@ extract_hierarchy_date main.rs:2079
 - 审计报告是时点证据，只追加 remediation，不改写历史结论。
 - 2026-10-18 重写过 git 历史；旧 SHA 是 pre-rewrite 引用，不要当作可解析提交。
 - 不提交 PII；fixtures 必须保持脱敏。
+- 改 GUI 文案时同步 `rust/src/ui_text.rs`（两种语言）与 `docs/GLOSSARY.md`，不要只改一处。
 
 ## 完成定义
 

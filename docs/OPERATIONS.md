@@ -1,6 +1,6 @@
 # Windows 安装、配置与运维
 
-最后核对：2026-10-29（Asia/Shanghai）
+最后核对：2026-11-23（Asia/Shanghai）
 
 > 第一次使用请先阅读 [QUICK_START.md](./QUICK_START.md)；本文件用于补充路径、实例、CLI、数据目录和长期运维细节。
 
@@ -35,6 +35,17 @@ enabled = true
 ```
 
 空的 `serial` 表示按实例 index 推导 TCP ADB serial；用户指定 serial 会覆盖该实例默认值。请勿把 `list2` 的 `ldplayer_reported_port` 当成 TCP ADB serial。
+
+## 界面语言
+
+GUI 支持中文与 English，在“关于”页切换，写入 `[ui] language`：
+
+```toml
+[ui]
+language = "zh"   # "zh" 或 "en"
+```
+
+只影响展示，不改变运行、门禁或结果字段；旧配置没有 `[ui]` 段时按 `zh` 解析。界面文案与术语见 [GLOSSARY.md](./GLOSSARY.md)。
 
 ## 依赖发现与诊断
 

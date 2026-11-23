@@ -1,6 +1,6 @@
 # 当前状态（唯一事实源）
 
-- 最后核对：2026-11-09（Asia/Shanghai）
+- 最后核对：2026-11-24（Asia/Shanghai）
 - 仓库：`https://github.com/Barabama/zhfd-checkin`
 - 本文件是**当前状态的唯一事实源**。其他文档只描述稳定知识；状态数字以这里为准。
 
@@ -10,12 +10,13 @@
 |---|---|
 | 默认分支 | `master` |
 | HEAD（发布） | `c60918c`（`v0.3.5` tag） |
-| master HEAD | `8c7009c`（比 tag 多 2 个 docs-only 提交） |
-| HEAD 与远端 | 与 `origin/master` 同步 |
-| Cargo 版本 | `0.3.5` |
+| master HEAD | 以 `git rev-parse master` 为准 |
+| Cargo 版本 | `0.3.6` |
 | `v0.3.5` tag commit | `c60918c` |
 | 最新 GitHub Release | `v0.3.5` |
 | Release 资产 | `zhfd-checkin-windows-x64-v0.3.5-c60918c14b28.zip` |
+
+> `v0.3.6` 包含设备分阶段就绪、双语界面、全页目录和签到页未确认提示。标签推送后由 GitHub Actions 构建发布；资产状态以 GitHub Releases 为准。未确认提示不改变任何点击门禁。
 
 > `v0.3.5` 已发布（PR #3）：Phase 2a（变更型命令确认、run 摘要/`--json`、alias）、Phase 2b（独立 `login --confirm-login`，ADR-0005）、Phase 3a（`commands.rs`/`cli.rs`、`RunPolicy`、GUI 去 clap、设备退出码）、以及 App「是否重启App / 界面劫持」弹窗识别（`app_restart_dialog`，不自动点击）。
 
@@ -43,8 +44,7 @@
 ```text
 cargo fmt --all -- --check                     ✅
 cargo clippy --all-targets --all-features -D warnings  ✅
-cargo test --lib                               ✅ 199 passed（v0.3.5 + 设备就绪等待；v0.3.2 tag 为 140）
-cargo test --all-targets                       ✅ lib 199 + bin 199（同一批测试跑两次）
+cargo test --lib                               ✅ 216 passed（含固定尺寸 GUI 用户场景）
 cargo build --release --bins                   ✅
 ```
 
@@ -60,7 +60,8 @@ cargo build --release --bins                   ✅
 | 登录页一键登录（默认关闭） | 是 | 是（153 tests） | 未运行（分支） | 是（2026-10-21 00:23，index 0，900x1600@320；00:58 在 720x1280@320 dry-run 验证预设适配） | **否** |
 | Windows 计划任务 | 是 | 字符串级 | 是 | 是（21:54/22:12 触发） | 部分 |
 | GUI Setup/Repair/迁移 | 是 | 状态机单元测试 | 构建通过 | 未做 GUI 黑盒 | **否** |
-| 设备就绪分阶段等待（ADR-0006） | 是 | 是（199 tests） | 未运行（分支） | 是（2026-10-29 干跑：启动中实例自动拉起 `device_ready_ms≈24s`；三实例 `--all-instances` 串行成功；`instance_not_running`/`instance_not_listed` 错误码与退出码 2/5 现场复现） | **否** |
+| GUI 新手文案与中文 / English 双语 | 是 | 是（211 tests，含文案表完整性与源码回归） | 未运行（分支） | 未做 GUI 黑盒 | **否** |
+| 设备就绪分阶段等待（ADR-0006） | 是 | 是（211 tests） | 未运行（分支） | 是（2026-10-29 干跑：启动中实例自动拉起 `device_ready_ms≈24s`；三实例 `--all-instances` 串行成功；`instance_not_running`/`instance_not_listed` 错误码与退出码 2/5 现场复现） | **否** |
 
 说明：2026-10-18 的三实例 live 证据来自 `0.3.1-90d086a+dirty` 构建（包含 v0.3.2 的修复但当时未提交），不是 `v0.3.2` tag 产物。它可以证明行为，不能替代对 tag 构建的独立验收。
 

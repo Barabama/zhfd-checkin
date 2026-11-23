@@ -2,16 +2,17 @@
 
 > 隐私说明：2026-10-18 对 git 历史进行了重写，以移除测试 fixture 中出现的真实姓名、班级和定位地址。历史文档中出现的旧 commit hash 属于重写前引用；tag 名称（`v0.1.0`–`v0.3.5`）保持不变，指向重写后的对应提交。
 
-> 最后核对：2026-11-09（Asia/Shanghai）。当前状态数字以 [STATUS.md](./STATUS.md) 为准，本文件只维护文档索引。
+> 最后核对：2026-11-23（Asia/Shanghai）。当前状态数字以 [STATUS.md](./STATUS.md) 为准，本文件只维护文档索引。
 
 此处是当前用户文档与工程文档的索引。第一次使用建议按顺序阅读：
 
 1. [当前状态（唯一事实源）](./STATUS.md)：HEAD、tag、Release、CI、审计与未关闭项。
 2. [新 AI 上手手册](./AI_ONBOARDING.md)：安全模型、代码地图、配置语义、陷阱与 recipes。
 3. [快速开始](./QUICK_START.md)：从准备环境、首次设置，到首次单实例 dry-run。
-4. GUI 左侧的“快速使用”：在程序内查看分步流程、结果解释和常见故障处理。
-5. [Windows 安装、配置与运维](./OPERATIONS.md)：依赖路径、实例、数据目录、CLI 和计划任务。
-6. [签到安全策略](./CHECKIN_SAFETY.md)：dry-run/live 边界、点击门禁、外勤限制和成功判定。
+4. GUI 左侧的“快速使用”：在程序内查看分步流程、结果解释和常见故障处理；界面支持中文 / English，可在“关于”页切换。
+5. [术语表](./GLOSSARY.md)：实例、编号、ADB 地址、屏幕预设、页面、签到类型与签到状态的关系。
+6. [Windows 安装、配置与运维](./OPERATIONS.md)：依赖路径、实例、数据目录、CLI 和计划任务。
+7. [签到安全策略](./CHECKIN_SAFETY.md)：dry-run/live 边界、点击门禁、外勤限制和成功判定。
 
 ## 当前主题入口
 
@@ -20,6 +21,7 @@
 | [STATUS.md](./STATUS.md) | 当前 HEAD/tag/Release/CI/审计状态；唯一事实源 |
 | [AI_ONBOARDING.md](./AI_ONBOARDING.md) | 新 AI/新维护者上手：架构、门禁、代码地图、错误契约、隐私规则 |
 | [快速开始](./QUICK_START.md) | 新用户首次运行流程、最小安全检查、dry-run 和结果确认 |
+| [术语表](./GLOSSARY.md) | 实例 / 编号 / ADB 地址 / 屏幕预设 / 页面 / 签到类型 / 签到状态；与 GUI 文案同源 |
 | [OPERATIONS.md](./OPERATIONS.md) | Windows 便携部署、TOML 配置、依赖发现、模拟器/实例/CLI 操作 |
 | [CHECKIN_SAFETY.md](./CHECKIN_SAFETY.md) | 页面路由、签到业务类型、点击门禁、成功日期、证据边界 |
 | [PRODUCT_AND_ARCHITECTURE.md](./PRODUCT_AND_ARCHITECTURE.md) | 产品职责、目标架构、Phase 状态与系统级待办 |

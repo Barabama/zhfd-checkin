@@ -3,6 +3,7 @@ use crate::commands::{
 };
 use crate::config::ConfigStore;
 use crate::domain::RunResult;
+use crate::ui_text::{self, Key, Lang, t};
 use crate::{
     analyze_image_file, dependency_diagnostics, diagnose, dump_ui_hierarchy, inspect_apk_metadata,
     install_apk, installed_app_version, list_instance_summaries, run, runtime_with_target,
@@ -18,8 +19,9 @@ use std::thread;
 /// damaged config never leaves the user without a recovery entry point.
 pub fn launch(store: ConfigStore, startup_error: Option<String>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions::default();
+    let title = t(Lang::from_config(&store.config.ui.language), Key::AppTitle);
     eframe::run_native(
-        "智汇福大自动签到",
+        title,
         options,
         Box::new(move |cc| {
             configure_fonts(&cc.egui_ctx);
@@ -184,14 +186,16 @@ impl GuiApp {
         let migration_target = config::recommended_local_app_data_root()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
+        let lang = Lang::from_config(&store.config.ui.language);
+        let status = if setup_required {
+            t(lang, Key::StatusNeedsSetup)
+        } else {
+            t(lang, Key::StatusReady)
+        };
         Self {
             store,
             tab: if setup_required { SETUP_TAB } else { 0 },
-            status: if setup_required {
-                "需要完成首次配置或修复配置后继续。".into()
-            } else {
-                "就绪。默认模式为 dry-run。".into()
-            },
+            status: status.into(),
             dependency_report: None,
             selected_ldplayer_candidate: None,
             selected_adb_candidate: None,
@@ -233,6 +237,23 @@ impl GuiApp {
         }
     }
 
+    /// Current interface language, read from the config every frame so a
+    /// switch takes effect immediately.
+    fn lang(&self) -> Lang {
+        Lang::from_config(&self.store.config.ui.language)
+    }
+
+    fn set_language(&mut self, lang: Lang) {
+        if self.lang() == lang {
+            return;
+        }
+        self.store.config.ui.language = lang.code().into();
+        self.status = match self.store.save() {
+            Ok(()) => t(lang, Key::LanguageSaved).into(),
+            Err(error) => format!("{}: {error:#}", t(lang, Key::CommonFailed)),
+        };
+    }
+
     fn start_background_job<F>(&mut self, label: impl Into<String>, task: F) -> bool
     where
         F: FnOnce() -> String + Send + 'static,
@@ -250,7 +271,7 @@ impl GuiApp {
         F: FnOnce() -> (String, Option<String>) + Send + 'static,
     {
         if self.job.is_some() {
-            self.status = "已有任务运行中".into();
+            self.status = t(self.lang(), Key::StatusJobBusy).into();
             return false;
         }
         let label = label.into();
@@ -263,7 +284,7 @@ impl GuiApp {
                 installed_version,
             });
         });
-        self.status = format!("{} 已启动，正在后台运行……", label);
+        self.status = t(self.lang(), Key::StatusJobStarted).replace("{}", &label);
         self.job = Some(GuiJob {
             label,
             kind,
@@ -274,7 +295,7 @@ impl GuiApp {
 
     fn start_dependency_scan(&mut self) {
         if self.dependency_scan.is_some() {
-            self.status = "依赖扫描正在运行".into();
+            self.status = t(self.lang(), Key::ScanRunning).into();
             return;
         }
         self.dependency_report = None;
@@ -290,7 +311,7 @@ impl GuiApp {
             }
         });
         self.dependency_scan = Some(slot);
-        self.status = "正在扫描 LDPlayer / ADB 依赖……".into();
+        self.status = t(self.lang(), Key::ScanStarted).into();
     }
 
     fn instance_target(&self) -> InstanceTargetArgs {
@@ -366,25 +387,45 @@ impl GuiApp {
         let all_instances = self.run_all_instances;
         // All-instances mode must not carry a single-instance selector.
         let target = run_target_for_selection(all_instances, self.selected_instance_index);
-        let label = if live { "live 运行" } else { "dry-run" };
+        let lang = self.lang();
+        let label = t(
+            lang,
+            if live {
+                Key::ModeLiveShort
+            } else {
+                Key::ModeDryRunShort
+            },
+        );
         self.start_background_job(label, move || {
-            match run(
-                &store,
-                RunRequest {
-                    requested_mode: if live {
-                        RequestedMode::Live
-                    } else {
-                        RequestedMode::DryRun
-                    },
-                    explicit_confirmation: live,
-                    all_instances,
-                    json: true,
-                    target,
+            let request = RunRequest {
+                requested_mode: if live {
+                    RequestedMode::Live
+                } else {
+                    RequestedMode::DryRun
                 },
-                RunSource::Gui,
-            ) {
-                Ok(code) => format!("完成，退出码 {:?}", code),
-                Err(error) => format!("失败: {:#}", error),
+                explicit_confirmation: live,
+                all_instances,
+                json: true,
+                target,
+            };
+            let outcome = if all_instances {
+                run(&store, request, RunSource::Gui).map(|code| (code, None))
+            } else {
+                crate::domain::Mode::from_config(&store.config.runtime.mode).and_then(|mode| {
+                    crate::run_single(&store, &request.resolve(mode, RunSource::Gui))
+                        .map(|(code, result)| (code, result.error_code))
+                })
+            };
+            match outcome {
+                Ok((_, Some(error_code))) if error_code == "route_candidate_unconfirmed" => {
+                    t(lang, Key::PageUnconfirmed).into()
+                }
+                Ok((code, _)) => format!(
+                    "{}: {}",
+                    t(lang, Key::CommonFinished),
+                    ui_text::exit_code_label(lang, code)
+                ),
+                Err(error) => format!("{}: {error:#}", t(lang, Key::CommonFailed)),
             }
         });
     }
@@ -411,7 +452,7 @@ impl GuiApp {
                 }
                 self.load_selected_log_artifact();
             }
-            Err(error) => self.status = format!("读取运行日志失败: {:#}", error),
+            Err(error) => self.status = format!("{}: {error:#}", t(self.lang(), Key::CommonFailed)),
         }
     }
 
@@ -437,7 +478,7 @@ impl GuiApp {
     /// freeze the window whenever one of those tools hangs.
     fn start_setup_validation(&mut self) {
         if self.setup_validation.is_some() {
-            self.status = "依赖验证正在运行".into();
+            self.status = t(self.lang(), Key::ValidationRunning).into();
             return;
         }
         let store = self.store.clone();
@@ -453,7 +494,7 @@ impl GuiApp {
             }
         });
         self.setup_validation = Some(slot);
-        self.status = "正在验证 LDPlayer / ADB 并读取实例……".into();
+        self.status = t(self.lang(), Key::ValidationStarted).into();
     }
 
     fn poll_setup_validation(&mut self) {
@@ -465,22 +506,23 @@ impl GuiApp {
             return;
         };
         self.setup_validation = None;
+        let lang = self.lang();
         match outcome {
             Ok(summary) => {
                 self.setup_error = None;
-                self.setup_notice =
-                    Some(format!("{summary}（已验证工具并读取到实例；尚未写入配置）"));
-                self.status = "依赖验证通过".into();
+                self.setup_notice = Some(t(lang, Key::ValidationSummary).replace("{}", &summary));
+                self.status = t(lang, Key::ValidationPassed).into();
             }
             Err(error) => {
-                self.setup_error = Some(format!("验证失败：{error}"));
+                self.setup_error = Some(t(lang, Key::ValidationFailed).replace("{}", &error));
                 self.setup_notice = None;
-                self.status = "依赖验证失败".into();
+                self.status = t(lang, Key::CommonFailed).into();
             }
         }
     }
 
     fn migrate_data_root(&mut self, destination: std::path::PathBuf) {
+        let lang = self.lang();
         match self.store.migrate_to_root(&destination) {
             Ok(store) => {
                 // Record only from the GUI entry point: the library migration
@@ -492,27 +534,29 @@ impl GuiApp {
                 self.adopt_store(store);
                 match recorded {
                     Ok(()) => {
-                        self.setup_notice = Some(format!(
-                            "数据目录已迁移到 {}；源目录保留未删除。",
-                            root.display()
-                        ));
-                        self.status = "数据目录迁移完成".into();
+                        self.setup_notice = Some(
+                            t(lang, Key::MigrationRecorded)
+                                .replace("{}", &root.display().to_string()),
+                        );
+                        self.status = t(lang, Key::StatusDone).into();
                     }
                     Err(error) => {
-                        self.setup_error = Some(format!(
-                            "数据已复制到 {}，但无法记录新数据目录；重启后会回到旧目录：{error:#}",
-                            root.display()
-                        ));
-                        self.status = "数据目录迁移未完成（记录新目录失败）".into();
+                        self.setup_error = Some(
+                            t(lang, Key::MigrationRecordFailed)
+                                .replacen("{}", &root.display().to_string(), 1)
+                                .replacen("{}", &format!("{error:#}"), 1),
+                        );
+                        self.status = t(lang, Key::MigrationIncomplete).into();
                     }
                 }
             }
             Err(error) => {
                 // A failed migration must leave the store on the original root.
-                self.setup_error = Some(format!(
-                    "迁移失败，仍使用原数据目录 {}：{error:#}",
-                    self.store.root.display()
-                ));
+                self.setup_error = Some(
+                    t(lang, Key::MigrationFailed)
+                        .replacen("{}", &self.store.root.display().to_string(), 1)
+                        .replacen("{}", &format!("{error:#}"), 1),
+                );
             }
         }
     }
@@ -531,7 +575,7 @@ impl GuiApp {
             Err(error) => {
                 self.selected_log_artifact = None;
                 self.selected_log_preview = None;
-                self.status = format!("读取选中日志失败: {error:#}");
+                self.status = format!("{}: {error:#}", t(self.lang(), Key::CommonFailed));
             }
         }
         self.refresh_events();
@@ -549,7 +593,7 @@ impl GuiApp {
                 self.latest_result = None;
                 self.refresh_logs();
             }
-            Err(error) => self.status = format!("读取运行结果失败: {:#}", error),
+            Err(error) => self.status = format!("{}: {error:#}", t(self.lang(), Key::CommonFailed)),
         }
     }
 
@@ -597,9 +641,10 @@ impl GuiApp {
         match logger::write_diagnostic_report(&self.store) {
             Ok(path) => {
                 self.report_path = Some(path.display().to_string());
-                self.status = format!("诊断报告已导出: {}", path.display());
+                self.status = t(self.lang(), Key::StatusReportExported)
+                    .replace("{}", &path.display().to_string());
             }
-            Err(error) => self.status = format!("诊断报告导出失败: {:#}", error),
+            Err(error) => self.status = format!("{}: {error:#}", t(self.lang(), Key::CommonFailed)),
         }
     }
 
@@ -607,8 +652,10 @@ impl GuiApp {
         self.apk_path = config::path_for_config(&self.store.root, &path);
         self.store.config.app.apk_path = self.apk_path.clone();
         match self.store.save() {
-            Ok(()) => self.status = format!("已保存 APK 路径: {}", self.apk_path),
-            Err(e) => self.status = format!("保存配置失败: {:#}", e),
+            Ok(()) => {
+                self.status = t(self.lang(), Key::StatusApkPathSaved).replace("{}", &self.apk_path)
+            }
+            Err(e) => self.status = format!("{}: {e:#}", t(self.lang(), Key::CommonFailed)),
         }
     }
 }
@@ -628,115 +675,18 @@ fn ordered_profiles() -> Vec<&'static profile::Profile> {
     profiles
 }
 
-fn run_result_status(result: &RunResult) -> String {
-    if result.success {
-        "success_today".into()
-    } else if result.field_work_ready {
-        "field_work_ready (dry-run only)".into()
-    } else if result.dry_run_ready {
-        "dry_run_ready".into()
-    } else {
-        result.error.clone().unwrap_or_else(|| "incomplete".into())
-    }
-}
-
-fn auto_login_status(result: &RunResult) -> Option<&'static str> {
+fn auto_login_status(lang: Lang, result: &RunResult) -> Option<&'static str> {
     if result.auto_login_attempted == Some(true) {
         return Some(match result.auto_login_succeeded {
-            Some(true) => "已执行一键登录，并确认离开登录页",
-            Some(false) => "已执行一键登录，但未确认成功",
-            None => "已执行一键登录，结果未知",
+            Some(true) => t(lang, Key::AutoLoginDone),
+            Some(false) => t(lang, Key::AutoLoginUnconfirmed),
+            None => t(lang, Key::AutoLoginUnknown),
         });
     }
     if result.auto_login_ready == Some(true) {
-        return Some("dry-run：登录页前置条件满足，未点击");
+        return Some(t(lang, Key::AutoLoginDryReady));
     }
     None
-}
-
-fn explain_error(error: &str) -> &'static str {
-    match error {
-        "unknown_state" => "视觉状态未能确认；请查看最新日志截图。",
-        "overlay_present" => {
-            "检测到非目标应用的窗口（弹窗/广告）遮挡了页面；请手动关闭后重新运行，程序未点击。"
-        }
-        "stale_page_refresh_failed" => "启动时停留在旧签到页且返回后未回到服务页；请手动返回首页。",
-        "stale_page_refresh_unconfirmed" => {
-            "启动时停留在旧签到页且返回后页面无法读取；请手动返回首页。"
-        }
-        "location_timeout" | "location_wait_timeout" => {
-            "定位等待达到上限；已保留最后一轮证据并安全停止，未执行点击。"
-        }
-        "shared_preflight_failed" => {
-            "公共依赖(ldconsole.exe / adb.exe)不可用；本批次没有启动任何设备。"
-        }
-        "runtime_error" => "运行时出现未分类错误；请查看诊断报告和最新截图。",
-        "success_timeout" => "点击后未在超时内确认成功；请人工核对页面。",
-        "outside_window" => "当前不在配置的签到时间窗口；未执行点击。",
-        "foreground_package_changed" | "target_app_not_foreground" => {
-            "目标 App 已离开前台（可能退到了桌面）；安全策略阻止继续操作，程序未点击。请在模拟器中手动把 App 的普通签到页切回前台后重新运行。"
-        }
-        "foreground_query_failed" => "无法读取前台应用；安全策略阻止继续操作。",
-        "route_candidate_unconfirmed" => "页面截图仅能形成候选，层级证据未确认；未执行点击。",
-        "unsupported_checkin_mode" => {
-            "已确认在签到页，但签到模式不是普通晚点名（外勤或其他）；未执行点击。"
-        }
-        "route_evidence_conflict" => "页面截图与层级证据冲突；安全策略阻止继续操作。",
-        "ready_confirmation_failed" => "点击前二次 ready 确认失败；未执行点击。",
-        "unknown_profile" => "设备分辨率/DPI 没有精确 profile；未执行点击。",
-        "uncalibrated_profile" => "当前 profile 尚未完成生产标定；未执行点击。",
-        "live_confirmation_required" => "正式模式需要同时指定 --live --confirm；未执行点击。",
-        "field_work_live_unsupported" => {
-            "外勤 live 默认关闭；请在当前 config.toml 设置 runtime.allow_field_work_live = true，并重新明确确认 live。"
-        }
-        "field_work_observation_only" => "外勤页面已记录观察结果；请人工确认页面状态。",
-        "click_authorization_failed" => "点击安全门禁未满足；程序没有继续点击。",
-        "success_text_unconfirmed" => "页面视觉状态为成功，但层级文字未确认；请人工核对。",
-        "success_stale" => "成功页面显示的日期不是今天；不能视为本次签到成功。",
-        "success_date_unknown" => "页面未提供可确认的成功日期；请人工核对。",
-        "app_start_timeout" => "目标 App 未能进入前台；请手动打开 App 并完成登录。",
-        "app_restart_dialog" => {
-            "检测到 App 的“是否重启App / 当前 App 可能被界面劫持”安全弹窗；程序未点击。请在模拟器中点击“取消”或“重启App”，并检查是否有悬浮窗/录屏/辅助功能后重试。"
-        }
-        "login_required" => {
-            "需要登录：请手动登录；或显式启用 runtime.allow_auto_login 后重试（仅一键登录，默认关闭）。"
-        }
-        "auto_login_terms_not_accepted" => {
-            "自动登录未获授权代勾选协议；请设置 runtime.accept_login_terms = true，或手动登录。"
-        }
-        "auto_login_consent_not_found" | "auto_login_consent_unconfirmed" => {
-            "无法确认登录页协议复选框；程序未点击登录，请手动登录。"
-        }
-        "auto_login_button_ambiguous" => {
-            "登录页的“一键登录”按钮缺失或不唯一；程序未点击，请手动登录。"
-        }
-        "auto_login_account_mismatch" | "auto_login_account_unknown" => {
-            "登录页账号无法确认或与配置不符；程序未点击登录。"
-        }
-        "auto_login_blocked" => {
-            "登录过程中出现外部窗口/弹窗或 App 离开前台；程序已停止，未继续点击。"
-        }
-        "auto_login_timeout" => "一键登录后未在超时内离开登录页；程序未重试，请人工核对登录状态。",
-        "auto_login_not_confirmed" => "登录后页面证据不可读；程序已停止，未继续签到。",
-        "instance_not_listed" => {
-            "实例 index 不存在，或实例已完全退出；请在 LDPlayer 中确认实例名，或先手动启动一次。程序未执行点击。"
-        }
-        "instance_not_running" => {
-            "实例当前未运行，且本命令不会自动启动实例；请先手动启动 LDPlayer 实例后重试。程序未执行点击。"
-        }
-        "instance_launch_timeout" => {
-            "实例启动超时；请手动启动 LDPlayer 实例后重试。程序未执行点击。"
-        }
-        "adb_connect_timeout" => "ADB 未就绪；请确认模拟器已启动并允许 ADB 调试。程序未执行点击。",
-        "boot_timeout" => {
-            "Android 系统未在预算内完成引导；请手动启动实例并等待桌面出现后重试。程序未执行点击。"
-        }
-        "navigation_not_confirmed" => "未能确认进入晚点名签到页；请手动导航后重试。",
-        "page_context_changed" => "运行中页面/签到模式发生变化；安全策略已停止自动点击。",
-        "hierarchy_unavailable" => "无法读取页面结构；为安全起见没有继续点击。",
-        other if other.contains("ADB") => "ADB 设备不可用；请检查模拟器和 serial。",
-        _ => "请查看诊断报告和运行日志。",
-    }
 }
 
 impl eframe::App for GuiApp {
@@ -755,6 +705,7 @@ impl eframe::App for GuiApp {
             self.dependency_scan = None;
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        let lang = self.lang();
         egui::SidePanel::left("navigation")
             .resizable(true)
             .default_width(178.0)
@@ -763,28 +714,46 @@ impl eframe::App for GuiApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.heading("签到助手");
+                        ui.heading(t(lang, Key::AppTitle));
                         ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+                        ui.label(format!(
+                            "{}: {}",
+                            t(lang, Key::LanguageLabel),
+                            ui_text::language_name(lang)
+                        ));
                         ui.separator();
-                        ui.label(egui::RichText::new("工作台").strong());
-                        for (index, label) in [(0, "运行控制"), (1, "环境诊断"), (2, "模拟器实例")]
-                        {
-                            if ui.selectable_label(self.tab == index, label).clicked() {
+                        ui.label(egui::RichText::new(t(lang, Key::NavWorkspace)).strong());
+                        for (index, label) in [
+                            (0, Key::NavRun),
+                            (1, Key::NavDiagnostics),
+                            (2, Key::NavInstances),
+                        ] {
+                            if ui
+                                .selectable_label(self.tab == index, t(lang, label))
+                                .clicked()
+                            {
                                 self.tab = index;
                             }
                         }
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("业务配置").strong());
-                        for (index, label) in [(3, "Profile"), (4, "应用 / APK"), (5, "配置文件")]
+                        ui.label(egui::RichText::new(t(lang, Key::NavBusiness)).strong());
+                        for (index, label) in
+                            [(3, Key::NavProfiles), (4, Key::NavApp), (5, Key::NavConfig)]
                         {
-                            if ui.selectable_label(self.tab == index, label).clicked() {
+                            if ui
+                                .selectable_label(self.tab == index, t(lang, label))
+                                .clicked()
+                            {
                                 self.tab = index;
                             }
                         }
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("任务与证据").strong());
-                        for (index, label) in [(6, "计划任务"), (7, "运行日志与结果")] {
-                            if ui.selectable_label(self.tab == index, label).clicked() {
+                        ui.label(egui::RichText::new(t(lang, Key::NavEvidence)).strong());
+                        for (index, label) in [(6, Key::NavTasks), (7, Key::NavLogs)] {
+                            if ui
+                                .selectable_label(self.tab == index, t(lang, label))
+                                .clicked()
+                            {
                                 self.tab = index;
                                 if index == 7 && self.recent_logs.is_empty() {
                                     self.refresh_logs();
@@ -792,20 +761,23 @@ impl eframe::App for GuiApp {
                             }
                         }
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("帮助").strong());
+                        ui.label(egui::RichText::new(t(lang, Key::NavHelp)).strong());
                         if ui
-                            .selectable_label(self.tab == HELP_TAB, "快速使用")
+                            .selectable_label(self.tab == HELP_TAB, t(lang, Key::NavQuickUse))
                             .clicked()
                         {
                             self.tab = HELP_TAB;
                         }
-                        if ui.selectable_label(self.tab == 8, "About / 版本").clicked() {
+                        if ui
+                            .selectable_label(self.tab == 8, t(lang, Key::NavAbout))
+                            .clicked()
+                        {
                             self.tab = 8;
                         }
                         // First-run/Repair stays reachable from the normal
                         // workspace after the initial wizard has been left.
                         if ui
-                            .selectable_label(self.tab == SETUP_TAB, "首次设置 / 配置修复")
+                            .selectable_label(self.tab == SETUP_TAB, t(lang, Key::NavSetup))
                             .clicked()
                         {
                             self.tab = SETUP_TAB;
@@ -815,22 +787,10 @@ impl eframe::App for GuiApp {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.label(&self.status);
             if let Some(job) = &self.job {
-                ui.label(format!("后台任务：{}（运行中）", job.label));
+                ui.label(t(lang, Key::StatusJobRunning).replace("{}", &job.label));
             }
         });
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            0 => self.home(ui),
-            1 => self.diagnostics(ui),
-            2 => self.instances_page(ui),
-            3 => self.profiles(ui),
-            4 => self.app_page(ui),
-            5 => self.config_page(ui),
-            6 => self.tasks_page(ui),
-            7 => self.logs_page(ui),
-            8 => self.about(ui),
-            HELP_TAB => self.quick_use(ui),
-            _ => self.setup_page(ui),
-        });
+        egui::CentralPanel::default().show(ctx, |ui| self.page_with_contents(ui));
         self.sync_confirmation_window(ctx);
         self.apk_install_confirmation_window(ctx);
         self.live_confirmation_window(ctx);
@@ -843,95 +803,229 @@ const SETUP_TAB: usize = 9;
 /// Navigation index for user-facing first-run and daily-use guidance.
 const HELP_TAB: usize = 10;
 
-impl GuiApp {
-    /// A task-oriented guide for first-time and returning users. Keep each
-    /// section actionable and link into the existing workbench pages instead
-    /// of duplicating the configuration controls here.
-    fn quick_use(&mut self, ui: &mut egui::Ui) {
-        ui.heading("快速使用");
-        ui.label("按顺序完成首次检查和 dry-run；长期使用时也可从这里进入诊断、日志和配置。");
-        ui.separator();
+fn page_anchor(ui: &mut egui::Ui, key: Key) {
+    if ui.data(|data| data.get_temp::<Key>(egui::Id::new("page_jump"))) == Some(key) {
+        let target = egui::Rect::from_min_size(ui.next_widget_position(), egui::Vec2::ZERO);
+        ui.scroll_to_rect(target, Some(egui::Align::TOP));
+    }
+}
 
-        egui::CollapsingHeader::new("首次使用：准备环境并完成设置")
+fn page_section(ui: &mut egui::Ui, lang: Lang, key: Key) {
+    ui.separator();
+    page_anchor(ui, key);
+    ui.label(egui::RichText::new(t(lang, key)).strong());
+}
+
+impl GuiApp {
+    fn page_with_contents(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang();
+        let tab = self.tab;
+        let sections: &[Key] = match tab {
+            0 => &[Key::PageRunControls, Key::PageLatestResult],
+            1 => &[
+                Key::StatusCardTitle,
+                Key::PageDiagnosticTools,
+                Key::PageLatestResult,
+            ],
+            2 => &[Key::PageInstanceList],
+            3 => &[Key::PagePresetList],
+            4 => &[Key::PageInstallPackage],
+            5 => &ui_text::CONFIG_HEADINGS,
+            6 => &[Key::PageTaskSettings, Key::PageTaskWindow],
+            7 => &[Key::PageRunHistory, Key::PageEvents, Key::LogsPreview],
+            8 => &[
+                Key::AboutLanguage,
+                Key::AboutLinks,
+                Key::AboutProfiles,
+                Key::AboutDeps,
+            ],
+            HELP_TAB => &[
+                Key::QuickPrepareTitle,
+                Key::QuickSetupTitle,
+                Key::QuickRunTitle,
+                Key::QuickIssuesTitle,
+                Key::QuickAdvancedTitle,
+                Key::SafetyTitle,
+            ],
+            _ => &[
+                Key::EnvTitle,
+                Key::SetupDepsHeading,
+                Key::SetupRestoreHeading,
+                Key::SetupMigrationHeading,
+            ],
+        };
+        let mut jump = None;
+        let mut contents = |ui: &mut egui::Ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            for key in std::iter::once(&Key::PageOverview).chain(sections) {
+                if *key == Key::LogsPreview && self.selected_log_preview.is_none() {
+                    continue;
+                }
+                if ui.button(t(lang, *key)).clicked() {
+                    jump = Some(*key);
+                }
+            }
+        };
+        if ui.available_width() >= 880.0 {
+            egui::SidePanel::right(egui::Id::new(("page_contents", tab)))
+                .exact_width(170.0)
+                .resizable(false)
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.strong(t(lang, Key::PageContents));
+                        contents(ui);
+                    });
+                });
+        } else {
+            egui::CollapsingHeader::new(t(lang, Key::PageContents))
+                .id_salt(("page_contents", tab))
+                .show(ui, |ui| ui.horizontal_wrapped(contents));
+            ui.separator();
+        }
+
+        let jump_id = egui::Id::new("page_jump");
+        if let Some(key) = jump {
+            ui.data_mut(|data| data.insert_temp(jump_id, key));
+        }
+        egui::ScrollArea::vertical()
+            .id_salt(("page_body", tab))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                page_anchor(ui, Key::PageOverview);
+                match tab {
+                    0 => self.home(ui),
+                    1 => self.diagnostics(ui),
+                    2 => self.instances_page(ui),
+                    3 => self.profiles(ui),
+                    4 => self.app_page(ui),
+                    5 => self.config_page(ui),
+                    6 => self.tasks_page(ui),
+                    7 => self.logs_page(ui),
+                    8 => self.about(ui),
+                    HELP_TAB => self.quick_use(ui),
+                    _ => self.setup_page(ui),
+                }
+            });
+        ui.data_mut(|data| data.remove::<Key>(jump_id));
+    }
+
+    fn quick_use(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang();
+        ui.heading(t(lang, Key::QuickHeading));
+        ui.label(t(lang, Key::QuickIntro));
+        ui.separator();
+        page_anchor(ui, Key::QuickPrepareTitle);
+        egui::CollapsingHeader::new(t(lang, ui_text::QUICK_USE_HEADINGS[0]))
             .default_open(true)
             .show(ui, |ui| {
-                ui.label("1. 启动 LDPlayer，并在模拟器中手动打开智汇福大 App、完成登录。程序不会替你输入凭据或同意协议。");
-                ui.label("2. 在“首次设置 / 配置修复”中确认 ldconsole.exe、adb.exe 路径及实例；验证通过后保存。损坏的配置不会被静默覆盖。");
-                ui.label("3. 到“环境诊断”检查所选实例、ADB 连接和设备几何/Profile；运行前请在模拟器中手动确认目标 App 位于前台。诊断只读取依赖和设备信息，不执行签到点击。");
-                ui.label("4. 返回“运行控制”，选择一个实例后运行 dry-run。首次建议不要勾选全部实例。");
-                ui.horizontal(|ui| {
-                    if ui.button("打开设置 / 修复").clicked() {
+                ui.label(egui::RichText::new(t(lang, Key::EnvTitle)).strong());
+                ui.label(t(lang, Key::EnvIntro));
+                render_environment_checklist(ui, lang);
+                ui.separator();
+                ui.label(egui::RichText::new(t(lang, Key::EnvStepsTitle)).strong());
+                ui.label(t(lang, Key::EnvStep1));
+                ui.label(t(lang, Key::EnvStep2));
+                ui.label(t(lang, Key::EnvStep3));
+                ui.label(t(lang, Key::EnvStep4));
+                ui.label(t(lang, Key::EnvNote));
+                ui.separator();
+                ui.label(egui::RichText::new(t(lang, Key::TermTitle)).strong());
+                egui::Grid::new("term_hints")
+                    .striped(true)
+                    .min_col_width(150.0)
+                    .show(ui, |ui| {
+                        for term in ui_text::TERM_HINTS {
+                            ui.label(egui::RichText::new(t(lang, term.term)).strong());
+                            ui.label(t(lang, term.meaning));
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(t(lang, Key::DiagramTitle)).strong());
+                ui.code(t(lang, Key::Diagram));
+                ui.label(t(lang, Key::TermPortNote));
+            });
+        page_anchor(ui, Key::QuickSetupTitle);
+        egui::CollapsingHeader::new(t(lang, ui_text::QUICK_USE_HEADINGS[1]))
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(t(lang, Key::QuickSetupStep1));
+                ui.label(t(lang, Key::QuickSetupStep2));
+                ui.label(t(lang, Key::QuickSetupStep3));
+                ui.label(t(lang, Key::QuickSetupStep4));
+                ui.label(t(lang, Key::QuickSetupNoneNeeded));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(t(lang, Key::QuickOpenSetup)).clicked() {
                         self.tab = SETUP_TAB;
                     }
-                    if ui.button("打开环境诊断").clicked() {
+                    if ui.button(t(lang, Key::QuickOpenDiagnostics)).clicked() {
                         self.tab = 1;
                     }
-                    if ui.button("返回运行控制").clicked() {
+                    if ui.button(t(lang, Key::QuickOpenRun)).clicked() {
                         self.tab = 0;
                     }
                 });
             });
-
-        egui::CollapsingHeader::new("dry-run 结果怎么看")
+        page_anchor(ui, Key::QuickRunTitle);
+        egui::CollapsingHeader::new(t(lang, ui_text::QUICK_USE_HEADINGS[2]))
             .default_open(true)
             .show(ui, |ui| {
-                ui.label("dry-run 用于观察页面和签到状态，不执行签到点击；它不等于签到成功。即使顶层 status 显示 success，也要结合 success、dry_run_ready 和 error_code 判断。");
-                ui.label("在“运行日志与结果”查看 status、route、checkin_mode、checkin_state 和 error_code；点击某次运行可查看事件时间线与文本结果，截图请通过“打开目录”在文件夹中查看。");
-                ui.label("只有 result 明确显示 success=true 才代表程序验证了成功；dry_run_ready=true 仅表示观察到可签到状态。");
-                if ui.button("打开运行日志与结果").clicked() {
+                ui.label(t(lang, Key::QuickRunDrySuccess));
+                ui.label(t(lang, Key::QuickRunLive));
+                ui.label(t(lang, Key::QuickRunFailure));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(t(lang, Key::QuickOpenLogs)).clicked() {
+                        self.tab = 7;
+                        self.refresh_logs();
+                    }
+                    if ui.button(t(lang, Key::QuickOpenRun)).clicked() {
+                        self.tab = 0;
+                    }
+                });
+            });
+        page_anchor(ui, Key::QuickIssuesTitle);
+        ui.collapsing(t(lang, ui_text::QUICK_USE_HEADINGS[3]), |ui| {
+            ui.label(t(lang, Key::QuickIssueDevice));
+            ui.label(t(lang, Key::QuickIssueLogin));
+            ui.label(t(lang, Key::QuickIssueDialog));
+            ui.label(t(lang, Key::QuickIssueMore));
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(t(lang, Key::QuickOpenLogs)).clicked() {
+                    self.tab = 7;
+                    self.refresh_logs();
+                }
+                if ui.button(t(lang, Key::QuickOpenDiagnostics)).clicked() {
+                    self.tab = 1;
+                }
+                if ui.button(t(lang, Key::QuickOpenSetup)).clicked() {
+                    self.tab = SETUP_TAB;
+                }
+            });
+        });
+        page_anchor(ui, Key::QuickAdvancedTitle);
+        ui.collapsing(t(lang, ui_text::QUICK_USE_HEADINGS[4]), |ui| {
+            ui.label(t(lang, Key::QuickAdvancedInstances));
+            ui.label(t(lang, Key::QuickAdvancedTasks));
+            ui.label(t(lang, Key::QuickAdvancedData));
+            ui.label(t(lang, Key::QuickAdvancedShare));
+            ui.label(t(lang, Key::QuickAdvancedBroken));
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(t(lang, Key::QuickOpenTasks)).clicked() {
+                    self.tab = 6;
+                }
+                if ui.button(t(lang, Key::QuickOpenConfig)).clicked() {
+                    self.tab = 5;
+                }
+                if ui.button(t(lang, Key::QuickOpenLogs)).clicked() {
                     self.tab = 7;
                     self.refresh_logs();
                 }
             });
-
-        egui::CollapsingHeader::new("常见情况：先看提示，再手动处理")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.label("设备未连接 / ADB 失败：确认模拟器已启动、配置的实例与 serial 正确，再运行环境诊断。");
-                ui.label("需要登录：默认需在模拟器中手动登录；若已显式开启自动登录，程序会先尝试一次一键登录，失败则停止并提示。");
-                ui.label("检测到弹窗或广告：按提示在模拟器中手动关闭，再重试。程序不会自动关闭、同意或点击弹窗。");
-                ui.label("页面未确认、页面证据冲突或定位超时：停止并查看最新日志/截图；确认页面状态后再决定是否重试，不要反复盲目运行。");
-                ui.label("配置损坏：进入“首次设置 / 配置修复”检查原文件并按需修复；原配置不会被 CLI 静默重置。");
-                ui.horizontal(|ui| {
-                    if ui.button("查看运行结果 / 日志").clicked() {
-                        self.tab = 7;
-                        self.refresh_logs();
-                    }
-                    if ui.button("重新运行环境诊断").clicked() {
-                        self.tab = 1;
-                    }
-                    if ui.button("打开配置修复").clicked() {
-                        self.tab = SETUP_TAB;
-                    }
-                });
-            });
-
-        egui::CollapsingHeader::new("长期使用：多实例、计划任务与数据")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label("确认单实例 dry-run 正常后，再按需选择全部已启用实例；批量运行会逐个记录结果，单实例失败不会抹掉其他实例结果。");
-                ui.label("计划任务建议保持 dry-run。不要将 live 设置为无人值守任务；live 需要显式确认，并继续受页面、前台、时间窗、Profile 和 ready 状态门禁保护。");
-                ui.label("运行日志、截图和报告保存在当前数据目录。导出或分享诊断资料前，请检查其中的本机路径、实例信息和截图。");
-                ui.label("迁移数据目录前确认目标位置可写；迁移会先备份并验证，不会在目标配置已存在时覆盖它。");
-                ui.horizontal(|ui| {
-                    if ui.button("打开计划任务").clicked() {
-                        self.tab = 6;
-                    }
-                    if ui.button("打开数据与配置").clicked() {
-                        self.tab = 5;
-                    }
-                    if ui.button("查看日志和证据").clicked() {
-                        self.tab = 7;
-                        self.refresh_logs();
-                    }
-                });
-            });
-
+        });
         ui.separator();
-        ui.label("安全边界：未知页面、证据不足或不支持的签到类型会停止；dry-run 不点击。普通 live 仍要求明确确认。外勤 live 还要求在 config.toml 中显式设置 runtime.allow_field_work_live = true；登录页默认需手动登录，只有同时开启 allow_auto_login 与 accept_login_terms 才会执行一次一键登录（不输入凭据）。程序不会自动关闭广告。");
-        if ui.button("打开安全策略说明").clicked() {
-            self.tab = 8;
-        }
+        page_anchor(ui, Key::SafetyTitle);
+        render_safety_table(ui, lang);
     }
 
     /// Setup (first run) and Repair (damaged config) share one page: the same
@@ -940,49 +1034,63 @@ impl GuiApp {
     fn setup_page(&mut self, ui: &mut egui::Ui) {
         // Only a genuine load/validation failure makes this a Repair page;
         // a successful reload or tool validation is ordinary feedback.
+        let lang = self.lang();
         let repairing = self.setup_error.is_some() || self.store.recovery_error.is_some();
-        ui.heading(if repairing {
-            "配置修复(Repair)"
-        } else {
-            "首次设置(Setup)"
-        });
-        ui.label(format!("配置文件:{}", self.store.path.display()));
-        ui.label(format!("数据目录:{}", self.store.root.display()));
-        ui.label(format!(
-            "配置来源:{}",
-            match self.store.origin {
-                config::ConfigOrigin::Explicit => "显式 --config / 修复路径",
-                config::ConfigOrigin::Portable => "EXE 便携目录",
-                config::ConfigOrigin::LocalAppData => "%LOCALAPPDATA%\\ZHFDCheckin",
-                config::ConfigOrigin::Recorded => "已迁移的数据目录",
-            }
+        ui.heading(t(
+            lang,
+            if repairing {
+                Key::SetupRepairHeading
+            } else {
+                Key::SetupFirstHeading
+            },
         ));
+        ui.label(
+            t(lang, Key::SetupConfigPath).replace("{}", &self.store.path.display().to_string()),
+        );
+        ui.label(t(lang, Key::SetupDataRoot).replace("{}", &self.store.root.display().to_string()));
+        let origin = t(
+            lang,
+            match self.store.origin {
+                config::ConfigOrigin::Explicit => Key::SetupOriginExplicit,
+                config::ConfigOrigin::Portable => Key::SetupOriginPortable,
+                config::ConfigOrigin::LocalAppData => Key::SetupOriginLocalAppData,
+                config::ConfigOrigin::Recorded => Key::SetupOriginRecorded,
+            },
+        );
+        ui.label(t(lang, Key::SetupOrigin).replace("{}", origin));
+        ui.separator();
+        page_section(ui, lang, Key::EnvTitle);
+        render_environment_checklist(ui, lang);
         if let Some(error) = self.setup_error.clone() {
             ui.separator();
-            ui.colored_label(egui::Color32::LIGHT_RED, format!("配置问题:{error}"));
-            ui.label(
-                "原文件未被覆盖。请重新载入、选择另一份配置，或在确认后显式恢复安全默认配置。",
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                t(lang, Key::SetupConfigProblem).replace("{}", &error),
             );
-            if ui.button("复制错误信息").clicked() {
+            ui.label(t(lang, Key::SetupConfigProblemNote));
+            if ui.button(t(lang, Key::SetupCopyError)).clicked() {
                 ui.ctx().copy_text(error);
-                self.status = "配置错误信息已复制".into();
+                self.status = t(lang, Key::SetupErrorCopied).into();
             }
         }
         if let Some(notice) = self.setup_notice.clone() {
             ui.separator();
-            ui.colored_label(egui::Color32::LIGHT_GREEN, format!("上次操作:{notice}"));
+            ui.colored_label(
+                egui::Color32::LIGHT_GREEN,
+                t(lang, Key::SetupLastAction).replace("{}", &notice),
+            );
         }
 
         ui.separator();
-        ui.label(egui::RichText::new("1. 依赖工具路径").strong());
+        page_section(ui, lang, Key::SetupDepsHeading);
         ui.horizontal(|ui| {
             ui.label("ldconsole.exe");
             ui.add(
                 egui::TextEdit::singleline(&mut self.setup_ldconsole)
                     .desired_width(430.0)
-                    .hint_text("雷电模拟器控制台可执行文件"),
+                    .hint_text(t(lang, Key::SetupHintLdconsole)),
             );
-            if ui.button("浏览...").clicked()
+            if ui.button(t(lang, Key::SetupBrowse)).clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("ldconsole.exe", &["exe"])
                     .pick_file()
@@ -993,7 +1101,7 @@ impl GuiApp {
                 let sibling = path.with_file_name("adb.exe");
                 if sibling.is_file() {
                     self.setup_adb = sibling.display().to_string();
-                    self.setup_notice = Some("已建议同目录 adb.exe；请确认后再保存。".into());
+                    self.setup_notice = Some(t(lang, Key::SetupAdbSuggested).into());
                 }
             }
         });
@@ -1002,9 +1110,9 @@ impl GuiApp {
             ui.add(
                 egui::TextEdit::singleline(&mut self.setup_adb)
                     .desired_width(430.0)
-                    .hint_text("Android Debug Bridge 可执行文件"),
+                    .hint_text(t(lang, Key::SetupHintAdb)),
             );
-            if ui.button("浏览...").clicked()
+            if ui.button(t(lang, Key::SetupBrowse)).clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("adb.exe", &["exe"])
                     .pick_file()
@@ -1013,24 +1121,21 @@ impl GuiApp {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            if ui.button("验证工具并读取实例").clicked() {
+            if ui.button(t(lang, Key::SetupValidate)).clicked() {
                 self.start_setup_validation();
             }
             if self.setup_validation.is_some() {
                 ui.spinner();
-                ui.label("验证中……");
+                ui.label(t(lang, Key::SetupValidating));
             }
-            if ui.button("确认并保存路径").clicked() {
+            if ui.button(t(lang, Key::SetupSave)).clicked() {
                 // Empty dependency paths are not a usable setup: refuse the
                 // write and keep the gate closed instead of publishing a config
                 // that can only fail at run time.
                 if self.setup_ldconsole.trim().is_empty() || self.setup_adb.trim().is_empty() {
                     self.setup_error = None;
-                    self.setup_notice = Some(
-                        "请先填写 ldconsole.exe 和 adb.exe 路径；依赖为空时不会解除首次设置。"
-                            .into(),
-                    );
-                    self.status = "依赖路径不完整，配置未保存".into();
+                    self.setup_notice = Some(t(lang, Key::SetupEmptyPaths).into());
+                    self.status = t(lang, Key::SetupPathsIncomplete).into();
                 } else {
                     // Persist a candidate and only publish it after the atomic
                     // write succeeded, so a failure keeps the last good config.
@@ -1045,7 +1150,7 @@ impl GuiApp {
                             self.setup_required = requires_setup(&self.store);
                             self.setup_error = None;
                             self.setup_notice = None;
-                            self.status = "依赖配置已保存".into();
+                            self.status = t(lang, Key::SetupSaved).into();
                             if !self.setup_required {
                                 self.tab = 0;
                             }
@@ -1053,24 +1158,26 @@ impl GuiApp {
                         Err(error) => {
                             // The write is atomic, so both the on-disk config and the
                             // in-memory config are still the previous ones.
-                            self.setup_error = Some(format!("保存失败,现有配置保持不变:{error:#}"));
+                            self.setup_error = Some(
+                                t(lang, Key::SetupSaveFailed).replace("{}", &format!("{error:#}")),
+                            );
                             self.setup_notice = None;
                         }
                     }
                 }
             }
-            if ui.button("打开配置所在目录").clicked()
+            if ui.button(t(lang, Key::SetupOpenDir)).clicked()
                 && let Some(parent) = self.store.path.parent()
                 && let Err(error) = crate::process::open_path(parent)
             {
-                self.status = format!("打开配置目录失败:{error:#}");
+                self.status = t(lang, Key::SetupOpenDirFailed).replace("{}", &format!("{error:#}"));
             }
         });
 
         ui.separator();
-        ui.label(egui::RichText::new("2. 恢复与重新载入").strong());
+        page_section(ui, lang, Key::SetupRestoreHeading);
         ui.horizontal_wrapped(|ui| {
-            if ui.button("重新载入磁盘配置").clicked() {
+            if ui.button(t(lang, Key::SetupReload)).clicked() {
                 match self.store.reload() {
                     Ok(()) => {
                         self.setup_ldconsole = self.store.config.emulator.ldconsole_path.clone();
@@ -1079,20 +1186,28 @@ impl GuiApp {
                         // empty tool path must keep Setup open.
                         self.setup_required = requires_setup(&self.store);
                         self.setup_error = None;
-                        self.setup_notice = Some(if self.setup_required {
-                            "已从磁盘重新载入；依赖路径仍为空，请完成设置。".into()
-                        } else {
-                            "已从磁盘重新载入并验证配置。".into()
-                        });
+                        self.setup_notice = Some(
+                            t(
+                                lang,
+                                if self.setup_required {
+                                    Key::SetupReloadedEmpty
+                                } else {
+                                    Key::SetupReloaded
+                                },
+                            )
+                            .into(),
+                        );
                     }
                     Err(error) => {
                         // Reload failure must keep the last valid in-memory config.
-                        self.setup_error = Some(format!("未载入,保留当前有效配置:{error:#}"));
+                        self.setup_error = Some(
+                            t(lang, Key::SetupReloadFailed).replace("{}", &format!("{error:#}")),
+                        );
                         self.setup_notice = None;
                     }
                 }
             }
-            if ui.button("选择另一份 config.toml...").clicked()
+            if ui.button(t(lang, Key::SetupChooseOther)).clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("TOML", &["toml"])
                     .pick_file()
@@ -1100,19 +1215,21 @@ impl GuiApp {
                 match ConfigStore::load_alternate(&path) {
                     Ok(store) => {
                         self.adopt_store(store);
-                        self.setup_notice = Some("已切换到所选配置文件。".into());
+                        self.setup_notice = Some(t(lang, Key::SetupSwitched).into());
                     }
                     Err(error) => {
-                        self.setup_error = Some(format!("所选配置不可用:{error:#}"));
+                        self.setup_error = Some(
+                            t(lang, Key::SetupAltUnavailable).replace("{}", &format!("{error:#}")),
+                        );
                         self.setup_notice = None;
                     }
                 }
             }
             if ui
                 .button(if self.confirm_reset_defaults {
-                    "再次点击确认:备份并恢复安全默认"
+                    t(lang, Key::SetupResetConfirm)
                 } else {
-                    "恢复安全默认配置..."
+                    t(lang, Key::SetupResetDefaults)
                 })
                 .clicked()
             {
@@ -1125,41 +1242,40 @@ impl GuiApp {
                             self.setup_adb.clear();
                             self.setup_required = true;
                             self.setup_error = None;
-                            self.setup_notice =
-                                Some("已备份原配置并恢复安全默认值；请重新设置依赖路径。".into());
+                            self.setup_notice = Some(t(lang, Key::SetupResetDone).into());
                         }
                         Err(error) => {
-                            self.setup_error = Some(format!("恢复失败,原配置保持不变:{error:#}"));
+                            self.setup_error = Some(
+                                t(lang, Key::SetupResetFailed).replace("{}", &format!("{error:#}")),
+                            );
                             self.setup_notice = None;
                         }
                     }
                     self.confirm_reset_defaults = false;
                 } else {
                     self.confirm_reset_defaults = true;
-                    self.status = "恢复默认配置需要再次确认。".into();
+                    self.status = t(lang, Key::SetupResetNeedsConfirm).into();
                 }
             }
         });
 
         ui.separator();
-        ui.label(egui::RichText::new("3. 数据目录迁移").strong());
-        ui.label(
-            "迁移会复制 config、logs、captures、reports、backups;仅在目标配置验证通过后切换当前数据目录,源目录不会删除。",
-        );
+        page_section(ui, lang, Key::SetupMigrationHeading);
+        ui.label(t(lang, Key::SetupMigrationNote));
         ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.migration_target)
                     .desired_width(430.0)
-                    .hint_text("目标数据目录"),
+                    .hint_text(t(lang, Key::SetupMigrationTargetHint)),
             );
-            if ui.button("选择目录...").clicked()
+            if ui.button(t(lang, Key::SetupChooseDir)).clicked()
                 && let Some(path) = rfd::FileDialog::new().pick_folder()
             {
                 self.migration_target = path.display().to_string();
             }
-            if ui.button("迁移并切换").clicked() {
+            if ui.button(t(lang, Key::SetupMigrate)).clicked() {
                 if self.migration_target.trim().is_empty() {
-                    self.setup_notice = Some("请先选择目标数据目录。".into());
+                    self.setup_notice = Some(t(lang, Key::SetupChooseTarget).into());
                 } else {
                     self.pending_migration =
                         Some(std::path::PathBuf::from(self.migration_target.trim()));
@@ -1168,28 +1284,32 @@ impl GuiApp {
         });
 
         ui.separator();
-        ui.label(
-            "默认手动登录：程序不会输入账号/密码/验证码。只有在 config.toml 同时开启 runtime.allow_auto_login 与 runtime.accept_login_terms 时，live 运行才会在登录页执行一次一键登录。首次 dry-run 默认只运行一个选中实例。",
-        );
+        ui.label(t(lang, Key::SetupLoginNote));
     }
 
     fn migration_confirmation_window(&mut self, ctx: &egui::Context) {
         let Some(target) = self.pending_migration.clone() else {
             return;
         };
+        let lang = self.lang();
         let mut action = None;
-        egui::Window::new("确认迁移数据目录")
+        egui::Window::new(t(lang, Key::MigrationTitle))
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(format!("当前:{}", self.store.root.display()));
-                ui.label(format!("目标:{}", target.display()));
-                ui.label("迁移前会先备份当前配置;源目录不会删除。确认继续?");
+                ui.label(
+                    t(lang, Key::MigrationCurrent)
+                        .replace("{}", &self.store.root.display().to_string()),
+                );
+                ui.label(
+                    t(lang, Key::MigrationTarget).replace("{}", &target.display().to_string()),
+                );
+                ui.label(t(lang, Key::MigrationWarning));
                 ui.horizontal(|ui| {
-                    if ui.button("确认迁移").clicked() {
+                    if ui.button(t(lang, Key::MigrationConfirm)).clicked() {
                         action = Some(true);
                     }
-                    if ui.button("取消").clicked() {
+                    if ui.button(t(lang, Key::CommonCancel)).clicked() {
                         action = Some(false);
                     }
                 });
@@ -1199,37 +1319,53 @@ impl GuiApp {
             if confirm {
                 self.migrate_data_root(target);
             } else {
-                self.setup_notice = Some("已取消数据目录迁移。".into());
+                self.setup_notice = Some(t(lang, Key::MigrationCancelled).into());
             }
         }
     }
 
     fn home(&mut self, ui: &mut egui::Ui) {
-        ui.heading("运行控制");
+        let lang = self.lang();
+        ui.heading(t(lang, Key::HomeHeading));
         if self.setup_required {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "首次配置尚未完成：请先进入“首次设置 / 配置修复”完成依赖路径并保存，再运行 dry-run。",
-            );
-            if ui.button("打开首次设置 / 配置修复").clicked() {
+            ui.colored_label(egui::Color32::YELLOW, t(lang, Key::HomeSetupBanner));
+            if ui.button(t(lang, Key::HomeOpenSetup)).clicked() {
                 self.tab = SETUP_TAB;
             }
             ui.separator();
         }
-        ui.label("Rust CLI/GUI 迁移第一阶段：默认只进行 dry-run，不执行真实点击。");
+        ui.group(|ui| {
+            ui.label(egui::RichText::new(t(lang, Key::HomeAboutTitle)).strong());
+            ui.label(t(lang, Key::HomeAboutWhat));
+            ui.label(t(lang, Key::HomeAboutDry));
+            ui.label(t(lang, Key::HomeAboutLive));
+            ui.label(t(lang, Key::HomeAboutUsable).replace(
+                "{}",
+                t(
+                    lang,
+                    if self.setup_required {
+                        Key::HomeUsableNo
+                    } else {
+                        Key::HomeUsableYes
+                    },
+                ),
+            ));
+        });
+        if !self.setup_required && self.latest_result.is_none() {
+            ui.colored_label(egui::Color32::LIGHT_BLUE, t(lang, Key::HomeFirstRunTitle));
+            ui.label(t(lang, Key::HomeFirstRunSteps));
+        }
+        page_section(ui, lang, Key::PageRunControls);
         let options = self.instance_options();
-        ui.checkbox(
-            &mut self.run_all_instances,
-            "dry-run 依次运行全部已发现实例",
-        );
+        ui.checkbox(&mut self.run_all_instances, t(lang, Key::HomeAllInstances));
         if !options.is_empty() {
-            egui::ComboBox::from_label("当前实例")
+            egui::ComboBox::from_label(t(lang, Key::HomeCurrentInstance))
                 .selected_text(
                     options
                         .iter()
                         .find(|(index, _)| *index == self.selected_instance_index)
                         .map(|(_, label)| label.as_str())
-                        .unwrap_or("未选择"),
+                        .unwrap_or_else(|| t(lang, Key::HomeNotSelected)),
                 )
                 .show_ui(ui, |ui| {
                     for (index, label) in &options {
@@ -1237,303 +1373,380 @@ impl GuiApp {
                     }
                 });
         }
-        ui.horizontal(|ui| {
-            if ui.button("环境诊断").clicked() {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(t(lang, Key::HomeButtonDiagnostics)).clicked() {
                 self.tab = 1;
             }
-            if ui.button("运行 dry-run").clicked() {
+            if ui.button(t(lang, Key::HomeButtonDryRun)).clicked() {
                 if self.setup_required {
-                    self.status = "首次配置尚未完成，无法运行；请先保存依赖路径。".into();
+                    self.status = t(lang, Key::HomeSetupIncomplete).into();
                     self.tab = SETUP_TAB;
                 } else {
                     self.start_dry_run();
                 }
             }
-            if ui.button("准备 live 运行").clicked() {
+            if ui.button(t(lang, Key::HomeButtonPrepareLive)).clicked() {
                 if self.setup_required {
-                    self.status = "首次配置尚未完成，无法准备 live 运行。".into();
+                    self.status = t(lang, Key::HomeSetupIncompleteLive).into();
                     self.tab = SETUP_TAB;
                 } else {
                     self.pending_live_run = Some(self.live_intent());
                 }
             }
-            if ui.button("打开配置").clicked() {
+            if ui.button(t(lang, Key::HomeButtonOpenConfig)).clicked() {
                 self.tab = 5;
             }
         });
         ui.separator();
-        ui.label(format!("配置文件：{}", self.store.path.display()));
-        ui.label(format!(
-            "APK：{}",
-            if self.apk_path.is_empty() {
-                "未选择"
-            } else {
-                &self.apk_path
-            }
-        ));
-        ui.label("正式模式请使用 CLI：zhfd-checkin.exe run --live --confirm");
+        ui.label(
+            t(lang, Key::HomeConfigPath).replace("{}", &self.store.path.display().to_string()),
+        );
+        let apk = if self.apk_path.is_empty() {
+            t(lang, Key::HomeApkNotSelected).to_string()
+        } else {
+            self.apk_path.clone()
+        };
+        ui.label(t(lang, Key::HomeApkPath).replace("{}", &apk));
+        ui.label(t(lang, Key::HomeAdvancedCli));
+        page_section(ui, lang, Key::PageLatestResult);
         if let Some(result) = &self.latest_result {
-            ui.separator();
-            ui.label(format!(
-                "最近结果：{} / {}",
-                result.state_history.join(" → "),
-                run_result_status(result)
-            ));
-            ui.label(format!(
-                "页面：{}；模式：{}；状态：{}",
-                result
-                    .page_route
-                    .map(|route| route.as_str())
-                    .unwrap_or("unknown"),
-                result
-                    .checkin_mode
-                    .map(|mode| mode.as_str())
-                    .unwrap_or("unknown"),
-                result
-                    .checkin_state
-                    .map(|state| state.as_str())
-                    .unwrap_or("unknown"),
-            ));
+            ui.label(
+                t(lang, Key::HomeLatestResult)
+                    .replace("{}", ui_text::run_result_label(lang, Some(result))),
+            );
+            ui.label(
+                t(lang, Key::HomeLatestPage)
+                    .replacen("{}", ui_text::page_route_label(lang, result.page_route), 1)
+                    .replacen(
+                        "{}",
+                        ui_text::checkin_mode_label(lang, result.checkin_mode),
+                        1,
+                    )
+                    .replacen(
+                        "{}",
+                        ui_text::checkin_state_label(lang, result.checkin_state),
+                        1,
+                    ),
+            );
+            if result.error_code.as_deref() == Some("route_candidate_unconfirmed") {
+                ui.label(ui_text::explain_error(lang, "route_candidate_unconfirmed"));
+            }
+        } else {
+            ui.label(t(lang, Key::DiagNoRun));
         }
     }
 
     fn diagnostics(&mut self, ui: &mut egui::Ui) {
-        ui.heading("环境诊断");
+        let lang = self.lang();
+        ui.heading(t(lang, Key::DiagHeading));
+        ui.label(t(lang, Key::DiagIntro));
+        page_anchor(ui, Key::StatusCardTitle);
         self.render_run_status_card(ui);
-        ui.horizontal(|ui| {
-            if ui.button("重新检测 LDPlayer / ADB").clicked() {
+        page_section(ui, lang, Key::PageDiagnosticTools);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(t(lang, Key::DiagRedetect)).clicked() {
                 let store = self.store.clone();
                 let target = self.instance_target();
-                self.start_background_job("环境诊断", move || {
+                self.start_background_job(t(lang, Key::DiagHeading), move || {
                     match diagnose(&store, &target) {
-                        Ok(code) => format!("完成，退出码 {:?}", code),
-                        Err(e) => format!("失败: {:#}", e),
+                        Ok(code) => format!(
+                            "{}: {}",
+                            t(lang, Key::CommonFinished),
+                            ui_text::exit_code_label(lang, code)
+                        ),
+                        Err(e) => format!("{}: {e:#}", t(lang, Key::CommonFailed)),
                     }
                 });
             }
-            if ui.button("导出诊断报告").clicked() {
+            if ui.button(t(lang, Key::DiagExportReport)).clicked() {
                 self.export_report();
             }
-            if ui.button("导出当前实例 hierarchy").clicked() {
+            if ui.button(t(lang, Key::DiagDumpHierarchy)).clicked() {
                 let store = self.store.clone();
                 let target = self.instance_target();
-                self.start_background_job("导出 hierarchy", move || {
+                self.start_background_job(t(lang, Key::DiagDumpHierarchy), move || {
                     match dump_ui_hierarchy(&store, &target) {
-                        Ok(text) => format!("完成，节点 XML 长度 {}", text.len()),
-                        Err(error) => format!("失败: {:#}", error),
+                        Ok(text) => {
+                            t(lang, Key::DiagDumpDone).replace("{}", &text.len().to_string())
+                        }
+                        Err(error) => format!("{}: {error:#}", t(lang, Key::CommonFailed)),
                     }
                 });
             }
-            if ui.button("分析截图...").clicked()
+            if ui.button(t(lang, Key::DiagAnalyzeImage)).clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("图片", &["png", "jpg", "jpeg"])
                     .pick_file()
             {
                 match analyze_image_file(&path) {
                     Ok(analysis) => {
-                        self.status = format!(
-                            "视觉分析：state={:?} center={:?}",
-                            analysis.state,
-                            analysis.button.map(|button| (button.cx, button.cy))
-                        );
+                        let state = match analysis.state {
+                            crate::vision::ButtonState::Gray => t(lang, Key::ButtonGray),
+                            crate::vision::ButtonState::Locating => t(lang, Key::ButtonLocating),
+                            crate::vision::ButtonState::Ready => t(lang, Key::ButtonReady),
+                            crate::vision::ButtonState::Success => t(lang, Key::ButtonSuccess),
+                            crate::vision::ButtonState::Unknown => t(lang, Key::ButtonUnknown),
+                        };
+                        let mut message = t(lang, Key::DiagImageState).replace("{}", state);
+                        if let Some(button) = analysis.button {
+                            message.push_str("; ");
+                            message.push_str(
+                                &t(lang, Key::DiagImageCenter)
+                                    .replacen("{}", &button.cx.to_string(), 1)
+                                    .replacen("{}", &button.cy.to_string(), 1),
+                            );
+                        }
+                        self.status = message;
                     }
-                    Err(error) => self.status = format!("视觉分析失败: {:#}", error),
+                    Err(error) => {
+                        self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed))
+                    }
                 }
             }
-            if ui.button("刷新最近运行结果").clicked() {
+            if ui.button(t(lang, Key::DiagRefreshResult)).clicked() {
                 self.refresh_latest_result();
-                self.status = "最近运行结果已刷新".into();
+                self.status = t(lang, Key::DiagResultRefreshed).into();
             }
         });
-        ui.label("诊断和报告导出不会执行签到点击。报告不包含 Token、Cookie 或定位地址。");
-        ui.separator();
+        ui.label(t(lang, Key::DiagNote));
+        page_section(ui, lang, Key::PageLatestResult);
         if let Some(path) = &self.report_path {
-            ui.label(format!("最近导出的报告：{}", path));
+            ui.label(t(lang, Key::DiagReportPath).replace("{}", path));
         }
         if let Some(dir) = &self.latest_log_dir {
-            ui.label(format!("最近运行日志：{}", dir));
+            ui.label(t(lang, Key::DiagLatestLog).replace("{}", dir));
         } else {
-            ui.label("尚未找到 result.json");
+            ui.label(t(lang, Key::DiagNoRun));
         }
         if let Some(result) = &self.latest_result {
-            ui.horizontal(|ui| {
-                ui.label(format!("模式：{}", result.mode));
-                ui.label(format!(
-                    "Profile：{}",
-                    result.profile_id.as_deref().unwrap_or("unknown")
+            let mode = t(
+                lang,
+                if result.mode == "live" {
+                    Key::ModeLiveShort
+                } else {
+                    Key::ModeDryRunShort
+                },
+            );
+            let profile = result
+                .profile_id
+                .clone()
+                .unwrap_or_else(|| t(lang, Key::CommonNotRead).to_string());
+            let serial = if result.serial.is_empty() {
+                t(lang, Key::CommonNotRead)
+            } else {
+                result.serial.as_str()
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(t(lang, Key::DiagMode).replace("{}", mode));
+                ui.label(t(lang, Key::DiagProfile).replace("{}", &profile));
+                ui.label(
+                    t(lang, Key::DiagPage)
+                        .replace("{}", ui_text::page_route_label(lang, result.page_route)),
+                );
+                ui.label(
+                    t(lang, Key::DiagCheckinType)
+                        .replace("{}", ui_text::checkin_mode_label(lang, result.checkin_mode)),
+                );
+                ui.label(t(lang, Key::DiagCheckinState).replace(
+                    "{}",
+                    ui_text::checkin_state_label(lang, result.checkin_state),
+                ));
+                ui.label(t(lang, Key::DiagClicked).replace(
+                    "{}",
+                    t(
+                        lang,
+                        if result.clicked {
+                            Key::CommonYes
+                        } else {
+                            Key::CommonNo
+                        },
+                    ),
                 ));
                 ui.label(format!(
-                    "页面：{}",
-                    result
-                        .page_route
-                        .map(|route| route.as_str())
-                        .unwrap_or("unknown")
+                    "{}: {}",
+                    t(lang, Key::StatusLabelStatus),
+                    ui_text::run_result_label(lang, Some(result))
                 ));
-                ui.label(format!(
-                    "业务：{}",
-                    result
-                        .checkin_mode
-                        .map(|mode| mode.as_str())
-                        .unwrap_or("unknown")
-                ));
-                ui.label(format!(
-                    "签到状态：{}",
-                    result
-                        .checkin_state
-                        .map(|state| state.as_str())
-                        .unwrap_or("unknown")
-                ));
-                ui.label(format!(
-                    "点击：{}",
-                    if result.clicked { "是" } else { "否" }
-                ));
-                ui.label(format!("结果：{}", run_result_status(result)));
-                if let Some(auto_login) = auto_login_status(result) {
-                    ui.label(format!("自动登录：{auto_login}"));
+                if let Some(auto_login) = auto_login_status(lang, result) {
+                    ui.label(t(lang, Key::DiagAutoLogin).replace("{}", auto_login));
                 }
             });
             if let Some(date) = &result.success_date {
-                ui.label(format!("页面日期：{date}"));
+                ui.label(t(lang, Key::DiagPageDate).replace("{}", date));
             }
             if let Some(error) = &result.error {
                 // `result.error` is the human-readable detail for a propagated
-                // failure (`boot_timeout: Android 系统未在 ... 内完成引导`), so the
-                // hint must be looked up from the *machine code*, not from the
-                // message text — otherwise every classified wait failure falls
-                // through to the generic "请查看诊断报告" hint.
+                // failure, so the hint must be looked up from the *machine code*
+                // first; otherwise every classified wait failure falls through
+                // to the generic hint.
                 let hint = result
                     .error_code
                     .as_deref()
-                    .map(explain_error)
-                    .unwrap_or_else(|| explain_error(error));
+                    .map(|code| ui_text::explain_error(lang, code))
+                    .unwrap_or_else(|| ui_text::explain_error(lang, error));
                 ui.colored_label(
                     egui::Color32::LIGHT_RED,
-                    format!("错误：{}（{}）", error, hint),
+                    t(lang, Key::DiagError)
+                        .replacen("{}", error, 1)
+                        .replacen("{}", hint, 1),
                 );
             } else if result.field_work_ready {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "外勤签到状态已识别为 ready；仅 dry-run 观察，未执行点击。",
-                );
+                ui.colored_label(egui::Color32::YELLOW, t(lang, Key::DiagFieldWorkReady));
             } else {
-                ui.colored_label(egui::Color32::LIGHT_GREEN, "未记录运行错误");
-            }
-            if let Some(stage) = &result.error_stage {
-                ui.label(format!("失败阶段：{stage}"));
+                ui.colored_label(egui::Color32::LIGHT_GREEN, t(lang, Key::DiagNoError));
             }
             if let Some(action) = &result.recovery_action {
-                ui.label(format!("建议操作：{action}"));
+                ui.label(t(lang, Key::DiagAction).replace("{}", action));
             }
-            ui.label(format!("状态历史：{}", result.state_history.join(" → ")));
-            ui.label(format!(
-                "ADB serial：{}",
-                if result.serial.is_empty() {
-                    "unknown"
-                } else {
-                    &result.serial
+            ui.collapsing(t(lang, Key::StatusTechnical), |ui| {
+                if let Some(code) = &result.error_code {
+                    ui.label(t(lang, Key::StatusErrorCode).replace("{}", code));
                 }
-            ));
+                if let Some(stage) = &result.error_stage {
+                    ui.label(t(lang, Key::DiagStage).replace("{}", stage));
+                }
+                ui.label(
+                    t(lang, Key::DiagHistory).replace("{}", &result.state_history.join(" -> ")),
+                );
+                ui.label(t(lang, Key::DiagSerial).replace("{}", serial));
+            });
         }
         ui.separator();
-        ui.label("默认模式为 dry-run。只有普通签到页面可进入 live 点击策略；外勤签到与未知模式保持无点击观察。");
+        ui.label(t(lang, Key::DiagDefaultNote));
     }
 
     /// Structured status card for the most recent run.
     ///
     /// Route, page loading, button state, locating state and foreground package
     /// are shown as separate dimensions: "the button is not ready yet" must not
-    /// read as "the page is unknown" (requirement FR-016).
+    /// read as "the page is unknown" (requirement FR-016). Raw machine values
+    /// live only inside the collapsed technical-details section.
     fn render_run_status_card(&self, ui: &mut egui::Ui) {
+        let lang = self.lang();
         ui.group(|ui| {
-            ui.label(egui::RichText::new("最近运行状态").strong());
+            ui.label(egui::RichText::new(t(lang, Key::StatusCardTitle)).strong());
             let Some(result) = &self.latest_result else {
-                ui.label("暂无 result.json;先运行一次 dry-run。");
+                ui.label(t(lang, Key::StatusCardEmpty));
                 return;
             };
-            let unknown = |value: Option<&str>| value.unwrap_or("unknown").to_string();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("status={}", unknown(result.status.as_deref())));
-                ui.label(format!(
-                    "route={}",
-                    unknown(
-                        result.route.as_deref().or_else(|| {
-                            result.page_route.map(crate::domain::PageRoute::as_str)
-                        })
-                    )
-                ));
-                ui.label(format!(
-                    "mode={}",
-                    unknown(result.checkin_mode.map(crate::domain::CheckinMode::as_str))
-                ));
-                ui.label(format!(
-                    "button={}",
-                    unknown(result.button_state.as_deref())
-                ));
-                ui.label(format!(
-                    "location={}",
-                    unknown(result.location_state.as_deref())
-                ));
-                ui.label(format!(
-                    "page_loading={}",
-                    result
-                        .page_loading
-                        .map(|value| if value { "yes" } else { "no" })
-                        .unwrap_or("unknown")
-                ));
-                ui.label(format!(
-                    "hierarchy={}",
-                    unknown(result.hierarchy_status.as_deref())
-                ));
-                if let Some(overlay) = &result.overlay_package {
-                    ui.colored_label(
-                        egui::Color32::LIGHT_RED,
-                        format!("检测到遮挡窗口：{overlay}（弹窗/广告，请手动关闭）"),
-                    );
-                }
-                ui.label(format!(
-                    "foreground={}",
-                    unknown(result.foreground_package.as_deref())
-                ));
-                ui.label(format!(
-                    "refresh={}/{}",
-                    result
-                        .page_refresh_attempted
-                        .map(|value| if value { "attempted" } else { "not_needed" })
-                        .unwrap_or("unknown"),
-                    result
-                        .page_refresh_confirmed
-                        .map(|value| if value { "confirmed" } else { "unconfirmed" })
-                        .unwrap_or("unknown")
-                ));
-            });
-            if let Some(code) = &result.error_code {
+            egui::Grid::new("run_status_card")
+                .striped(true)
+                .min_col_width(110.0)
+                .show(ui, |ui| {
+                    for (label, value) in [
+                        (
+                            Key::StatusLabelStatus,
+                            ui_text::run_result_label(lang, Some(result)).to_string(),
+                        ),
+                        (
+                            Key::StatusLabelRoute,
+                            ui_text::page_route_label(lang, result.page_route).to_string(),
+                        ),
+                        (
+                            Key::StatusLabelMode,
+                            ui_text::checkin_mode_label(lang, result.checkin_mode).to_string(),
+                        ),
+                        (
+                            Key::StatusLabelButton,
+                            ui_text::button_state_label(lang, result.button_state.as_deref())
+                                .to_string(),
+                        ),
+                        (
+                            Key::StatusLabelLocation,
+                            ui_text::location_state_label(lang, result.location_state.as_deref())
+                                .to_string(),
+                        ),
+                        (
+                            Key::StatusLabelLoading,
+                            ui_text::page_loading_label(lang, result.page_loading).to_string(),
+                        ),
+                        (
+                            Key::StatusLabelHierarchy,
+                            ui_text::hierarchy_status_label(
+                                lang,
+                                result.hierarchy_status.as_deref(),
+                            )
+                            .to_string(),
+                        ),
+                        (
+                            Key::StatusLabelForeground,
+                            result
+                                .foreground_package
+                                .clone()
+                                .unwrap_or_else(|| t(lang, Key::CommonNotRead).to_string()),
+                        ),
+                        (
+                            Key::StatusLabelRefresh,
+                            ui_text::refresh_label(
+                                lang,
+                                result.page_refresh_attempted,
+                                result.page_refresh_confirmed,
+                            ),
+                        ),
+                        (
+                            Key::StatusLabelClicked,
+                            t(
+                                lang,
+                                if result.clicked {
+                                    Key::StatusClicked
+                                } else {
+                                    Key::StatusNotClicked
+                                },
+                            )
+                            .to_string(),
+                        ),
+                    ] {
+                        ui.label(t(lang, label));
+                        ui.label(value);
+                        ui.end_row();
+                    }
+                });
+            if let Some(overlay) = &result.overlay_package {
                 ui.colored_label(
                     egui::Color32::LIGHT_RED,
-                    format!(
-                        "error_code={} ({});stage={}",
-                        code,
-                        explain_error(code),
-                        unknown(result.error_stage.as_deref())
-                    ),
+                    t(lang, Key::StatusOverlay).replace("{}", overlay),
                 );
+            }
+            if let Some(code) = &result.error_code {
+                ui.colored_label(egui::Color32::LIGHT_RED, ui_text::explain_error(lang, code));
             } else {
-                ui.colored_label(egui::Color32::LIGHT_GREEN, "未记录机器错误码");
+                ui.colored_label(egui::Color32::LIGHT_GREEN, t(lang, Key::StatusNoErrorCode));
             }
             if let Some(action) = &result.recovery_action {
-                ui.label(format!("建议操作:{action}"));
+                ui.label(t(lang, Key::StatusRecovery).replace("{}", action));
             }
+            ui.collapsing(t(lang, Key::StatusTechnical), |ui| {
+                if let Some(code) = &result.error_code {
+                    ui.label(t(lang, Key::StatusErrorCode).replace("{}", code));
+                }
+                if let Some(stage) = &result.error_stage {
+                    ui.label(t(lang, Key::StatusStage).replace("{}", stage));
+                }
+                ui.label(
+                    t(lang, Key::DiagHistory).replace("{}", &result.state_history.join(" -> ")),
+                );
+                let serial = if result.serial.is_empty() {
+                    t(lang, Key::CommonNotRead)
+                } else {
+                    result.serial.as_str()
+                };
+                ui.label(t(lang, Key::DiagSerial).replace("{}", serial));
+            });
         });
     }
 
     fn instances_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("模拟器实例");
-        if ui.button("刷新实例列表").clicked() {
+        let lang = self.lang();
+        ui.heading(t(lang, Key::InstHeading));
+        ui.label(t(lang, Key::InstIntro));
+        if ui.button(t(lang, Key::InstRefresh)).clicked() {
             match list_instance_summaries(&self.store) {
                 Ok(instances) => {
-                    self.status = format!("检测到 {} 个实例", instances.len());
+                    self.status = t(lang, Key::StatusInstancesFound)
+                        .replace("{}", &instances.len().to_string());
                     self.instance_summaries = instances;
                 }
-                Err(error) => self.status = format!("实例列表失败: {:#}", error),
+                Err(error) => self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed)),
             }
         }
         if self.instance_summaries.is_empty()
@@ -1541,98 +1754,141 @@ impl GuiApp {
         {
             self.instance_summaries = instances;
         }
-        egui::Grid::new("instances").striped(true).show(ui, |ui| {
-            ui.label("index");
-            ui.label("名称");
-            ui.label("运行");
-            ui.label("TCP ADB serial");
-            ui.label("list2 报告端口（参考）");
-            ui.label("尺寸/DPI");
-            ui.label("Profile");
-            ui.label("启用");
-            ui.end_row();
-            for instance in &self.instance_summaries {
-                ui.label(instance.index.to_string());
-                ui.label(&instance.name);
-                ui.label(if instance.running { "是" } else { "否" });
-                ui.label(&instance.serial);
-                ui.label(
-                    instance
-                        .ldplayer_reported_port
-                        .map(|port| port.to_string())
-                        .unwrap_or_else(|| "未知".into()),
-                )
-                .on_hover_text(
-                    "ldconsole list2 原始报告字段；不是本程序用于 adb connect 的 TCP ADB serial。",
-                );
-                ui.label(format!(
-                    "{}x{}@{}",
-                    instance.width.unwrap_or(0),
-                    instance.height.unwrap_or(0),
-                    instance.dpi.unwrap_or(0)
-                ));
-                ui.label(instance.profile_id.as_deref().unwrap_or("unknown"));
-                ui.label(if instance.enabled { "是" } else { "否" });
+        page_section(ui, lang, Key::PageInstanceList);
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            egui::Grid::new("instances").striped(true).show(ui, |ui| {
+                ui.label(t(lang, Key::InstColIndex));
+                ui.label(t(lang, Key::InstColName));
+                ui.label(t(lang, Key::InstColRunning));
+                ui.label(t(lang, Key::InstColSerial));
+                ui.label(t(lang, Key::InstColPort));
+                ui.label(t(lang, Key::InstColGeometry));
+                ui.label(t(lang, Key::InstColProfile));
+                ui.label(t(lang, Key::InstColEnabled));
                 ui.end_row();
-            }
+                for instance in &self.instance_summaries {
+                    ui.label(instance.index.to_string());
+                    ui.label(&instance.name);
+                    ui.label(t(
+                        lang,
+                        if instance.running {
+                            Key::CommonYes
+                        } else {
+                            Key::CommonNo
+                        },
+                    ));
+                    ui.label(&instance.serial);
+                    ui.label(
+                        instance
+                            .ldplayer_reported_port
+                            .map(|port| port.to_string())
+                            .unwrap_or_else(|| t(lang, Key::CommonUnknown).to_string()),
+                    )
+                    .on_hover_text(t(lang, Key::InstPortHover));
+                    ui.label(format!(
+                        "{}x{}@{}",
+                        instance.width.unwrap_or(0),
+                        instance.height.unwrap_or(0),
+                        instance.dpi.unwrap_or(0)
+                    ));
+                    ui.label(
+                        instance
+                            .profile_id
+                            .as_deref()
+                            .unwrap_or_else(|| t(lang, Key::CommonNotRead)),
+                    );
+                    ui.label(t(
+                        lang,
+                        if instance.enabled {
+                            Key::CommonYes
+                        } else {
+                            Key::CommonNo
+                        },
+                    ));
+                    ui.end_row();
+                }
+            });
         });
+        ui.add_space(6.0);
+        ui.label(t(lang, Key::TermPortNote));
     }
 
     fn profiles(&mut self, ui: &mut egui::Ui) {
-        ui.heading("内置 Profile");
-        ui.label(format!("当前实例 index：{}", self.selected_instance_index));
-        if ui.button("检测当前模拟器 Profile").clicked() {
+        let lang = self.lang();
+        ui.heading(t(lang, Key::ProfilesHeading));
+        ui.label(t(lang, Key::ProfilesIntro));
+        ui.label(
+            t(lang, Key::ProfilesCurrent).replace("{}", &self.selected_instance_index.to_string()),
+        );
+        if ui.button(t(lang, Key::ProfilesDetect)).clicked() {
             let store = self.store.clone();
             let target = self.instance_target();
-            self.start_background_job("Profile 检测", move || {
+            self.start_background_job(t(lang, Key::ProfilesDetectJob), move || {
                 match runtime_with_target(&store, false, Some(&target)) {
                     Ok((_, device, info)) => {
                         let exact =
                             profile::find_profile(info.width, info.height, info.density_dpi);
                         match exact {
-                            Some(p) => format!(
-                                "当前 {} {}x{}@{}，匹配 {}",
-                                device.serial, info.width, info.height, info.density_dpi, p.id
-                            ),
-                            None => format!(
-                                "当前 {} {}x{}@{}，没有精确匹配 profile",
-                                device.serial, info.width, info.height, info.density_dpi
-                            ),
+                            Some(p) => t(lang, Key::ProfilesDetectMatch)
+                                .replacen("{}", &device.serial, 1)
+                                .replacen("{}", &info.width.to_string(), 1)
+                                .replacen("{}", &info.height.to_string(), 1)
+                                .replacen("{}", &info.density_dpi.to_string(), 1)
+                                .replacen("{}", p.id, 1),
+                            None => t(lang, Key::ProfilesDetectNoMatch)
+                                .replacen("{}", &device.serial, 1)
+                                .replacen("{}", &info.width.to_string(), 1)
+                                .replacen("{}", &info.height.to_string(), 1)
+                                .replacen("{}", &info.density_dpi.to_string(), 1),
                         }
                     }
-                    Err(e) => format!("失败: {:#}", e),
+                    Err(e) => format!("{}: {e:#}", t(lang, Key::CommonFailed)),
                 }
             });
         }
-        ui.label("已标定 Profile 优先显示；未标定项仍可同步配置，但不允许用于 live 点击。");
-        egui::ScrollArea::both()
+        ui.label(t(lang, Key::ProfilesNote));
+        page_section(ui, lang, Key::PagePresetList);
+        egui::ScrollArea::horizontal()
             .id_salt("profile_table_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_min_width(720.0);
                 egui::Grid::new("profiles").striped(true).show(ui, |ui| {
-                    ui.label("ID");
-                    ui.label("尺寸");
-                    ui.label("DPI");
-                    ui.label("方向");
-                    ui.label("运行资格");
-                    ui.label("操作");
+                    ui.label(t(lang, Key::ProfilesColId));
+                    ui.label(t(lang, Key::ProfilesColSize));
+                    ui.label(t(lang, Key::ProfilesColDpi));
+                    ui.label(t(lang, Key::ProfilesColOrientation));
+                    ui.label(t(lang, Key::ProfilesColEligibility));
+                    ui.label(t(lang, Key::ProfilesColAction));
                     ui.end_row();
                     for p in ordered_profiles() {
                         if profile::is_ldplayer_preset(p.width, p.height, p.density_dpi) {
                             ui.label(p.id);
                         } else {
-                            ui.label(format!("{}（历史）", p.id));
+                            ui.label(format!("{}{}", p.id, t(lang, Key::ProfilesHistory)));
                         }
                         ui.label(format!("{}x{}", p.width, p.height));
                         ui.label(p.density_dpi.to_string());
-                        ui.label(p.orientation.as_str());
-                        ui.label(if p.calibrated {
-                            "已标定"
-                        } else {
-                            "仅 dry-run"
-                        });
-                        if ui.button(format!("准备同步##{}", p.id)).clicked() {
+                        ui.label(t(
+                            lang,
+                            if p.orientation.as_str() == "landscape" {
+                                Key::OrientationLandscape
+                            } else {
+                                Key::OrientationPortrait
+                            },
+                        ));
+                        ui.label(t(
+                            lang,
+                            if p.calibrated {
+                                Key::ProfilesCalibrated
+                            } else {
+                                Key::ProfilesDryOnly
+                            },
+                        ));
+                        if ui
+                            .button(format!("{}##{}", t(lang, Key::ProfilesSync), p.id))
+                            .clicked()
+                        {
                             self.pending_sync = Some(p.id.to_string());
                         }
                         ui.end_row();
@@ -1645,31 +1901,44 @@ impl GuiApp {
         let Some(intent) = self.pending_live_run.clone() else {
             return;
         };
+        let lang = self.lang();
         let mut action = None;
-        egui::Window::new("确认正式 live 运行")
+        egui::Window::new(t(lang, Key::LiveTitle))
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
                 let scope = if intent.all_instances {
-                    "全部已启用实例"
+                    t(lang, Key::LiveScopeAll)
                 } else {
-                    "当前选择的实例"
+                    t(lang, Key::LiveScopeOne)
                 };
-                ui.colored_label(egui::Color32::YELLOW, format!("范围：{}", scope));
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    t(lang, Key::LiveScope).replace("{}", scope),
+                );
                 // Show the snapshot, not the current state: the user reviews
                 // exactly what will run.
-                ui.label(format!("配置文件：{}", intent.config_path.display()));
-                ui.label(format!("数据目录：{}", intent.data_root.display()));
+                ui.label(
+                    t(lang, Key::LiveConfigPath)
+                        .replace("{}", &intent.config_path.display().to_string()),
+                );
+                ui.label(
+                    t(lang, Key::LiveDataRoot)
+                        .replace("{}", &intent.data_root.display().to_string()),
+                );
                 if !intent.all_instances {
-                    ui.label(format!("实例 index：{}", intent.instance_index));
+                    ui.label(
+                        t(lang, Key::LiveInstanceIndex)
+                            .replace("{}", &intent.instance_index.to_string()),
+                    );
                 }
-                ui.label("将执行真实签到点击。普通签到仍检查 calibrated Profile、时间窗口、前台包名、连续 ready 和点击前二次确认；外勤签到还要求 config.toml 中显式设置 runtime.allow_field_work_live = true，并使用外勤页面自己的按钮。程序不会把外勤降级为普通签到。" );
-                ui.label("请确认设备、实例和当前页面均正确；确认后将调用 CLI 同一套 run --live --confirm 业务逻辑。");
+                ui.label(t(lang, Key::LiveWarning));
+                ui.label(t(lang, Key::LiveConfirmNote));
                 ui.horizontal(|ui| {
-                    if ui.button("确认 live").clicked() {
+                    if ui.button(t(lang, Key::LiveConfirm)).clicked() {
                         action = Some(true);
                     }
-                    if ui.button("取消").clicked() {
+                    if ui.button(t(lang, Key::CommonCancel)).clicked() {
                         action = Some(false);
                     }
                 });
@@ -1681,14 +1950,12 @@ impl GuiApp {
                 // data root changed. Never run live against a different target
                 // than the one displayed.
                 if self.live_intent() != intent {
-                    self.status =
-                        "配置、数据目录或实例已在确认前变化；live 未启动，请重新准备 live 运行。"
-                            .into();
+                    self.status = t(lang, Key::LiveChanged).into();
                 } else {
                     self.start_run(true);
                 }
             } else {
-                self.status = "已取消 live 运行".into();
+                self.status = t(lang, Key::StatusCanceledLive).into();
             }
         }
     }
@@ -1697,22 +1964,22 @@ impl GuiApp {
         let Some(id) = self.pending_sync.clone() else {
             return;
         };
-
+        let lang = self.lang();
         let mut action = None;
-        egui::Window::new("确认 Profile 同步")
+        egui::Window::new(t(lang, Key::SyncTitle))
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
                 ui.colored_label(
                     egui::Color32::YELLOW,
-                    format!("将修改 LDPlayer 分辨率/DPI 并重启实例：{}", id),
+                    t(lang, Key::SyncWarning).replace("{}", &id),
                 );
-                ui.label("同步会先备份已有配置；执行期间请不要手动操作模拟器。\n确认继续吗？");
+                ui.label(t(lang, Key::SyncNote));
                 ui.horizontal(|ui| {
-                    if ui.button("确认同步").clicked() {
+                    if ui.button(t(lang, Key::SyncConfirm)).clicked() {
                         action = Some(true);
                     }
-                    if ui.button("取消").clicked() {
+                    if ui.button(t(lang, Key::CommonCancel)).clicked() {
                         action = Some(false);
                     }
                 });
@@ -1724,49 +1991,63 @@ impl GuiApp {
                 let store = self.store.clone();
                 let sync_id = id.clone();
                 let target = self.instance_target();
-                self.start_background_job(format!("同步 {}", id), move || {
+                self.start_background_job(t(lang, Key::SyncJob).replace("{}", &id), move || {
                     match sync_profile(&store, &sync_id, true, &target) {
-                        Ok(code) => format!("完成，退出码 {:?}", code),
-                        Err(e) => format!("失败: {:#}", e),
+                        Ok(code) => format!(
+                            "{}: {}",
+                            t(lang, Key::CommonFinished),
+                            ui_text::exit_code_label(lang, code)
+                        ),
+                        Err(e) => format!("{}: {e:#}", t(lang, Key::CommonFailed)),
                     }
                 });
             } else {
-                self.status = "已取消 Profile 同步".into();
+                self.status = t(lang, Key::StatusCanceledSync).into();
             }
         }
     }
 
     fn tasks_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("计划任务");
-        ui.label("计划任务默认创建为 dry-run；正式模式必须显式勾选并确认。\n");
+        let lang = self.lang();
+        ui.heading(t(lang, Key::TasksHeading));
+        ui.label(t(lang, Key::TasksIntro));
+        page_section(ui, lang, Key::PageTaskSettings);
         ui.horizontal(|ui| {
-            ui.label("任务名称");
+            ui.label(t(lang, Key::TasksName));
             ui.text_edit_singleline(&mut self.task_name);
         });
-        ui.checkbox(&mut self.task_live, "创建 live 任务（需要显式确认）");
-        ui.checkbox(&mut self.task_all_instances, "计划任务依次运行全部配置实例");
+        ui.checkbox(&mut self.task_live, t(lang, Key::TasksLive));
+        ui.checkbox(
+            &mut self.task_all_instances,
+            t(lang, Key::TasksAllInstances),
+        );
         ui.horizontal(|ui| {
-            if ui.button("查询任务").clicked() {
+            if ui.button(t(lang, Key::TasksQuery)).clicked() {
                 let name = self.task_name.clone();
                 let config_path = self.store.path.clone();
-                self.start_background_job("计划任务查询", move || {
+                self.start_background_job(t(lang, Key::TasksQuery), move || {
                     match task_command(TaskRequest::Query { name }, Some(&config_path)) {
-                        Ok(code) => format!("完成，退出码 {:?}", code),
-                        Err(error) => format!("失败: {:#}", error),
+                        Ok(code) => format!(
+                            "{}: {}",
+                            t(lang, Key::CommonFinished),
+                            ui_text::exit_code_label(lang, code)
+                        ),
+                        Err(error) => format!("{}: {error:#}", t(lang, Key::CommonFailed)),
                     }
                 });
             }
-            if ui.button("创建任务").clicked() {
+            if ui.button(t(lang, Key::TasksCreate)).clicked() {
                 let name = self.task_name.clone();
                 let live = self.task_live;
                 let all_instances = self.task_all_instances;
                 let config_path = self.store.path.clone();
                 let target = self.instance_target();
                 if live {
-                    self.status = "live 计划任务需要再次确认；请点击下方确认按钮".into();
+                    self.status = t(lang, Key::TasksLiveNeedsConfirm).into();
                 } else {
-                    self.start_background_job("创建 dry-run 计划任务", move || {
-                        match task_command(
+                    self.start_background_job(
+                        t(lang, Key::TasksCreate),
+                        move || match task_command(
                             TaskRequest::Create {
                                 name,
                                 dry_run: true,
@@ -1777,16 +2058,20 @@ impl GuiApp {
                             },
                             Some(&config_path),
                         ) {
-                            Ok(code) => format!("完成,退出码 {:?}", code),
-                            Err(error) => format!("失败: {:#}", error),
-                        }
-                    });
+                            Ok(code) => format!(
+                                "{}: {}",
+                                t(lang, Key::CommonFinished),
+                                ui_text::exit_code_label(lang, code)
+                            ),
+                            Err(error) => format!("{}: {error:#}", t(lang, Key::CommonFailed)),
+                        },
+                    );
                 }
             }
-            if ui.button("删除任务").clicked() {
+            if ui.button(t(lang, Key::TasksDelete)).clicked() {
                 let name = self.task_name.clone();
                 let config_path = self.store.path.clone();
-                self.start_background_job("删除计划任务", move || {
+                self.start_background_job(t(lang, Key::TasksDelete), move || {
                     match task_command(
                         TaskRequest::Delete {
                             name,
@@ -1794,25 +2079,27 @@ impl GuiApp {
                         },
                         Some(&config_path),
                     ) {
-                        Ok(code) => format!("完成，退出码 {:?}", code),
-                        Err(error) => format!("失败: {:#}", error),
+                        Ok(code) => format!(
+                            "{}: {}",
+                            t(lang, Key::CommonFinished),
+                            ui_text::exit_code_label(lang, code)
+                        ),
+                        Err(error) => format!("{}: {error:#}", t(lang, Key::CommonFailed)),
                     }
                 });
             }
         });
         if self.task_live {
             ui.separator();
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "正式计划任务会每天在签到窗口开始时间执行 live；必须再次确认。",
-            );
-            if ui.button("确认创建 live 计划任务").clicked() {
+            ui.colored_label(egui::Color32::YELLOW, t(lang, Key::TasksLiveWarning));
+            if ui.button(t(lang, Key::TasksConfirmLive)).clicked() {
                 let name = self.task_name.clone();
                 let all_instances = self.task_all_instances;
                 let target = self.instance_target();
                 let config_path = self.store.path.clone();
-                self.start_background_job("创建 live 计划任务", move || {
-                    match task_command(
+                self.start_background_job(
+                    t(lang, Key::TasksConfirmLive),
+                    move || match task_command(
                         TaskRequest::Create {
                             name,
                             dry_run: false,
@@ -1823,50 +2110,60 @@ impl GuiApp {
                         },
                         Some(&config_path),
                     ) {
-                        Ok(code) => format!("完成，退出码 {:?}", code),
-                        Err(error) => format!("失败: {:#}", error),
-                    }
-                });
+                        Ok(code) => format!(
+                            "{}: {}",
+                            t(lang, Key::CommonFinished),
+                            ui_text::exit_code_label(lang, code)
+                        ),
+                        Err(error) => format!("{}: {error:#}", t(lang, Key::CommonFailed)),
+                    },
+                );
                 self.task_live = false;
             }
         }
-        ui.separator();
-        ui.label(format!(
-            "配置窗口：{}–{}",
-            self.store.config.window.start, self.store.config.window.end
-        ));
-        ui.label("GUI 不提供直接 live 签到按钮；计划任务 live 仍受 CLI 的全部门禁保护。");
+        page_section(ui, lang, Key::PageTaskWindow);
+        ui.label(
+            t(lang, Key::TasksWindow)
+                .replacen("{}", &self.store.config.window.start, 1)
+                .replacen("{}", &self.store.config.window.end, 1),
+        );
+        ui.label(t(lang, Key::TasksGuiNote));
     }
 
     fn logs_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("运行日志与结果");
+        let lang = self.lang();
+        ui.heading(t(lang, Key::LogsHeading));
         ui.horizontal_wrapped(|ui| {
-            if ui.button("刷新列表").clicked() {
+            if ui.button(t(lang, Key::LogsRefresh)).clicked() {
                 self.refresh_logs();
             }
-            if ui.button("打开 logs 目录").clicked() {
+            if ui.button(t(lang, Key::LogsOpenDir)).clicked() {
                 match crate::process::open_path(&self.store.root.join("logs")) {
-                    Ok(()) => self.status = "已打开 logs 目录".into(),
-                    Err(error) => self.status = format!("打开 logs 目录失败: {error:#}"),
+                    Ok(()) => self.status = t(lang, Key::StatusLogsDirOpened).into(),
+                    Err(error) => {
+                        self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed))
+                    }
                 }
             }
-            if ui.button("导出诊断报告").clicked() {
+            if ui.button(t(lang, Key::LogsExportReport)).clicked() {
                 self.export_report();
             }
-            if ui.button("打开最近报告").clicked() {
+            if ui.button(t(lang, Key::LogsOpenReport)).clicked() {
                 match self.report_path.as_ref().map(std::path::PathBuf::from) {
                     Some(path) => match crate::process::open_path(&path) {
-                        Ok(()) => self.status = "已打开诊断报告".into(),
-                        Err(error) => self.status = format!("打开诊断报告失败: {error:#}"),
+                        Ok(()) => self.status = t(lang, Key::StatusReportOpened).into(),
+                        Err(error) => {
+                            self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed))
+                        }
                     },
-                    None => self.status = "请先导出诊断报告".into(),
+                    None => self.status = t(lang, Key::StatusExportReportFirst).into(),
                 }
             }
             ui.add_space(10.0);
-            ui.label("筛选");
+            ui.label(t(lang, Key::LogsFilter));
             ui.add(
                 egui::TextEdit::singleline(&mut self.logs_filter)
-                    .hint_text("类型、状态、摘要或路径")
+                    .hint_text(t(lang, Key::LogsFilterHint))
                     .desired_width(210.0),
             );
         });
@@ -1875,26 +2172,33 @@ impl GuiApp {
         // reachable while browsing long directories and event summaries.
         ui.horizontal_wrapped(|ui| {
             if let Some(directory) = self.selected_log_directory.clone() {
-                ui.add(egui::Label::new(format!("选中：{}", directory.display())).truncate());
-                if ui.button("打开目录").clicked() {
+                ui.add(
+                    egui::Label::new(
+                        t(lang, Key::LogsSelected).replace("{}", &directory.display().to_string()),
+                    )
+                    .truncate(),
+                );
+                if ui.button(t(lang, Key::LogsOpen)).clicked() {
                     match crate::process::open_path(&directory) {
-                        Ok(()) => self.status = "已打开选中的日志目录".into(),
-                        Err(error) => self.status = format!("打开日志目录失败: {error:#}"),
+                        Ok(()) => self.status = t(lang, Key::StatusLogsDirOpened).into(),
+                        Err(error) => {
+                            self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed))
+                        }
                     }
                 }
-                if ui.button("复制路径").clicked() {
+                if ui.button(t(lang, Key::LogsCopyPath)).clicked() {
                     ui.ctx().copy_text(directory.display().to_string());
-                    self.status = "日志目录路径已复制".into();
+                    self.status = t(lang, Key::StatusPathCopied).into();
                 }
-                if ui.button("复制结果/证据").clicked() {
+                if ui.button(t(lang, Key::LogsCopyEvidence)).clicked() {
                     if let Some(preview) = &self.selected_log_preview {
                         ui.ctx().copy_text(preview.clone());
-                        self.status = "选中的结果/证据文本已复制".into();
+                        self.status = t(lang, Key::StatusEvidenceCopied).into();
                     } else {
-                        self.status = "选中目录没有可复制的证据文件".into();
+                        self.status = t(lang, Key::StatusNothingToCopy).into();
                     }
                 }
-                if ui.button("导出选中 JSON/证据").clicked() {
+                if ui.button(t(lang, Key::LogsExportSelected)).clicked() {
                     let file_name = self
                         .selected_log_artifact
                         .as_ref()
@@ -1906,13 +2210,18 @@ impl GuiApp {
                         rfd::FileDialog::new().set_file_name(file_name).save_file()
                     {
                         match logger::export_log_artifact(&directory, &destination) {
-                            Ok(path) => self.status = format!("日志证据已导出：{}", path.display()),
-                            Err(error) => self.status = format!("导出日志证据失败：{error:#}"),
+                            Ok(path) => {
+                                self.status = t(lang, Key::StatusEvidenceExported)
+                                    .replace("{}", &path.display().to_string())
+                            }
+                            Err(error) => {
+                                self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed))
+                            }
                         }
                     }
                 }
                 if directory.join("events.jsonl").is_file()
-                    && ui.button("导出 events.jsonl").clicked()
+                    && ui.button(t(lang, Key::LogsExportEvents)).clicked()
                     && let Some(destination) = rfd::FileDialog::new()
                         .set_file_name("events.jsonl")
                         .save_file()
@@ -1922,15 +2231,21 @@ impl GuiApp {
                         "events.jsonl",
                         &destination,
                     ) {
-                        Ok(path) => self.status = format!("事件日志已导出：{}", path.display()),
-                        Err(error) => self.status = format!("导出事件日志失败：{error:#}"),
+                        Ok(path) => {
+                            self.status = t(lang, Key::StatusEventLogExported)
+                                .replace("{}", &path.display().to_string())
+                        }
+                        Err(error) => {
+                            self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed))
+                        }
                     }
                 }
             } else {
-                ui.label("选择一条日志以查看和导出结果。");
+                ui.label(t(lang, Key::LogsSelectHint));
             }
         });
 
+        page_section(ui, lang, Key::PageRunHistory);
         let filter = self.logs_filter.trim().to_lowercase();
         let filtered: Vec<logger::LogSummary> = self
             .recent_logs
@@ -1952,9 +2267,9 @@ impl GuiApp {
         if filtered.is_empty() {
             ui.separator();
             ui.label(if self.recent_logs.is_empty() {
-                "尚未找到运行或同步日志。"
+                t(lang, Key::LogsEmpty)
             } else {
-                "没有匹配当前筛选条件的日志。"
+                t(lang, Key::LogsNoMatch)
             });
             // The filter only narrows the run list; the structured event
             // timeline belongs to the still-selected run and must stay visible.
@@ -1975,17 +2290,25 @@ impl GuiApp {
                     .striped(true)
                     .min_col_width(88.0)
                     .show(ui, |ui| {
-                        for heading in ["类型", "状态", "摘要", "日志目录"] {
-                            ui.label(egui::RichText::new(heading).strong());
+                        for heading in [
+                            Key::LogsColKind,
+                            Key::LogsColStatus,
+                            Key::LogsColSummary,
+                            Key::LogsColDir,
+                        ] {
+                            ui.label(egui::RichText::new(t(lang, heading)).strong());
                         }
                         ui.end_row();
                         for entry in &filtered {
                             let selected = selected_directory.as_ref() == Some(&entry.directory);
-                            let response = ui.selectable_label(selected, &entry.kind);
+                            let response = ui.selectable_label(
+                                selected,
+                                ui_text::log_kind_label(lang, &entry.kind),
+                            );
                             if response.clicked() || response.double_clicked() {
                                 clicked_directory = Some(entry.directory.clone());
                             }
-                            ui.label(&entry.status);
+                            ui.label(ui_text::log_status_label(lang, &entry.status));
                             let response = ui.add_sized(
                                 [430.0, 24.0],
                                 egui::Button::selectable(selected, &entry.summary).truncate(),
@@ -2010,8 +2333,8 @@ impl GuiApp {
         if let (Some(artifact), Some(preview)) =
             (&self.selected_log_artifact, &self.selected_log_preview)
         {
+            page_section(ui, lang, Key::LogsPreview);
             ui.horizontal(|ui| {
-                ui.label("证据预览");
                 ui.add(egui::Label::new(artifact.display().to_string()).truncate());
             });
             egui::ScrollArea::both()
@@ -2030,10 +2353,12 @@ impl GuiApp {
     /// navigation actions share one ordered view so a route decision can be
     /// read together with the same round's evidence (requirement FR-012).
     fn render_event_timeline(&self, ui: &mut egui::Ui) {
+        let lang = self.lang();
         ui.separator();
-        ui.label(egui::RichText::new("事件时间线(前台 / 层级 / 路由 / 导航)").strong());
+        page_anchor(ui, Key::PageEvents);
+        ui.label(egui::RichText::new(t(lang, Key::LogsTimeline)).strong());
         if self.recent_events.is_empty() {
-            ui.label("选中目录没有可展示的结构化事件(events.jsonl)。");
+            ui.label(t(lang, Key::LogsNoEvents));
             return;
         }
         let height = (ui.available_height() * 0.35).clamp(120.0, 300.0);
@@ -2047,8 +2372,8 @@ impl GuiApp {
                     .striped(true)
                     .min_col_width(96.0)
                     .show(ui, |ui| {
-                        for heading in ["时间", "事件", "摘要"] {
-                            ui.label(egui::RichText::new(heading).strong());
+                        for heading in [Key::LogsColTime, Key::LogsColEvent, Key::LogsColSummary] {
+                            ui.label(egui::RichText::new(t(lang, heading)).strong());
                         }
                         ui.end_row();
                         for event in &self.recent_events {
@@ -2069,33 +2394,43 @@ impl GuiApp {
         let Some(apk) = self.pending_apk_install.clone() else {
             return;
         };
+        let lang = self.lang();
         let mut action = None;
-        egui::Window::new("确认安装 APK")
+        egui::Window::new(t(lang, Key::ApkTitle))
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(format!("APK：{}", apk.display()));
+                ui.label(t(lang, Key::ApkPath).replace("{}", &apk.display().to_string()));
                 if let Some(metadata) = &self.pending_apk_metadata {
-                    ui.label(format!("APK 包名：{}", metadata.package_name));
-                    ui.label(format!(
-                        "APK versionName：{}",
-                        metadata.version_name.as_deref().unwrap_or("未知")
-                    ));
-                    ui.label(format!(
-                        "APK versionCode：{}",
-                        metadata.version_code.as_deref().unwrap_or("未知")
-                    ));
+                    ui.label(t(lang, Key::ApkPackageName).replace("{}", &metadata.package_name));
+                    ui.label(
+                        t(lang, Key::ApkVersionName).replace(
+                            "{}",
+                            metadata
+                                .version_name
+                                .as_deref()
+                                .unwrap_or(t(lang, Key::CommonUnknown)),
+                        ),
+                    );
+                    ui.label(
+                        t(lang, Key::ApkVersionCode).replace(
+                            "{}",
+                            metadata
+                                .version_code
+                                .as_deref()
+                                .unwrap_or(t(lang, Key::CommonUnknown)),
+                        ),
+                    );
                 }
-                ui.label(format!("目标包名：{}", self.store.config.app.package_name));
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "将连接当前模拟器并使用 adb install -r 安装/更新 APK。",
+                ui.label(
+                    t(lang, Key::AppPackage).replace("{}", &self.store.config.app.package_name),
                 );
+                ui.colored_label(egui::Color32::YELLOW, t(lang, Key::ApkWarning));
                 ui.horizontal(|ui| {
-                    if ui.button("确认安装").clicked() {
+                    if ui.button(t(lang, Key::CommonConfirm)).clicked() {
                         action = Some(true);
                     }
-                    if ui.button("取消").clicked() {
+                    if ui.button(t(lang, Key::CommonCancel)).clicked() {
                         action = Some(false);
                     }
                 });
@@ -2107,43 +2442,49 @@ impl GuiApp {
             if confirm {
                 let store = self.store.clone();
                 let target = self.instance_target();
-                self.start_background_job_with_kind("APK 安装", JobKind::AppInstall, move || {
-                    match install_apk(&store, &apk, &target) {
+                self.start_background_job_with_kind(
+                    t(lang, Key::ApkJob),
+                    JobKind::AppInstall,
+                    move || match install_apk(&store, &apk, &target) {
                         Ok(result) => (
-                            format!(
-                                "完成：{} {}；adb 输出：{}",
-                                result.package_name,
-                                result.version,
-                                result.install_output.trim()
-                            ),
+                            t(lang, Key::ApkDone)
+                                .replacen("{}", &result.package_name, 1)
+                                .replacen("{}", &result.version, 1)
+                                .replacen("{}", result.install_output.trim(), 1),
                             Some(result.version),
                         ),
-                        Err(error) => (format!("失败: {:#}", error), None),
-                    }
-                });
+                        Err(error) => (format!("{}: {error:#}", t(lang, Key::CommonFailed)), None),
+                    },
+                );
             } else {
-                self.status = "已取消 APK 安装".into();
+                self.status = t(lang, Key::StatusCanceledApk).into();
             }
         }
     }
 
     fn app_page(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang();
         if !self.app_version_checked && self.job.is_none() {
             self.start_app_version_query();
         }
-        ui.heading("应用管理");
-        ui.label(format!("目标包名：{}", self.store.config.app.package_name));
+        ui.heading(t(lang, Key::AppHeading));
+        ui.label(t(lang, Key::AppPackage).replace("{}", &self.store.config.app.package_name));
         ui.horizontal(|ui| {
-            ui.label("当前已安装版本");
-            ui.label(self.installed_version.as_deref().unwrap_or("尚未读取"));
-            if ui.button("刷新版本").clicked() {
+            ui.label(t(lang, Key::AppInstalledVersion));
+            ui.label(
+                self.installed_version
+                    .as_deref()
+                    .unwrap_or_else(|| t(lang, Key::AppNotRead)),
+            );
+            if ui.button(t(lang, Key::AppRefreshVersion)).clicked() {
                 self.start_app_version_query();
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("APK 路径");
+        page_section(ui, lang, Key::PageInstallPackage);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(t(lang, Key::AppApkPath));
             ui.text_edit_singleline(&mut self.apk_path);
-            if ui.button("浏览 APK...").clicked()
+            if ui.button(t(lang, Key::AppBrowse)).clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("Android APK", &["apk"])
                     .pick_file()
@@ -2151,15 +2492,15 @@ impl GuiApp {
                 self.save_apk_path(path);
             }
         });
-        if ui.button("保存 APK 路径").clicked() {
+        if ui.button(t(lang, Key::AppSavePath)).clicked() {
             let path = std::path::PathBuf::from(&self.apk_path);
             self.store.config.app.apk_path = config::path_for_config(&self.store.root, &path);
             match self.store.save() {
-                Ok(()) => self.status = "APK 路径已保存".into(),
-                Err(e) => self.status = format!("保存失败: {:#}", e),
+                Ok(()) => self.status = t(lang, Key::StatusDone).into(),
+                Err(e) => self.status = format!("{}: {e:#}", t(lang, Key::CommonFailed)),
             }
         }
-        if ui.button("安装/更新选中的 APK").clicked() {
+        if ui.button(t(lang, Key::AppInstall)).clicked() {
             match config::resolve_path(&self.store.root, &self.apk_path) {
                 Some(apk) if apk.is_file() => match inspect_apk_metadata(&apk) {
                     Ok(metadata) if metadata.package_name == self.store.config.app.package_name => {
@@ -2167,227 +2508,263 @@ impl GuiApp {
                         self.pending_apk_install = Some(apk);
                     }
                     Ok(metadata) => {
-                        self.status = format!(
-                            "APK 包名不匹配：实际={}，目标={}",
-                            metadata.package_name, self.store.config.app.package_name
-                        )
+                        self.status = t(lang, Key::AppPackageMismatch)
+                            .replacen("{}", &metadata.package_name, 1)
+                            .replacen("{}", &self.store.config.app.package_name, 1);
                     }
-                    Err(error) => self.status = format!("APK 检查失败: {:#}", error),
+                    Err(error) => {
+                        self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed))
+                    }
                 },
-                Some(apk) => self.status = format!("APK 不存在：{}", apk.display()),
-                None => self.status = "请先选择 APK".into(),
+                Some(apk) => {
+                    self.status = t(lang, Key::AppMissing).replace("{}", &apk.display().to_string())
+                }
+                None => self.status = t(lang, Key::AppChooseFirst).into(),
             }
         }
         if let Some(result) = &self.apk_install_result {
             ui.separator();
-            ui.label(format!("最近一次安装结果：{}", result));
+            ui.label(t(lang, Key::AppLatestInstall).replace("{}", result));
         }
-        ui.label("当前阶段支持标准 .apk；不自动下载、不修改账号或设备身份。安装前必须确认，安装后会校验目标包名和版本。");
+        ui.label(t(lang, Key::AppNote));
     }
 
     fn config_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("配置");
-        ui.label(format!("配置文件：{}", self.store.path.display()));
-        ui.horizontal(|ui| {
-            if ui.button("扫描 LDPlayer / ADB 依赖").clicked() {
-                self.start_dependency_scan();
-            }
-            if ui.button("保存选中的发现路径").clicked() {
-                let Some(report) = self.dependency_report.clone() else {
-                    self.status = "请先扫描依赖，再选择并保存候选路径。".into();
-                    return;
-                };
-                let original_ldconsole_path = self.store.config.emulator.ldconsole_path.clone();
-                let original_adb_path = self.store.config.emulator.adb_path.clone();
-                let mut changed = false;
-                if let Some(path) = &self.selected_ldplayer_candidate
-                    && report
-                        .ldplayer
-                        .candidates
-                        .iter()
-                        .any(|candidate| candidate.exists && &candidate.path == path)
-                {
-                    self.store.config.emulator.ldconsole_path =
-                        config::path_for_config(&self.store.root, path);
-                    changed = true;
-                }
-                if let Some(path) = &self.selected_adb_candidate
-                    && report
-                        .adb
-                        .candidates
-                        .iter()
-                        .any(|candidate| candidate.exists && &candidate.path == path)
-                {
-                    self.store.config.emulator.adb_path =
-                        config::path_for_config(&self.store.root, path);
-                    changed = true;
-                }
-                self.dependency_report = Some(report.clone());
-                if changed {
-                    match self.store.save() {
-                        Ok(()) => self.status = "已保存选中的 LDPlayer / ADB 路径".into(),
-                        Err(error) => {
-                            self.store.config.emulator.ldconsole_path = original_ldconsole_path;
-                            self.store.config.emulator.adb_path = original_adb_path;
-                            self.status = format!("保存发现路径失败：{error:#}");
+        let lang = self.lang();
+        ui.heading(t(lang, Key::ConfigHeading));
+        ui.label(t(lang, Key::ConfigIntro));
+        ui.label(t(lang, Key::ConfigPath).replace("{}", &self.store.path.display().to_string()));
+        for (index, heading) in ui_text::CONFIG_HEADINGS.iter().enumerate() {
+            page_section(ui, lang, *heading);
+            self.render_config_section(ui, lang, index);
+        }
+    }
+
+    fn render_config_section(&mut self, ui: &mut egui::Ui, lang: Lang, section: usize) {
+        match section {
+            0 => {
+                ui.horizontal(|ui| {
+                    if ui.button(t(lang, Key::ConfigScan)).clicked() {
+                        self.start_dependency_scan();
+                    }
+                    if ui.button(t(lang, Key::ConfigSaveFound)).clicked() {
+                        let Some(report) = self.dependency_report.clone() else {
+                            self.status = t(lang, Key::ConfigScanFirst).into();
+                            return;
+                        };
+                        let original_ldconsole_path =
+                            self.store.config.emulator.ldconsole_path.clone();
+                        let original_adb_path = self.store.config.emulator.adb_path.clone();
+                        let mut changed = false;
+                        if let Some(path) = &self.selected_ldplayer_candidate
+                            && report
+                                .ldplayer
+                                .candidates
+                                .iter()
+                                .any(|candidate| candidate.exists && &candidate.path == path)
+                        {
+                            self.store.config.emulator.ldconsole_path =
+                                config::path_for_config(&self.store.root, path);
+                            changed = true;
+                        }
+                        if let Some(path) = &self.selected_adb_candidate
+                            && report
+                                .adb
+                                .candidates
+                                .iter()
+                                .any(|candidate| candidate.exists && &candidate.path == path)
+                        {
+                            self.store.config.emulator.adb_path =
+                                config::path_for_config(&self.store.root, path);
+                            changed = true;
+                        }
+                        self.dependency_report = Some(report.clone());
+                        if changed {
+                            match self.store.save() {
+                                Ok(()) => self.status = t(lang, Key::ConfigPathsSaved).into(),
+                                Err(error) => {
+                                    self.store.config.emulator.ldconsole_path =
+                                        original_ldconsole_path;
+                                    self.store.config.emulator.adb_path = original_adb_path;
+                                    self.status =
+                                        format!("{}: {error:#}", t(lang, Key::CommonFailed));
+                                }
+                            }
+                        } else {
+                            self.status =
+                                format!("{}\n{}", report.ldplayer.summary(), report.adb.summary());
                         }
                     }
-                } else {
-                    self.status =
-                        format!("{}\n{}", report.ldplayer.summary(), report.adb.summary());
+                    if ui.button(t(lang, Key::ConfigOpenToml)).clicked() {
+                        match crate::config_command(&self.store, ConfigRequest::Open) {
+                            Ok(_) => self.status = t(lang, Key::ConfigOpened).into(),
+                            Err(error) => {
+                                self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed))
+                            }
+                        }
+                    }
+                });
+                ui.label(t(lang, Key::ConfigTomlHint));
+                if let Some(report) = &self.dependency_report {
+                    ui.separator();
+                    ui.label(egui::RichText::new(t(lang, Key::ConfigDepsHeading)).strong());
+                    Self::dependency_candidate_selector(
+                        ui,
+                        lang,
+                        "LDPlayer",
+                        &report.ldplayer,
+                        &mut self.selected_ldplayer_candidate,
+                    );
+                    Self::dependency_candidate_selector(
+                        ui,
+                        lang,
+                        "ADB",
+                        &report.adb,
+                        &mut self.selected_adb_candidate,
+                    );
                 }
             }
-            if ui.button("打开 config.toml").clicked() {
-                match crate::config_command(&self.store, ConfigRequest::Open) {
-                    Ok(_) => self.status = "已打开 config.toml".into(),
-                    Err(error) => self.status = format!("打开配置失败: {error:#}"),
-                }
-            }
-        });
-        ui.label(
-            "Windows 路径推荐使用 TOML 单引号 literal string，无需双写反斜杠；正斜杠路径也可用。",
-        );
-        if let Some(report) = &self.dependency_report {
-            ui.separator();
-            ui.heading("依赖发现结果");
-            Self::dependency_candidate_selector(
-                ui,
-                "LDPlayer",
-                &report.ldplayer,
-                &mut self.selected_ldplayer_candidate,
-            );
-            Self::dependency_candidate_selector(
-                ui,
-                "ADB",
-                &report.adb,
-                &mut self.selected_adb_candidate,
-            );
-        }
-        ui.separator();
-        ui.label("外勤签到 live 授权");
-        let mut allow_field_work_live = self.store.config.runtime.allow_field_work_live;
-        if ui
-            .checkbox(
-                &mut allow_field_work_live,
-                "允许 live 点击外勤签到按钮（高风险，需明确确认）",
-            )
-            .changed()
-        {
-            self.store.config.runtime.allow_field_work_live = allow_field_work_live;
-            match self.store.save() {
-                Ok(()) => {
-                    self.status = if allow_field_work_live {
-                        "已启用外勤 live；请确认页面、实例和定位后再执行。".into()
-                    } else {
-                        "已关闭外勤 live；外勤页面将只允许 dry-run 观察。".into()
-                    };
-                }
-                Err(error) => {
-                    self.store.config.runtime.allow_field_work_live = !allow_field_work_live;
-                    self.status = format!("保存外勤 live 设置失败：{error:#}");
-                }
-            }
-        }
-        ui.label("默认关闭。启用后仍需 --live --confirm、校准 Profile、时间窗口、目标 App 前台、连续 Ready，以及点击前 route/mode/前台二次复核；未知模式和证据冲突仍会停止。 ");
-        ui.separator();
-        ui.label("登录页自动登录（一键登录）");
-        ui.label("高风险：仅在登录页使用 App 记住的上次账号，不输入、不保存账号/密码/验证码。");
-        let mut allow_auto_login = self.store.config.runtime.allow_auto_login;
-        if ui
-            .checkbox(
-                &mut allow_auto_login,
-                "允许 live 运行在登录页执行一次一键登录",
-            )
-            .changed()
-        {
-            self.store.config.runtime.allow_auto_login = allow_auto_login;
-            match self.store.save() {
-                Ok(()) => {
-                    self.status = if allow_auto_login {
-                        "已启用自动登录；仍需单独授权代勾选协议。".into()
-                    } else {
-                        "已关闭自动登录；登录页将恢复为手动登录。".into()
-                    };
-                }
-                Err(error) => {
-                    self.store.config.runtime.allow_auto_login = !allow_auto_login;
-                    self.status = format!("保存自动登录设置失败：{error:#}");
-                }
-            }
-        }
-        let mut accept_login_terms = self.store.config.runtime.accept_login_terms;
-        if ui
-            .checkbox(
-                &mut accept_login_terms,
-                "允许程序在登录页代勾选《用户协议》《隐私协议》（代您作出同意）",
-            )
-            .changed()
-        {
-            self.store.config.runtime.accept_login_terms = accept_login_terms;
-            match self.store.save() {
-                Ok(()) => {
-                    self.status = if accept_login_terms {
-                        "已授权代勾选登录协议；该授权具有法律同意含义。".into()
-                    } else {
-                        "已撤销代勾选协议授权；自动登录将拒绝执行。".into()
-                    };
-                }
-                Err(error) => {
-                    self.store.config.runtime.accept_login_terms = !accept_login_terms;
-                    self.status = format!("保存协议授权失败：{error:#}");
-                }
-            }
-        }
-        ui.horizontal(|ui| {
-            ui.label("期望账号（可留空）：");
-            let previous = self.store.config.runtime.auto_login_account.clone();
-            let mut account = previous.clone();
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut account)
-                    .password(!self.show_auto_login_account)
-                    .hint_text(if previous.is_empty() {
-                        "未设置"
-                    } else {
-                        "已设置（默认隐藏）"
-                    }),
-            );
-            if response.changed() {
-                self.store.config.runtime.auto_login_account = account.clone();
-            }
-            if response.lost_focus() {
-                match self.store.save() {
-                    Ok(()) => self.status = "已保存期望账号。".into(),
-                    Err(error) => {
-                        self.store.config.runtime.auto_login_account = previous;
-                        self.status = format!("保存期望账号失败：{error:#}");
+            1 => {
+                ui.label(egui::RichText::new(t(lang, Key::ConfigFieldWorkHeading)).strong());
+                let mut allow_field_work_live = self.store.config.runtime.allow_field_work_live;
+                if ui
+                    .checkbox(
+                        &mut allow_field_work_live,
+                        t(lang, Key::ConfigFieldWorkCheckbox),
+                    )
+                    .changed()
+                {
+                    self.store.config.runtime.allow_field_work_live = allow_field_work_live;
+                    match self.store.save() {
+                        Ok(()) => {
+                            self.status = t(
+                                lang,
+                                if allow_field_work_live {
+                                    Key::FieldWorkEnabled
+                                } else {
+                                    Key::FieldWorkDisabled
+                                },
+                            )
+                            .into();
+                        }
+                        Err(error) => {
+                            self.store.config.runtime.allow_field_work_live =
+                                !allow_field_work_live;
+                            self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed));
+                        }
                     }
                 }
+                ui.label(t(lang, Key::ConfigFieldWorkNote));
             }
-            ui.checkbox(&mut self.show_auto_login_account, "显示明文");
-        });
-        ui.horizontal(|ui| {
-            ui.label("登录后等待秒数（5-120）：");
-            let mut timeout = self.store.config.runtime.auto_login_timeout_seconds;
-            if ui
-                .add(egui::DragValue::new(&mut timeout).range(5..=120))
-                .changed()
-            {
-                self.store.config.runtime.auto_login_timeout_seconds = timeout;
-                if let Err(error) = self.store.save() {
-                    self.status = format!("保存登录超时失败：{error:#}");
+            2 => {
+                ui.label(egui::RichText::new(t(lang, Key::ConfigLoginHeading)).strong());
+                ui.label(t(lang, Key::ConfigLoginRisk));
+                let mut allow_auto_login = self.store.config.runtime.allow_auto_login;
+                if ui
+                    .checkbox(&mut allow_auto_login, t(lang, Key::ConfigLoginAllow))
+                    .changed()
+                {
+                    self.store.config.runtime.allow_auto_login = allow_auto_login;
+                    match self.store.save() {
+                        Ok(()) => {
+                            self.status = t(
+                                lang,
+                                if allow_auto_login {
+                                    Key::AutoLoginEnabled
+                                } else {
+                                    Key::AutoLoginDisabled
+                                },
+                            )
+                            .into();
+                        }
+                        Err(error) => {
+                            self.store.config.runtime.allow_auto_login = !allow_auto_login;
+                            self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed));
+                        }
+                    }
                 }
+                let mut accept_login_terms = self.store.config.runtime.accept_login_terms;
+                if ui
+                    .checkbox(&mut accept_login_terms, t(lang, Key::ConfigLoginTerms))
+                    .changed()
+                {
+                    self.store.config.runtime.accept_login_terms = accept_login_terms;
+                    match self.store.save() {
+                        Ok(()) => {
+                            self.status = t(
+                                lang,
+                                if accept_login_terms {
+                                    Key::TermsGranted
+                                } else {
+                                    Key::TermsRevoked
+                                },
+                            )
+                            .into();
+                        }
+                        Err(error) => {
+                            self.store.config.runtime.accept_login_terms = !accept_login_terms;
+                            self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed));
+                        }
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label(t(lang, Key::ConfigAccountLabel));
+                    let previous = self.store.config.runtime.auto_login_account.clone();
+                    let mut account = previous.clone();
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut account)
+                            .password(!self.show_auto_login_account)
+                            .hint_text(if previous.is_empty() {
+                                t(lang, Key::ConfigAccountUnset)
+                            } else {
+                                t(lang, Key::ConfigAccountSet)
+                            }),
+                    );
+                    if response.changed() {
+                        self.store.config.runtime.auto_login_account = account.clone();
+                    }
+                    if response.lost_focus() {
+                        match self.store.save() {
+                            Ok(()) => self.status = t(lang, Key::AccountSaved).into(),
+                            Err(error) => {
+                                self.store.config.runtime.auto_login_account = previous;
+                                self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed));
+                            }
+                        }
+                    }
+                    ui.checkbox(
+                        &mut self.show_auto_login_account,
+                        t(lang, Key::ConfigShowPlain),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label(t(lang, Key::ConfigLoginTimeout));
+                    let mut timeout = self.store.config.runtime.auto_login_timeout_seconds;
+                    if ui
+                        .add(egui::DragValue::new(&mut timeout).range(5..=120))
+                        .changed()
+                    {
+                        self.store.config.runtime.auto_login_timeout_seconds = timeout;
+                        if let Err(error) = self.store.save() {
+                            self.status = format!("{}: {error:#}", t(lang, Key::CommonFailed));
+                        }
+                    }
+                });
+                ui.label(t(lang, Key::ConfigLoginNote));
             }
-        });
-        ui.label("默认关闭。即使开启，仍要求目标 App 前台、无外部窗口、唯一的“一键登录”按钮、账号匹配、协议复选框视觉确认和点击前二次观测；dry-run 永不点击，一次运行最多一次登录点击。");
-        ui.separator();
-        ui.label("当前配置内容（账号与通知地址已脱敏；明文请用“打开配置所在目录”查看）");
-        ui.code(
-            toml::to_string_pretty(&self.store.config.redacted_for_display()).unwrap_or_default(),
-        );
+            _ => {
+                ui.label(t(lang, Key::ConfigTomlHeading));
+                ui.code(
+                    toml::to_string_pretty(&self.store.config.redacted_for_display())
+                        .unwrap_or_default(),
+                );
+            }
+        }
     }
 
     fn dependency_candidate_selector(
         ui: &mut egui::Ui,
+        lang: Lang,
         label: &str,
         report: &crate::discovery::DiscoveryReport,
         selected: &mut Option<std::path::PathBuf>,
@@ -2397,7 +2774,7 @@ impl GuiApp {
             .iter()
             .find(|candidate| candidate.exists && Some(&candidate.path) == selected.as_ref())
             .map(|candidate| format!("{} [{}]", candidate.path.display(), candidate.source))
-            .unwrap_or_else(|| "没有可选的已安装候选".into());
+            .unwrap_or_else(|| t(lang, Key::ConfigDepNone).to_string());
         egui::ComboBox::from_label(label)
             .selected_text(selected_text)
             .show_ui(ui, |ui| {
@@ -2413,73 +2790,344 @@ impl GuiApp {
                     );
                 }
             });
-        ui.collapsing(format!("{label} 候选诊断"), |ui| {
-            for candidate in report.candidates.iter().take(20) {
-                let marker = if candidate.exists { "✓" } else { "·" };
-                ui.label(format!(
-                    "{marker} {} [{}]",
-                    candidate.path.display(),
-                    candidate.source
-                ));
-            }
-            let omitted = report.candidates.len().saturating_sub(20);
-            if omitted > 0 {
-                ui.label(format!("另有 {omitted} 个候选未展开。"));
-            }
-        });
+        ui.collapsing(
+            t(lang, Key::ConfigDepCandidates).replace("{}", label),
+            |ui| {
+                for candidate in report.candidates.iter().take(20) {
+                    let marker = if candidate.exists { "✓" } else { "·" };
+                    ui.label(format!(
+                        "{marker} {} [{}]",
+                        candidate.path.display(),
+                        candidate.source
+                    ));
+                }
+                let omitted = report.candidates.len().saturating_sub(20);
+                if omitted > 0 {
+                    ui.label(t(lang, Key::ConfigDepOmitted).replace("{}", &omitted.to_string()));
+                }
+            },
+        );
     }
 
     fn about(&mut self, ui: &mut egui::Ui) {
-        ui.heading("关于 / About");
-        ui.label(format!("版本：{}", env!("CARGO_PKG_VERSION")));
-        ui.label(format!("Git commit：{}", crate::GIT_COMMIT));
-        ui.label(format!("Build id：{}", crate::build_id()));
+        let lang = self.lang();
+        ui.heading(t(lang, Key::AboutHeading));
+        ui.label(t(lang, Key::AboutVersion).replace("{}", env!("CARGO_PKG_VERSION")));
         // A dirty build is not the commit it names; surface it here so a bug
         // report cannot be attributed to a clean build of that commit (FR-014).
         match crate::git_dirty() {
             Some(true) => {
                 ui.colored_label(
                     egui::Color32::from_rgb(200, 120, 0),
-                    "工作区状态：dirty（包含未提交的已跟踪改动）",
+                    t(lang, Key::AboutDirty),
                 );
             }
             Some(false) => {
-                ui.label("工作区状态：clean");
+                ui.label(t(lang, Key::AboutClean));
             }
             None => {
-                ui.label("工作区状态：unknown（构建时无法运行 git status）");
+                ui.label(t(lang, Key::AboutUnknown));
             }
         }
-        ui.hyperlink_to("雷电模拟器官网", "https://www.ldmnq.com/");
-        ui.hyperlink_to("智汇福大官网", "https://app.fzu.edu.cn/fd-app/m/index.html");
-        ui.separator();
-        ui.label("支持的 Profile：");
+        page_section(ui, lang, Key::AboutLanguage);
+        ui.label(t(lang, Key::AboutLanguageHint));
+        let mut requested = None;
+        ui.horizontal(|ui| {
+            for option in [Lang::Zh, Lang::En] {
+                if ui
+                    .selectable_label(lang == option, ui_text::language_name(option))
+                    .clicked()
+                {
+                    requested = Some(option);
+                }
+            }
+        });
+        if let Some(option) = requested {
+            self.set_language(option);
+        }
+        ui.collapsing(t(lang, Key::AboutTechnical), |ui| {
+            ui.label(t(lang, Key::AboutGitCommit).replace("{}", crate::GIT_COMMIT));
+            ui.label(t(lang, Key::AboutBuildId).replace("{}", &crate::build_id()));
+        });
+        page_section(ui, lang, Key::AboutLinks);
+        ui.hyperlink_to(t(lang, Key::AboutLdplayerLink), "https://www.ldmnq.com/");
+        ui.hyperlink_to(
+            t(lang, Key::AboutAppLink),
+            "https://app.fzu.edu.cn/fd-app/m/index.html",
+        );
+        page_section(ui, lang, Key::AboutProfiles);
         for supported in ordered_profiles() {
+            let orientation = t(
+                lang,
+                if supported.orientation.as_str() == "landscape" {
+                    Key::OrientationLandscape
+                } else {
+                    Key::OrientationPortrait
+                },
+            );
+            let eligibility = t(
+                lang,
+                if supported.calibrated {
+                    Key::ProfilesCalibrated
+                } else {
+                    Key::ProfilesDryOnly
+                },
+            );
             ui.label(format!(
-                "{} {}x{}@{} {} calibrated={}",
+                "{} {}x{}@{} {} {}",
                 supported.id,
                 supported.width,
                 supported.height,
                 supported.density_dpi,
-                supported.orientation.as_str(),
-                supported.calibrated
+                orientation,
+                eligibility
             ));
         }
+        page_section(ui, lang, Key::AboutDeps);
+        ui.label(t(lang, Key::DepImage));
+        ui.label(t(lang, Key::DepGui));
+        ui.label(t(lang, Key::DepRfd));
+        ui.label(t(lang, Key::DepSerde));
+        ui.label(t(lang, Key::DepExternal));
         ui.separator();
-        ui.label("第三方依赖：");
-        ui.label("image：PNG/JPEG 解码和轻量视觉处理");
-        ui.label("eframe/egui：原生 GUI");
-        ui.label("rfd：APK 文件选择器");
-        ui.label("serde / serde_json / toml：配置和结构化日志");
-        ui.label("ADB + LDPlayer ldconsole.exe：外部设备控制依赖");
-        ui.separator();
-        ui.label("使用建议：先执行诊断，再运行 dry-run；正式模式需要显式确认。");
+        ui.label(t(lang, Key::AboutAdvice));
     }
+}
+
+/// The "what do I need to install" checklist, shared by the Quick-start page
+/// and the Setup page so both cannot drift apart.
+fn render_environment_checklist(ui: &mut egui::Ui, lang: Lang) {
+    egui::Grid::new("environment_checklist")
+        .striped(true)
+        .min_col_width(120.0)
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(t(lang, Key::EnvColNeed)).strong());
+            ui.label(egui::RichText::new(t(lang, Key::EnvColRequired)).strong());
+            ui.label(egui::RichText::new(t(lang, Key::EnvColSource)).strong());
+            ui.end_row();
+            for (need, required, source) in [
+                (Key::EnvWindows, Key::CommonRequired, Key::EnvWindowsSrc),
+                (Key::EnvLdplayer, Key::CommonRequired, Key::EnvLdplayerSrc),
+                (Key::EnvExe, Key::CommonRequired, Key::EnvExeSrc),
+                (Key::EnvApk, Key::CommonRequired, Key::EnvApkSrc),
+                (Key::EnvAdb, Key::CommonNotRequired, Key::EnvAdbSrc),
+                (Key::EnvRoot, Key::CommonNotRequired, Key::EnvRootSrc),
+            ] {
+                ui.label(t(lang, need));
+                ui.label(t(lang, required));
+                ui.label(t(lang, source));
+                ui.end_row();
+            }
+        });
+}
+
+/// Short "does / does not" columns replacing the long safety paragraphs.
+fn render_safety_table(ui: &mut egui::Ui, lang: Lang) {
+    ui.label(egui::RichText::new(t(lang, Key::SafetyTitle)).strong());
+    egui::Grid::new("safety_table")
+        .striped(true)
+        .min_col_width(200.0)
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(t(lang, Key::SafetyDoTitle)).strong());
+            ui.label(egui::RichText::new(t(lang, Key::SafetyDontTitle)).strong());
+            ui.end_row();
+            for (does, does_not) in [
+                (Key::SafetyDoLaunch, Key::SafetyDontCredentials),
+                (Key::SafetyDoTap, Key::SafetyDontPopups),
+                (Key::SafetyDoLogin, Key::SafetyDontStore),
+                (Key::SafetyDoWrite, Key::SafetyDontUpload),
+            ] {
+                ui.label(t(lang, does));
+                ui.label(t(lang, does_not));
+                ui.end_row();
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    fn configured_store() -> ConfigStore {
+        let root = std::env::temp_dir().join(format!(
+            "zhfd-gui-harness-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = config::Config::default();
+        config.emulator.ldconsole_path = "tools/ldconsole.exe".into();
+        config.emulator.adb_path = "tools/adb.exe".into();
+        ConfigStore {
+            root: root.clone(),
+            path: root.join("config.toml"),
+            config,
+            origin: config::ConfigOrigin::Explicit,
+            created_default: false,
+            recovery_error: None,
+        }
+    }
+
+    fn gui_harness(size: egui::Vec2) -> Harness<'static, GuiApp> {
+        let store = configured_store();
+        Harness::builder()
+            .with_size(size)
+            .with_max_steps(2)
+            .build_eframe(|cc| {
+                configure_fonts(&cc.egui_ctx);
+                GuiApp::new(store, None)
+            })
+    }
+
+    fn assert_all_nodes_fit(harness: &Harness<'static, GuiApp>, label: &str, width: f32) {
+        let nodes: Vec<_> = harness.query_all_by_label(label).collect();
+        assert!(!nodes.is_empty(), "no visible node matched {label:?}");
+        assert!(
+            nodes.iter().all(|node| node.rect().max.x <= width),
+            "node {label:?} extends beyond width {width}"
+        );
+    }
+
+    fn assert_matching_nodes_fit(harness: &Harness<'static, GuiApp>, text: &str, width: f32) {
+        let nodes: Vec<_> = harness.query_all_by_label_contains(text).collect();
+        assert!(!nodes.is_empty(), "no visible node contained {text:?}");
+        assert!(
+            nodes.iter().all(|node| node.rect().max.x <= width),
+            "node containing {text:?} extends beyond width {width}"
+        );
+    }
+
+    #[test]
+    fn gui_copy_has_no_hard_coded_machine_fields() {
+        // The banned strings are assembled from parts so this test's own
+        // source does not contain them.
+        let source = include_str!("gui.rs");
+        let banned = [
+            concat!("status", "={"),
+            concat!("route", "={"),
+            concat!("error_code", "={"),
+            concat!("退出", "码 {:?}"),
+            concat!("暂无 ", "result.json"),
+            concat!("首次设置", "(Setup)"),
+            concat!("Rust CLI/GUI", " 迁移第一阶段"),
+        ];
+        for value in banned {
+            assert!(
+                !source.contains(value),
+                "gui.rs still hard-codes user-visible machine output: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn quick_use_is_a_single_column_user_flow_at_narrow_width() {
+        let mut harness = gui_harness(egui::vec2(800.0, 700.0));
+        harness.get_by_label(t(Lang::Zh, Key::NavQuickUse)).click();
+        harness.run_steps(1);
+
+        for heading in [
+            Key::QuickPrepareTitle,
+            Key::QuickSetupTitle,
+            Key::QuickRunTitle,
+            Key::QuickIssuesTitle,
+            Key::QuickAdvancedTitle,
+        ] {
+            assert_all_nodes_fit(&harness, t(Lang::Zh, heading), 800.0);
+        }
+        assert_all_nodes_fit(&harness, t(Lang::Zh, Key::SafetyTitle), 800.0);
+
+        harness
+            .get_by_label(t(Lang::Zh, Key::QuickIssuesTitle))
+            .click_accesskit();
+        harness.run_steps(2);
+        harness
+            .get_by_label(t(Lang::Zh, Key::QuickIssuesTitle))
+            .scroll_to_me();
+        harness.run_steps(2);
+        assert_matching_nodes_fit(&harness, "设备没连上", 800.0);
+    }
+
+    #[test]
+    fn config_page_shows_all_sections_in_one_wrapping_column() {
+        let mut harness = gui_harness(egui::vec2(800.0, 700.0));
+        harness.get_by_label(t(Lang::Zh, Key::NavConfig)).click();
+        harness.run_steps(1);
+
+        for heading in ui_text::CONFIG_HEADINGS {
+            assert_all_nodes_fit(&harness, t(Lang::Zh, heading), 800.0);
+        }
+        assert_all_nodes_fit(&harness, t(Lang::Zh, Key::ConfigOpenToml), 800.0);
+    }
+
+    #[test]
+    fn page_contents_jump_to_configuration_sections_in_wide_and_narrow_windows() {
+        use egui::accesskit::Role;
+
+        for width in [800.0, 1280.0] {
+            let mut harness = gui_harness(egui::vec2(width, 500.0));
+            harness.get_by_label("配置文件").click();
+            harness.run_steps(3);
+            if width == 800.0 {
+                harness.get_by_label("本页目录").click();
+                harness.run_steps(3);
+            }
+            let open_button_before = harness.get_by_label("打开 config.toml").rect();
+            let destination = "当前配置内容";
+            let before = harness
+                .get_by_role_and_label(Role::Label, destination)
+                .rect();
+            harness
+                .get_by_role_and_label(Role::Button, destination)
+                .click();
+            harness.run_steps(8);
+            let after = harness
+                .get_by_role_and_label(Role::Label, destination)
+                .rect();
+            assert!(after.min.y < before.min.y && after.max.y < 475.0);
+            assert!((after.min.x - before.min.x).abs() < 1.0);
+            assert!(open_button_before.max.x <= width);
+        }
+    }
+
+    #[test]
+    fn unconfirmed_checkin_page_shows_a_specific_no_tap_message() {
+        let store = configured_store();
+        let log = logger::RunLog::new(&store.root).unwrap();
+        let mut result = crate::new_run_result(
+            crate::domain::Mode::DryRun,
+            &log,
+            &InstanceTargetArgs::default(),
+        );
+        result.error_code = Some("route_candidate_unconfirmed".into());
+        result.page_route = Some(crate::domain::PageRoute::RouteCandidateUnconfirmed);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 700.0))
+            .build_eframe(|cc| {
+                configure_fonts(&cc.egui_ctx);
+                let mut app = GuiApp::new(store, None);
+                app.latest_result = Some(result);
+                app
+            });
+        harness.run_steps(2);
+        for words in ["无法确认签到页面", "无晚点名清单", "未点击签到"] {
+            assert_matching_nodes_fit(&harness, words, 800.0);
+        }
+    }
+
+    #[test]
+    fn about_language_switch_changes_visible_navigation_copy() {
+        let mut harness = gui_harness(egui::vec2(1000.0, 700.0));
+        harness.get_by_label(t(Lang::Zh, Key::NavAbout)).click();
+        harness.run_steps(2);
+        harness.get_by_label("English").click();
+        harness.run_steps(2);
+
+        assert_all_nodes_fit(&harness, t(Lang::En, Key::AboutHeading), 1000.0);
+        assert_all_nodes_fit(&harness, t(Lang::En, Key::NavQuickUse), 1000.0);
+    }
 
     #[test]
     fn profiles_sort_calibrated_first_with_a_stable_geometry_tiebreaker() {

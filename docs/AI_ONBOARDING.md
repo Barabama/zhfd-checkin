@@ -53,7 +53,7 @@ git log --oneline -5
 git tag --list
 git rev-list -n1 v0.3.5
 cd rust
-cargo test --lib          # 预期 199 passed（v0.3.2 tag 为 140）
+cargo test --lib          # 预期 211 passed（v0.3.2 tag 为 140）
 ```
 
 在看代码之前，先确认你不在一个脏工作区、没有待发布的本地改动。
@@ -147,6 +147,7 @@ rust/
     auto_login.rs  登录页选择器、协议复选框、一次一键登录（不读 Profile 几何）
     domain.rs      页面/业务/状态枚举、点击授权、自动登录策略、结果结构、时间窗口
     config.rs      配置 schema、data root 选择、原子保存/备份、迁移、恢复
+    ui_text.rs     GUI 文案表（中文 / English）与术语、状态、错误提示的人话映射
     gui.rs         egui 界面（Setup/Repair、运行、诊断、实例、日志、计划任务）
     bin/zhfd-checkin-gui.rs   无控制台 GUI 入口
     adb.rs         ADB 设备、截图、hierarchy dump、前台/包名、overlay 观测
@@ -249,7 +250,7 @@ LdPlayer::discover
 | 前台检查 | `log_foreground_snapshot` / `foreground_check` foreground.rs | FR-013 前台包观测与分类 |
 | 点击门禁 | `guarded_tap` main.rs:2745 | route/mode + click policy |
 | 日期解析 | `extract_hierarchy_date` main.rs:1916 | 成功日期与冲突规则 |
-| 测试 | main.rs / page.rs / auto_login.rs / adb.rs / ldplayer.rs / wait.rs 测试模块 | 约 199 个测试 |
+| 测试 | main.rs / page.rs / auto_login.rs / adb.rs / ldplayer.rs / wait.rs 测试模块 | 约 211 个测试 |
 
 **高风险区域**：`run_inner_with_device`、`stage_device`/`runtime_with_target_recording` 与 `locate_or_navigate`。不要盲格式化、移动或重排；先读对应测试，再改。
 
@@ -285,7 +286,7 @@ pwsh -NoProfile -File scripts/portable_smoke.ps1 `
   -FixturePath "$PWD/autojs6/fixtures/ready.png"
 ```
 
-`cargo test --lib` = 199 passed。`cargo test --all-targets` 会在 lib 与 bin 各跑一次。
+`cargo test --lib` = 211 passed。`cargo test --all-targets` 会在 lib 与 bin 各跑一次。
 
 ### 8.3 构建溯源
 
@@ -350,6 +351,16 @@ CI、release workflow、`package_release.ps1` 都拒绝 `+dirty` / `+unknown`。
 - 两个新键的 `0` 由 `Config::validate` 拒绝；上限只在使用处钳制（与 `location_timeout_seconds` 相同模式），避免新增校验把已有配置打进 Repair。
 - 旧 `config.toml` 没有这两个键时按 serde 默认值解析，无需迁移。
 - GUI 暂未暴露这两个键，只能编辑配置文件。
+
+### 9.2.2 界面语言
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `ui.language` | `"zh"` | 界面语言，`"zh"` 或 `"en"`；GUI 在“关于”页切换并保存，切换立即生效 |
+
+- 只影响展示，不改变任何运行、门禁或结果字段。
+- 非法值由 `Config::validate` 拒绝；没有 `[ui]` 段的旧配置按默认 `zh` 解析。
+- 文案表在 `src/ui_text.rs`；新增文案必须同时提供中文和 English。
 
 ### 9.3 自动登录配置
 
@@ -510,7 +521,10 @@ zhfd-checkin.exe analyze-image --image .\ready.png   # alias: vision
 1. 业务逻辑放 `main.rs`/`config.rs`，GUI 只做展示与调用；
 2. 后台任务放线程，`try_lock` 轮询；
 3. Setup 门禁统一走 `requires_setup`；
-4. 改 live 相关必须保留快照校验。
+4. 改 live 相关必须保留快照校验；
+5. 用户可见文案一律加到 `ui_text.rs` 的 `Key` 表（中文与 English 同时写），GUI 里用 `t(lang, Key::...)` 取用，不内联中英文；
+6. 术语、状态和错误提示改用时同步更新 `docs/GLOSSARY.md`；`cargo test` 会检查每个 key 两种语言都非空、且英文不含中文；
+7. 原始机器字段只能放在“技术详情”折叠区或证据页，主界面显示人话结论。
 
 ### 准备发布（需人工批准）
 
@@ -526,7 +540,7 @@ zhfd-checkin.exe analyze-image --image .\ready.png   # alias: vision
 
 - [ ] 读 `docs/STATUS.md` 与本文；
 - [ ] `git status -sb` 确认工作区干净；
-- [ ] `cargo test --lib` 确认 199 passed（v0.3.2 tag 为 140）；
+- [ ] `cargo test --lib` 确认 211 passed（v0.3.2 tag 为 140）；
 - [ ] 找到 `guarded_tap`、`authorize_click`、`run_inner_with_device`；
 - [ ] 确认自己没有运行任何 live/设备命令；
 - [ ] 明确本次任务是否触及 Frozen 决策（若是，先写 ADR）。

@@ -59,6 +59,11 @@ auto_login_timeout_seconds = 30
 
 [notifications]
 bark_url = ""
+
+[ui]
+# Interface language: "zh" (Chinese) or "en" (English). Changing it in the
+# About page writes this key; no other setting depends on it.
+language = "zh"
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +74,8 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +200,26 @@ pub struct NotificationConfig {
     pub bark_url: String,
 }
 
+/// Presentation-only settings. They never affect run safety; the GUI reads
+/// them each frame, so a change takes effect immediately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiConfig {
+    #[serde(default = "default_language")]
+    pub language: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            language: default_language(),
+        }
+    }
+}
+
+fn default_language() -> String {
+    "zh".to_string()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -242,6 +269,10 @@ impl Config {
             anyhow::bail!("app.package_name 和 app.activity_name 不能为空");
         }
         crate::domain::Mode::from_config(&self.runtime.mode)?;
+        match self.ui.language.trim().to_ascii_lowercase().as_str() {
+            "zh" | "en" => {}
+            other => anyhow::bail!("ui.language 只支持 \"zh\" 或 \"en\"，当前为 {other}"),
+        }
         crate::domain::parse_time(&self.window.start)
             .with_context(|| format!("window.start 无效: {}", self.window.start))?;
         crate::domain::parse_time(&self.window.end)
@@ -1045,6 +1076,30 @@ mod tests {
         // `Config::default()`, and a typo there panics at startup.
         assert!(DEFAULT_CONFIG.contains("boot_timeout_seconds = 180"));
         assert!(DEFAULT_CONFIG.contains("instance_appear_timeout_seconds = 30"));
+    }
+
+    #[test]
+    fn ui_language_defaults_to_chinese_and_rejects_unknown_values() {
+        let config = Config::default();
+        assert_eq!(config.ui.language, "zh");
+        assert!(DEFAULT_CONFIG.contains("[ui]"));
+        assert!(DEFAULT_CONFIG.contains("language = \"zh\""));
+
+        let mut english = config.clone();
+        english.ui.language = "en".into();
+        english.validate().unwrap();
+
+        let mut broken = config;
+        broken.ui.language = "fr".into();
+        assert!(broken.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_config_without_ui_section_gets_the_default_language() {
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        let without_ui = text.split("[ui]").next().unwrap().to_string();
+        let parsed: Config = toml::from_str(&without_ui).unwrap();
+        assert_eq!(parsed.ui.language, "zh");
     }
 
     #[test]

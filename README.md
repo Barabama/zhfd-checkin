@@ -1,6 +1,6 @@
 # zhfd-checkin
 
-Windows 便携式「智汇福大晚点名签到」辅助工具。Rust CLI + GUI，通过 ADB 控制 LDPlayer；默认 dry-run，live 点击必须在用户显式授权后通过全部门禁。
+Windows 便携式「智汇福大晚点名签到」辅助工具。Rust CLI + GUI，通过 ADB 控制 LDPlayer；默认 dry-run，live 点击必须在用户显式授权后通过全部门禁。GUI 支持中文与 English，可在“关于”页切换。
 
 ![功能演示：环境检查 → 导航到签到页 → 定位等待 → 确认签到状态](docs/assets/zhfd-checkin.gif)
 
@@ -17,6 +17,7 @@ Windows 便携式「智汇福大晚点名签到」辅助工具。Rust CLI + GUI�
 | [docs/STATUS.md](docs/STATUS.md) | 当前 HEAD / tag / Release / CI / 审计状态（唯一事实源） |
 | [docs/AI_ONBOARDING.md](docs/AI_ONBOARDING.md) | 新 AI / 新维护者上手：架构、门禁、代码地图、配置、陷阱 |
 | [docs/QUICK_START.md](docs/QUICK_START.md) | 第一次使用：环境、首次设置、单实例 dry-run |
+| [docs/GLOSSARY.md](docs/GLOSSARY.md) | 实例 / 编号 / ADB 地址 / 屏幕预设等术语与关系 |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | 安装、配置、实例、CLI、数据目录、计划任务 |
 | [docs/CHECKIN_SAFETY.md](docs/CHECKIN_SAFETY.md) | 页面路由、点击门禁、成功判定、外勤限制 |
 | [docs/README.md](docs/README.md) | 完整文档索引与权威层级 |
