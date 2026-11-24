@@ -221,7 +221,8 @@ jobs:
           #    the same commit. Any other asset name means a different commit was
           #    already published under this version.
           $existing = & gh api "repos/$env:REPOSITORY/releases/tags/$tag" 2>&1
-          if ($LASTEXITCODE -eq 0) {
+          $ghExit = $LASTEXITCODE
+          if ($ghExit -eq 0) {
             $release = $existing | ConvertFrom-Json
             $names = @($release.assets | ForEach-Object { $_.name })
             if ($names.Count -gt 0) {
@@ -233,12 +234,13 @@ jobs:
             } else {
               Write-Host "existing_release=EMPTY tag=$tag (re-publishing $expectedAsset)"
             }
-          } elseif ($existing -match "404|Not Found") {
+          } elseif (($existing -join "`n") -match '(?m)^gh: [^\r\n]*\(HTTP 404\)\s*$') {
+            $LASTEXITCODE = 0
             Write-Host "existing_release=ABSENT tag=$tag"
           } else {
             # Anything else (auth, rate limit, network) must not be treated as
             # "no existing release": that is the fail-open direction.
-            throw "Unable to check whether Release $tag already exists. output=$($existing -join ' ')"
+            throw "Unable to check whether Release $tag already exists. gh_exit=$ghExit output=$($existing -join ' ')"
           }
           Write-Host "prepublish_guard=PASS tag=$tag commit=$fullCommit asset=$expectedAsset"
 

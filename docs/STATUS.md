@@ -9,14 +9,12 @@
 | 项目 | 值 |
 |---|---|
 | 默认分支 | `master` |
-| HEAD（发布） | `c60918c`（`v0.3.5` tag） |
 | master HEAD | 以 `git rev-parse master` 为准 |
-| Cargo 版本 | `0.3.6` |
-| `v0.3.5` tag commit | `c60918c` |
+| Cargo 版本 | `0.3.7` |
 | 最新 GitHub Release | `v0.3.5` |
 | Release 资产 | `zhfd-checkin-windows-x64-v0.3.5-c60918c14b28.zip` |
 
-> `v0.3.6` 包含设备分阶段就绪、双语界面、全页目录和签到页未确认提示。标签推送后由 GitHub Actions 构建发布；资产状态以 GitHub Releases 为准。未确认提示不改变任何点击门禁。
+> **`v0.3.6` 的 GitHub Release 未发布。** Windows Release run `45230475364` 的最终 guard 因 GitHub CLI 查询不存在的 Release 时泄漏预期 404 的退出码而假失败，发布步骤因此跳过。同一提交的 CI run `45230475170` 成功。`v0.3.7` 修复此问题；旧标签保留原样，发布结果以 GitHub Releases 为准。
 
 > `v0.3.5` 已发布（PR #3）：Phase 2a（变更型命令确认、run 摘要/`--json`、alias）、Phase 2b（独立 `login --confirm-login`，ADR-0005）、Phase 3a（`commands.rs`/`cli.rs`、`RunPolicy`、GUI 去 clap、设备退出码）、以及 App「是否重启App / 界面劫持」弹窗识别（`app_restart_dialog`，不自动点击）。
 
@@ -36,6 +34,8 @@
 | `v0.3.3` | `de2cc8d` |
 | `v0.3.4` | `3437b1f` |
 | `v0.3.5` | `c60918c` |
+| `v0.3.6` | `d787451` |
+| `v0.3.7` | 以 `git rev-list -n1 v0.3.7` 为准 |
 
 > 2026-10-18 重写过 git 历史以移除 fixture PII。重写前的 SHA（例如 `e135369`、`9a66664`、`c4b3bc4`）在本地已不可解析；历史文档中的这些 SHA 只应标注为 pre-rewrite 引用。
 
@@ -60,8 +60,8 @@ cargo build --release --bins                   ✅
 | 登录页一键登录（默认关闭） | 是 | 是（153 tests） | 未运行（分支） | 是（2026-10-21 00:23，index 0，900x1600@320；00:58 在 720x1280@320 dry-run 验证预设适配） | **否** |
 | Windows 计划任务 | 是 | 字符串级 | 是 | 是（21:54/22:12 触发） | 部分 |
 | GUI Setup/Repair/迁移 | 是 | 状态机单元测试 | 构建通过 | 未做 GUI 黑盒 | **否** |
-| GUI 新手文案与中文 / English 双语 | 是 | 是（211 tests，含文案表完整性与源码回归） | 未运行（分支） | 未做 GUI 黑盒 | **否** |
-| 设备就绪分阶段等待（ADR-0006） | 是 | 是（211 tests） | 未运行（分支） | 是（2026-10-29 干跑：启动中实例自动拉起 `device_ready_ms≈24s`；三实例 `--all-instances` 串行成功；`instance_not_running`/`instance_not_listed` 错误码与退出码 2/5 现场复现） | **否** |
+| GUI 新手文案与中文 / English 双语 | 是 | 是（216 tests，含固定尺寸 GUI 用户场景） | v0.3.6 CI 成功 | 未做 GUI 黑盒 | **否** |
+| 设备就绪分阶段等待（ADR-0006） | 是 | 是（216 tests） | v0.3.6 CI 成功 | 是（2026-10-29 干跑：启动中实例自动拉起 `device_ready_ms≈24s`；三实例 `--all-instances` 串行成功；`instance_not_running`/`instance_not_listed` 错误码与退出码 2/5 现场复现） | **否** |
 
 说明：2026-10-18 的三实例 live 证据来自 `0.3.1-90d086a+dirty` 构建（包含 v0.3.2 的修复但当时未提交），不是 `v0.3.2` tag 产物。它可以证明行为，不能替代对 tag 构建的独立验收。
 
@@ -70,7 +70,7 @@ cargo build --release --bins                   ✅
 - 最新独立审计：`docs/audits/V0.3.1_INDEPENDENT_AUDIT_REPORT_2026-10-18.md`（对象 `e135369` / `v0.3.1`；pre-rewrite SHA）。
 - 该审计结论是「不构成独立验收通过」，列出 9 个 P1。
 - v0.3.2 修复了其中 P1-1/P1-2/P1-3/P1-6/P1-7/P1-8；P1-9 通过 ADR-0002 与文档更新解决。
-- **v0.3.2 / v0.3.3 / v0.3.4 / v0.3.5 尚无独立审计报告。**
+- **v0.3.2 / v0.3.3 / v0.3.4 / v0.3.5 / v0.3.6 尚无独立审计报告。**
 - v0.3.4 的 PII 脱敏与 CLI Phase 1 未独立审计；AI 审计与 remediation 记录见 [CLI 设计审计](./audits/CLI_DESIGN_AUDIT_2026-10-21.md) 与 [V0.3.3 AI 审计报告](./audits/V0.3.3_AUDIT_REPORT_2026-10-21.md)。
 - 2026-10-21 AI 审计：[V0.3.3 AI 审计报告](./audits/V0.3.3_AUDIT_REPORT_2026-10-21.md)（对象 `de2cc8d` / HEAD `27f5649`）。确认：诊断报告导出 `auto_login_account` 明文（P1）、dry-run 不能完成一键登录且无 login-only 通道（P1，设计取舍）、release workflow 仍不绑定 tag/版本（P1-4）；另有 GUI/备份/忽略规则等 P2 PII 路径。**AI 辅助，不构成独立验收。**
 - 2026-10-21 CLI 设计审计：[CLI 命令面设计审计](./audits/CLI_DESIGN_AUDIT_2026-10-21.md)。结论：最大嵌套 2 层、结构已扁平，但 help 可发现性、CLI/GUI/状态机耦合、`task create --all-instances` 参数组合仍需改进；列为 P1/P2，未改代码。**AI 辅助，不构成独立验收。**
@@ -78,7 +78,7 @@ cargo build --release --bins                   ✅
 - 未关闭项：
   - 其余 P2/P3 见审计报告；多数为诊断、GUI 状态与兼容性问题。
 - 2026-10-26/27 关闭的发布门禁项（AI 辅助，非独立审计）：**P1-4** 与 **P2-26** 已由 `.github/workflows/release.yml` / `ci.yml` 的改动处理 —— release 现在要求 tag ref、tag 名 == `v<Cargo 版本>`、tag 提交 == checkout 的 HEAD、且 tag 提交在默认分支上；`release` job `needs: verify`（reusable `ci.yml`）；asset 名在发布前复核；**发布前重读远端 tag 并检查已有 Release 的资产名**（tag 被移动或同名版本已发布过别的 commit 时拒绝），`action-gh-release` 显式传 `tag_name`/`target_commitish`；`concurrency` 串行化同一 tag 的发布；CI 的 artifact 上传移到 Python/Node 之后。变更记录见 [ENGINEERING_AND_RELEASE.md](./ENGINEERING_AND_RELEASE.md)。
-  - 该改动**尚未**在 GitHub runner 上真实执行过（tag 发布是首次真实运行），本地离线回归见 `scripts/simulate_release_guards.ps1`（23 个场景）。
+  - `v0.3.6` 的首次发布验证发现预期 404 退出码泄漏。离线回归见 `scripts/simulate_release_guards.ps1`（23 个场景，发布前 guard 包含 Actions 的退出码包装）。
   - **P2-26 的残余**：`release` job 从源码重新构建，不消费 `ci.yml` 上传的 artifact；保证的是「同一份源码通过了门禁」，不是「通过门禁的那份字节被发布」。
 
 ## 5. 已知运行限制
@@ -104,6 +104,7 @@ cargo build --release --bins                   ✅
 git status -sb
 git log --oneline -3
 git rev-list -n1 v0.3.5
+git rev-list -n1 v0.3.6
 git tag --list
 cd rust; cargo test --lib
 ```

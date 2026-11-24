@@ -108,7 +108,9 @@ Set-Content -LiteralPath $guardScript -Encoding utf8 -Value (Get-StepScript $wor
 $assetGuardScript = Join-Path $WorkRoot "asset_guard.ps1"
 Set-Content -LiteralPath $assetGuardScript -Encoding utf8 -Value (Get-StepScript $workflowPath "Verify the packaged asset matches the tag")
 $prepublishGuardScript = Join-Path $WorkRoot "prepublish_guard.ps1"
-Set-Content -LiteralPath $prepublishGuardScript -Encoding utf8 -Value (Get-StepScript $workflowPath "Re-verify the tag and any existing Release before publishing")
+$prepublishBody = Get-StepScript $workflowPath "Re-verify the tag and any existing Release before publishing"
+$actionsExit = 'if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }'
+Set-Content -LiteralPath $prepublishGuardScript -Encoding utf8 -Value @($prepublishBody, $actionsExit)
 
 # The guards are PowerShell: a syntax error should be reported as such rather
 # than as a mysterious scenario failure.
@@ -342,12 +344,34 @@ function Invoke-PrepublishGuard {
         $env:REPOSITORY = "owner/repo"
         $env:GITHUB_REF_NAME = $TEST_TAG
         $text = (& pwsh -NoProfile -File $prepublishGuardScript 2>&1 | Out-String)
+        $exitCode = $LASTEXITCODE
         if ($null -eq $text) { $text = "" }
-        return $text
+        return [pscustomobject]@{ Output = $text; ExitCode = $exitCode }
     } finally {
         Pop-Location
         $env:PATH = $savedPath
         Remove-Item Env:GH_STUB_SPEC, Env:GH_TOKEN, Env:REPOSITORY, Env:GITHUB_REF_NAME -ErrorAction SilentlyContinue
+    }
+}
+
+function Assert-Prepublish {
+    param([string]$Name, [pscustomobject]$Result, [bool]$ExpectPass)
+    $hasPassMarker = $Result.Output -match "prepublish_guard=PASS"
+    $passed = if ($ExpectPass) {
+        $Result.ExitCode -eq 0 -and $hasPassMarker
+    } else {
+        $Result.ExitCode -ne 0 -and -not $hasPassMarker
+    }
+    if ($passed) {
+        $script:Ok++
+        $verdict = if ($ExpectPass) { "PASS" } else { "REFUSED" }
+        Write-Host ("ok       {0,-7} {1}" -f $verdict, $Name)
+        $line = $Result.Output -split "`n" | Where-Object { $_ -match "prepublish_guard=PASS" } | Select-Object -First 1
+        if ($line) { Write-Host ("         {0}" -f $line.Trim()) }
+    } else {
+        $script:Bad++
+        Write-Host "MISMATCH want_exit=$(if ($ExpectPass) { 0 } else { 'nonzero' }) got=$($Result.ExitCode) marker=$hasPassMarker $Name"
+        Write-Host $Result.Output
     }
 }
 
@@ -372,46 +396,46 @@ function Add-ScenarioTag {
 $s = New-PublishScenario "p1-no-release"
 Add-ScenarioTag $s
 Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Not Found (HTTP 404)"
-Assert "pre-publish: tag unchanged, no existing Release" (Invoke-PrepublishGuard $s) $true "prepublish_guard=PASS"
+Assert-Prepublish "pre-publish: tag unchanged, no existing Release (expected 404)" (Invoke-PrepublishGuard $s) $true
 
 $s = New-PublishScenario "p2-same-asset"
 Add-ScenarioTag $s
 Set-GhAnswer $s -ExitCode 0 -Stdout (New-ReleaseJson @((Get-ScenarioAssetName $s)))
-Assert "pre-publish: existing Release carries this commit's asset" (Invoke-PrepublishGuard $s) $true "prepublish_guard=PASS"
+Assert-Prepublish "pre-publish: existing Release carries this commit's asset" (Invoke-PrepublishGuard $s) $true
 
 $s = New-PublishScenario "p3-foreign-asset"
 Add-ScenarioTag $s
 Set-GhAnswer $s -ExitCode 0 -Stdout (New-ReleaseJson @("zhfd-checkin-windows-x64-$TEST_TAG-000000000000.zip"))
-Assert "pre-publish: existing Release carries another commit's asset" (Invoke-PrepublishGuard $s) $false "prepublish_guard=PASS"
+Assert-Prepublish "pre-publish: existing Release carries another commit's asset" (Invoke-PrepublishGuard $s) $false
 
 $s = New-PublishScenario "p4-tag-moved"
 Add-ScenarioTag $s
 & git -C $s.Clone @GIT_IDENTITY commit --quiet --allow-empty -m "moved"
 & git -C $s.Clone push --quiet --force origin "refs/tags/$TEST_TAG"
 Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Not Found (HTTP 404)"
-Assert "pre-publish: remote tag moved to a newer commit" (Invoke-PrepublishGuard $s) $false "prepublish_guard=PASS"
+Assert-Prepublish "pre-publish: remote tag moved to a newer commit" (Invoke-PrepublishGuard $s) $false
 
 $s = New-PublishScenario "p5-tag-gone"
 Add-ScenarioTag $s
 & git -C $s.Clone push --quiet origin ":refs/tags/$TEST_TAG"
 Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Not Found (HTTP 404)"
-Assert "pre-publish: remote tag no longer exists" (Invoke-PrepublishGuard $s) $false "prepublish_guard=PASS"
+Assert-Prepublish "pre-publish: remote tag no longer exists" (Invoke-PrepublishGuard $s) $false
 
 $s = New-PublishScenario "p6-gh-error"
 Add-ScenarioTag $s
-Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Bad credentials (HTTP 401)"
-Assert "pre-publish: cannot tell whether a Release exists" (Invoke-PrepublishGuard $s) $false "prepublish_guard=PASS"
+Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Bad credentials (HTTP 401)`nrequest id: 404abc"
+Assert-Prepublish "pre-publish: non-404 GitHub CLI error remains fail-closed" (Invoke-PrepublishGuard $s) $false
 
 $s = New-PublishScenario "p7-annotated"
 & git -C $s.Clone @GIT_IDENTITY tag -a $TEST_TAG -m "annotated tag"
 & git -C $s.Clone push --quiet origin "refs/tags/$TEST_TAG"
 Set-GhAnswer $s -ExitCode 1 -Stderr "gh: Not Found (HTTP 404)"
-Assert "pre-publish: annotated tag resolves to the same commit" (Invoke-PrepublishGuard $s) $true "prepublish_guard=PASS"
+Assert-Prepublish "pre-publish: annotated tag resolves to the same commit" (Invoke-PrepublishGuard $s) $true
 
 $s = New-PublishScenario "p8-empty-release"
 Add-ScenarioTag $s
 Set-GhAnswer $s -ExitCode 0 -Stdout (New-ReleaseJson @())
-Assert "pre-publish: existing Release has no assets yet" (Invoke-PrepublishGuard $s) $true "prepublish_guard=PASS"
+Assert-Prepublish "pre-publish: existing Release has no assets yet" (Invoke-PrepublishGuard $s) $true
 
 # --- the real repository (opt-in: -CheckRealTag) -----------------------------
 # The scenarios above are synthetic, so they prove the guard's logic but not that

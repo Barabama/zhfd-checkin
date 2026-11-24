@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+最后核对：2026-11-24（Asia/Shanghai）
+
 Windows 便携式「智汇福大晚点名签到」辅助工具：Rust CLI + GUI，通过 ADB 控制 LDPlayer。默认 dry-run；live 点击必须由用户显式授权并通过全部门禁。
 
 ## 先读什么
@@ -36,7 +38,7 @@ git tag --list
 cd rust; cargo test --lib
 ```
 
-当前基线：Cargo `0.3.5`，最新 tag `v0.3.5`，`cargo test --lib` 211 passed。HEAD 可能比 tag 多 docs-only 提交。
+当前 Cargo 版本、最新标签、发布状态及测试基线见 [`docs/STATUS.md`](docs/STATUS.md)。
 
 ## 环境
 
@@ -50,7 +52,7 @@ cd rust; cargo test --lib
 cd rust
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib                 # 211 tests
+cargo test --lib
 cargo build --release --bins     # 必须 --bins：CLI 与 GUI 一起
 ```
 
