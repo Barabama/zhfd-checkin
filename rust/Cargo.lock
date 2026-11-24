@@ -4521,7 +4521,7 @@ dependencies = [
 
 [[package]]
 name = "zhfd-checkin"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "chrono",

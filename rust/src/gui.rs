@@ -816,6 +816,14 @@ fn page_section(ui: &mut egui::Ui, lang: Lang, key: Key) {
     ui.label(egui::RichText::new(t(lang, key)).strong());
 }
 
+fn table_grid(ui: &mut egui::Ui, id: &str) -> egui::Grid {
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    egui::Grid::new(id)
+        .striped(true)
+        .min_row_height(26.0)
+        .spacing([18.0, 6.0])
+}
+
 impl GuiApp {
     fn page_with_contents(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang();
@@ -1756,15 +1764,19 @@ impl GuiApp {
         }
         page_section(ui, lang, Key::PageInstanceList);
         egui::ScrollArea::horizontal().show(ui, |ui| {
-            egui::Grid::new("instances").striped(true).show(ui, |ui| {
-                ui.label(t(lang, Key::InstColIndex));
-                ui.label(t(lang, Key::InstColName));
-                ui.label(t(lang, Key::InstColRunning));
-                ui.label(t(lang, Key::InstColSerial));
-                ui.label(t(lang, Key::InstColPort));
-                ui.label(t(lang, Key::InstColGeometry));
-                ui.label(t(lang, Key::InstColProfile));
-                ui.label(t(lang, Key::InstColEnabled));
+            table_grid(ui, "instances").show(ui, |ui| {
+                for heading in [
+                    Key::InstColIndex,
+                    Key::InstColName,
+                    Key::InstColRunning,
+                    Key::InstColSerial,
+                    Key::InstColPort,
+                    Key::InstColGeometry,
+                    Key::InstColProfile,
+                    Key::InstColEnabled,
+                ] {
+                    ui.strong(t(lang, heading));
+                }
                 ui.end_row();
                 for instance in &self.instance_summaries {
                     ui.label(instance.index.to_string());
@@ -1777,7 +1789,7 @@ impl GuiApp {
                             Key::CommonNo
                         },
                     ));
-                    ui.label(&instance.serial);
+                    ui.monospace(&instance.serial);
                     ui.label(
                         instance
                             .ldplayer_reported_port
@@ -1852,20 +1864,23 @@ impl GuiApp {
             .id_salt("profile_table_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.set_min_width(720.0);
-                egui::Grid::new("profiles").striped(true).show(ui, |ui| {
-                    ui.label(t(lang, Key::ProfilesColId));
-                    ui.label(t(lang, Key::ProfilesColSize));
-                    ui.label(t(lang, Key::ProfilesColDpi));
-                    ui.label(t(lang, Key::ProfilesColOrientation));
-                    ui.label(t(lang, Key::ProfilesColEligibility));
-                    ui.label(t(lang, Key::ProfilesColAction));
+                table_grid(ui, "profiles").show(ui, |ui| {
+                    for heading in [
+                        Key::ProfilesColId,
+                        Key::ProfilesColSize,
+                        Key::ProfilesColDpi,
+                        Key::ProfilesColOrientation,
+                        Key::ProfilesColEligibility,
+                        Key::ProfilesColAction,
+                    ] {
+                        ui.strong(t(lang, heading));
+                    }
                     ui.end_row();
                     for p in ordered_profiles() {
                         if profile::is_ldplayer_preset(p.width, p.height, p.density_dpi) {
-                            ui.label(p.id);
+                            ui.monospace(p.id);
                         } else {
-                            ui.label(format!("{}{}", p.id, t(lang, Key::ProfilesHistory)));
+                            ui.monospace(format!("{}{}", p.id, t(lang, Key::ProfilesHistory)));
                         }
                         ui.label(format!("{}x{}", p.width, p.height));
                         ui.label(p.density_dpi.to_string());
@@ -1885,10 +1900,8 @@ impl GuiApp {
                                 Key::ProfilesDryOnly
                             },
                         ));
-                        if ui
-                            .button(format!("{}##{}", t(lang, Key::ProfilesSync), p.id))
-                            .clicked()
-                        {
+                        let sync = ui.push_id(p.id, |ui| ui.button(t(lang, Key::ProfilesSync)));
+                        if sync.inner.clicked() {
                             self.pending_sync = Some(p.id.to_string());
                         }
                         ui.end_row();
@@ -2988,6 +3001,60 @@ mod tests {
         assert!(
             nodes.iter().all(|node| node.rect().max.x <= width),
             "node {label:?} extends beyond width {width}"
+        );
+    }
+
+    #[test]
+    fn emulator_table_keeps_addresses_and_preset_ids_on_one_line() {
+        let mut harness = gui_harness(egui::vec2(800.0, 600.0));
+        harness
+            .state_mut()
+            .instance_summaries
+            .push(crate::InstanceSummary {
+                index: 0,
+                name: "雷电模拟器-1".into(),
+                running: true,
+                serial: "127.0.0.1:5555".into(),
+                ldplayer_reported_port: Some(11740),
+                width: Some(900),
+                height: Some(1600),
+                dpi: Some(320),
+                profile_id: Some("portrait_900x1600_d320".into()),
+                configured: true,
+                enabled: true,
+            });
+        harness.get_by_label("模拟器实例").click();
+        harness.run_steps(4);
+        let address = harness.get_by_label("127.0.0.1:5555").rect();
+        let preset = harness.get_by_label("portrait_900x1600_d320").rect();
+        assert!(address.height() < 30.0 && preset.height() < 30.0);
+        assert!(address.max.x < preset.min.x);
+    }
+
+    #[test]
+    fn preset_table_shows_short_sync_buttons_and_confirms_the_selected_preset() {
+        let mut harness = gui_harness(egui::vec2(800.0, 600.0));
+        harness.get_by_label("屏幕预设").click();
+        harness.run_steps(4);
+        let preset = harness.get_by_label("portrait_900x1600_d320").rect();
+        assert!(preset.height() < 30.0);
+        let sync = harness
+            .get_all_by_label("准备同步")
+            .min_by(|left, right| {
+                (left.rect().center().y - preset.center().y)
+                    .abs()
+                    .total_cmp(&(right.rect().center().y - preset.center().y).abs())
+            })
+            .unwrap();
+        assert!(sync.rect().height() < 36.0 && sync.rect().min.x > preset.max.x);
+        sync.click();
+        harness.run_steps(4);
+        assert!(harness.query_by_label("确认同步屏幕预设").is_some());
+        assert!(
+            harness
+                .query_all_by_label_contains("portrait_900x1600_d320")
+                .count()
+                >= 2
         );
     }
 

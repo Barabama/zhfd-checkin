@@ -10,9 +10,11 @@
 |---|---|
 | 默认分支 | `master` |
 | master HEAD | 以 `git rev-parse master` 为准 |
-| Cargo 版本 | `0.3.7` |
-| 最新 GitHub Release | `v0.3.5` |
-| Release 资产 | `zhfd-checkin-windows-x64-v0.3.5-c60918c14b28.zip` |
+| Cargo 版本 | `0.3.8` |
+| 最近核实的 GitHub Release | `v0.3.7` |
+| 最近核实的 Release 资产 | `zhfd-checkin-windows-x64-v0.3.7-57d658c9dfd7.zip` |
+
+> `v0.3.8` 改善模拟器实例与屏幕预设表格的可读性；新版资产以 GitHub Releases 为准。
 
 > **`v0.3.6` 的 GitHub Release 未发布。** Windows Release run `45230475364` 的最终 guard 因 GitHub CLI 查询不存在的 Release 时泄漏预期 404 的退出码而假失败，发布步骤因此跳过。同一提交的 CI run `45230475170` 成功。`v0.3.7` 修复此问题；旧标签保留原样，发布结果以 GitHub Releases 为准。
 
@@ -35,7 +37,8 @@
 | `v0.3.4` | `3437b1f` |
 | `v0.3.5` | `c60918c` |
 | `v0.3.6` | `d787451` |
-| `v0.3.7` | 以 `git rev-list -n1 v0.3.7` 为准 |
+| `v0.3.7` | `57d658c` |
+| `v0.3.8` | 以 `git rev-list -n1 v0.3.8` 为准 |
 
 > 2026-10-18 重写过 git 历史以移除 fixture PII。重写前的 SHA（例如 `e135369`、`9a66664`、`c4b3bc4`）在本地已不可解析；历史文档中的这些 SHA 只应标注为 pre-rewrite 引用。
 
@@ -44,7 +47,7 @@
 ```text
 cargo fmt --all -- --check                     ✅
 cargo clippy --all-targets --all-features -D warnings  ✅
-cargo test --lib                               ✅ 216 passed（含固定尺寸 GUI 用户场景）
+cargo test --lib                               ✅ 218 passed（含固定尺寸 GUI 用户场景）
 cargo build --release --bins                   ✅
 ```
 
